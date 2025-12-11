@@ -446,4 +446,3 @@ if __name__ == '__main__':
     signal(SIGINT, handler)
 
     StartMining()
-```
