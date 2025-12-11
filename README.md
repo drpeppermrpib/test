@@ -253,10 +253,20 @@ def block_listener(t):
     while not(b'mining.notify' in response):
         response += sock.recv(1024)
 
-    responses = [json.loads(res) for res in response.decode().split('\n') if len(res.strip())>0 and 'mining.notify' in res]
-    ctx.job_id, ctx.prevhash, ctx.coinb1, ctx.coinb2, ctx.merkle_branch, ctx.version, ctx.nbits, ctx.ntime, ctx.clean_jobs = responses[0]['params']
-    # do this one time, will be overwriten by mining loop when new block is detected
-    ctx.updatedPrevHash = ctx.prevhash
+    responses = []
+    for res in response.decode().split('\n'):
+        if len(res.strip()) > 0:
+            try:
+                responses.append(json.loads(res))
+            except json.JSONDecodeError as e:
+                logg(f'[*] JSON decode error: {e} for response: {res}')
+
+    notify_responses = [res for res in responses if 'method' in res and res['method'] == 'mining.notify']
+    if notify_responses:
+        params = notify_responses[0]['params']
+        ctx.job_id, ctx.prevhash, ctx.coinb1, ctx.coinb2, ctx.merkle_branch, ctx.version, ctx.nbits, ctx.ntime, ctx.clean_jobs = params
+        # do this one time, will be overwriten by mining loop when new block is detected
+        ctx.updatedPrevHash = ctx.prevhash
     # set sock 
     ctx.sock = sock 
 
@@ -269,8 +279,14 @@ def block_listener(t):
         response = b''
         while not(b'mining.notify' in response):
             response += sock.recv(1024)
-        responses = [json.loads(res) for res in response.decode().split('\n') if len(res.strip())>0]     
-        
+        responses = []
+        for res in response.decode().split('\n'):
+            if len(res.strip()) > 0:
+                try:
+                    responses.append(json.loads(res))
+                except json.JSONDecodeError as e:
+                    logg(f'[*] JSON decode error: {e} for response: {res}')
+
         for res in responses:
             if 'method' in res:
                 if res['method'] == 'mining.notify':
