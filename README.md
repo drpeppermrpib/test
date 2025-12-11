@@ -25,7 +25,7 @@ import argparse
 SOLO_HOST = 'solo.ckpool.org'
 SOLO_PORT = 3333
 SOLO_ADDRESS = 'bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.001'
-SOLO_PASSWORD = 'x'  # Arbitrary for solo
+SOLO_PASSWORD = 'password'  # Arbitrary for solo
 
 POOL_HOST = 'ss.antpool.com'
 POOL_PORT = 3333
@@ -248,7 +248,7 @@ def block_listener(t):
     response = json.loads(lines[0])
     ctx.sub_details,ctx.extranonce1,ctx.extranonce2_size = response['result']
     # send and handle authorize message  
-    sock.sendall(b'{"params": ["'+ctx.user.encode()+b'", "'+ctx.password+'"], "id": 2, "method": "mining.authorize"}\n')
+    sock.sendall(b'{"params": ["' + ctx.user.encode('utf-8') + b'", "' + ctx.password.encode('utf-8') + b'"], "id": 2, "method": "mining.authorize"}\n')
     response = b''
     while response.count(b'\n') < 4 and not(b'mining.notify' in response):response += sock.recv(1024)
 
