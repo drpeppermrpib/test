@@ -250,7 +250,8 @@ def block_listener(t):
     # send and handle authorize message  
     sock.sendall(b'{"params": ["' + ctx.user.encode('utf-8') + b'", "' + ctx.password.encode('utf-8') + b'"], "id": 2, "method": "mining.authorize"}\n')
     response = b''
-    while response.count(b'\n') < 4 and not(b'mining.notify' in response):response += sock.recv(1024)
+    while not(b'mining.notify' in response):
+        response += sock.recv(1024)
 
     responses = [json.loads(res) for res in response.decode().split('\n') if len(res.strip())>0 and 'mining.notify' in res]
     ctx.job_id, ctx.prevhash, ctx.coinb1, ctx.coinb2, ctx.merkle_branch, ctx.version, ctx.nbits, ctx.ntime, ctx.clean_jobs = responses[0]['params']
@@ -266,7 +267,8 @@ def block_listener(t):
 
         # check for new block 
         response = b''
-        while response.count(b'\n') < 4 and not(b'mining.notify' in response):response += sock.recv(1024)
+        while not(b'mining.notify' in response):
+            response += sock.recv(1024)
         responses = [json.loads(res) for res in response.decode().split('\n') if len(res.strip())>0]     
         
         for res in responses:
