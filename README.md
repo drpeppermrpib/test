@@ -25,7 +25,7 @@ import argparse
 SOLO_HOST = 'solo.ckpool.org'
 SOLO_PORT = 3333
 SOLO_ADDRESS = 'bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.001'
-SOLO_PASSWORD = 'password'  # Arbitrary for solo
+SOLO_PASSWORD = 'x'  # Arbitrary for solo
 
 POOL_HOST = 'ss.antpool.com'
 POOL_PORT = 3333
@@ -118,6 +118,11 @@ def bitcoin_miner(t, restarted=False, thread_id=0):
     if restarted:
         logg('[*] Bitcoin Miner restarted')
         time.sleep(10)
+
+    # Wait for job data if not available
+    while ctx.nbits is None or ctx.version is None or ctx.prevhash is None or ctx.ntime is None:
+        logg('[*] Waiting for job data in thread {}'.format(thread_id))
+        time.sleep(1)
 
     # Use block target initially
     block_target = (ctx.nbits[2:]+'00'*(int(ctx.nbits[:2],16) - 3)).zfill(64)
@@ -401,7 +406,14 @@ def StartMining():
     subscribe_t.start()
     logg("[*] Subscribe thread started.")
 
-    time.sleep(4)
+    # Wait for initial job data to be set
+    timeout = 60  # Max wait time in seconds
+    start_time = time.time()
+    while ctx.nbits is None or ctx.version is None or ctx.prevhash is None or ctx.ntime is None:
+        if time.time() - start_time > timeout:
+            raise Exception("Timeout waiting for initial job from pool")
+        time.sleep(1)
+    logg("[*] Initial job received, starting miners.")
 
     for i in range(num_threads):
         miner_t = CoinMinerThread(None, n=i+2, thread_id=i)
@@ -434,3 +446,4 @@ if __name__ == '__main__':
     signal(SIGINT, handler)
 
     StartMining()
+```
