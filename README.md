@@ -15,28 +15,32 @@ import curses
 import argparse
 import signal
 
-# ======================  GLOBALS  ======================
+# ======================  GLOBALS (all in one place) ======================
 fShutdown = False
 listfThreadRunning = []
 nHeightDiff = {}
 updatedPrevHash = None
+
+# job data from pool
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
 sock = None
 target = None
+
+# runtime config
 mode = "pool"
 host = port = user = password = None
 
-# Stats
+# stats
 hashrates = []
 accepted = rejected = 0
 accepted_timestamps = []
 rejected_timestamps = []
 lock = threading.Lock()
 
-# ======================  LOGGER  ======================
-def logg(msg: str):
+# ======================  LOGGER ======================
+def logg(msg):
     print(msg)
     try:
         logging.basicConfig(level=logging.INFO,
@@ -49,19 +53,20 @@ def logg(msg: str):
 
 logg("[*] Miner starting...")
 
-# ======================  OPTIONAL GPU  ======================
+# ======================  OPTIONAL GPU ======================
 gpu_enabled = False
 try:
-    import numpy as np
-    import pycuda.driver as cuda
-    import pycuda.autoinit
-    from pycuda.compiler import SourceModule
-    gpu_enabled = True
-    logg("[*] PyCUDA loaded – GPU support active")
-except Exception as e:
-    logg(f"[!] PyCUDA not available ({e}) – CPU-only mode")
+    try:
+        import numpy as np
+        import pycuda.driver as cuda
+        import pycuda.autoinit
+        from pycuda.compiler import SourceModule
+        gpu_enabled = True
+        logg("[*] PyCUDA loaded – GPU support active")
+    except Exception as e:
+        logg(f"[!] No PyCUDA – running CPU-only ({e})")
 
-# ======================  CONFIG  ======================
+# ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
 SOLO_PORT = 3333
 SOLO_ADDRESS = 'bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.001'
@@ -73,12 +78,7 @@ POOL_PASSWORD = 'x'
 
 num_threads = max(1, os.cpu_count() * 2)
 
-# ======================  HELPERS  ======================
-def diff_to_target(diff: float) -> str:
-    diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-    target_int = diff1 // int(diff)
-    return format(target_int, '064x')
-
+# ======================  SIGNAL HANDLER ======================
 def signal_handler(sig, frame):
     global fShutdown
     fShutdown = True
@@ -86,27 +86,56 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
-# ======================  MINING LOOP  ======================
-def bitcoin_miner(thread_id: int):
-    global nbits, version, prevhash, ntime, target
+# ======================  MERKLE ROOT ======================
+def calculate_merkle_root():
+    coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
+    h = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
+    for b in merkle_branch:
+        h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
+    return binascii.hexlify(h).decode()[::-1]  # little-endian
 
-    # Wait for first job
+# ======================  SHARE SUBMIT ======================
+def submit_share(nonce):
+    payload = {
+        "id": 1,
+        "method": "mining.submit",
+        "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
+    }
+    msg = json.dumps(payload) + "\n"
+    try:
+        sock.sendall(msg.encode())
+        resp = sock.recv(1024).decode().strip()
+        logg(f"[*] Share submitted → {resp}")
+        with lock:
+            if "true" in resp.lower():
+                global accepted, accepted_timestamps
+                accepted += 1
+                accepted_timestamps.append(time.time())
+            else:
+                global rejected, rejected_timestamps
+                rejected += 1
+                rejected_timestamps.append(time.time())
+    except Exception as e:
+        logg(f"[!] Submit error: {e}")
+
+# ======================  MINING LOOP (CPU + GPU) ======================
+def bitcoin_miner(thread_id):
+    # wait for first job
     while None in (nbits, version, prevhash, ntime):
         time.sleep(0.5)
 
-    # Build static header part (nonce will be added later)
     merkle_root = calculate_merkle_root()
     header_static = version + prevhash + merkle_root + ntime + nbits
     header_bytes = binascii.unhexlify(header_static)
 
-    current_target = target or (nbits[2:] + '00' * (int(nbits[:2], 16) - 3)).zfill(64)
+    current_target = target or (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
     while not fShutdown:
-        # GPU batch (if available)
+        # GPU batch (optional)
         if gpu_enabled:
             try:
                 batch = 10_000_000
@@ -116,12 +145,14 @@ def bitcoin_miner(thread_id: int):
 
                 cuda_mod.get_function("mine_kernel")(
                     cuda.In(header_bytes),
-                     np.uint32(len(header_bytes)),
-                     np.uint32(nonce - batch),
-                     np.uint32(batch),
-                     cuda.In(binascii.unhexlify(current_target)),
-                     found_gpu,
-                     block=(1024,1,1), grid=(grid,1))
+                    np.uint32(len(header_bytes)),
+                    np.uint32(nonce - batch),
+                    np.uint32(batch),
+                    cuda.In(binascii.unhexlify(current_target)),
+                    found_gpu,
+                    block=(1024,1,1),
+                    grid=(grid,1)
+                )
 
                 cuda.memcpy_dtoh(found, found_gpu)
                 if found[0] != 0xffffffff:
@@ -130,12 +161,12 @@ def bitcoin_miner(thread_id: int):
                 hashes_done += batch
                 nonce -= batch
             except Exception as e:
-                logg(f"[!] GPU error (thread {thread_id}): {e}")
+                pass  # silently fall back to CPU if GPU fails
 
         # CPU batch
         for _ in range(50000):
             nonce = (nonce - 1) & 0xffffffff
-            h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4, 'little')).digest()).digest()
+            h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
 
             hashes_done += 1
@@ -154,37 +185,7 @@ def bitcoin_miner(thread_id: int):
 
         time.sleep(0.001)
 
-def calculate_merkle_root():
-    coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
-    h = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
-    for b in merkle_branch:
-        h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
-    return binascii.hexlify(h).decode()[::-1]  # little-endian
-
-def submit_share(nonce: int):
-    payload = {
-        "id": 1,
-        "method": "mining.submit",
-        "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
-    }
-    msg = json.dumps(payload) + "\n"
-    try:
-        sock.sendall(msg.encode())
-        resp = sock.recv(1024).decode().strip()
-        logg(f"[*] Submitted nonce {nonce:08x} → {resp}")
-        with lock:
-            if "true" in resp.lower():
-                global accepted, accepted_timestamps
-                accepted += 1
-                accepted_timestamps.append(time.time())
-            else:
-                global rejected, rejected_timestamps
-                rejected += 1
-                rejected_timestamps.append(time.time())
-    except Exception as e:
-        logg(f"[!] Submit failed: {e}")
-
-# ======================  STRATUM LISTENER  ======================
+# ======================  STRATUM LISTENER ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size
@@ -219,14 +220,14 @@ def stratum_worker():
             logg(f"[!] Stratum error: {e}")
             break
 
-# ======================  DISPLAY  ======================
+# ======================  DISPLAY ======================
 def display_worker():
     stdscr = curses.initscr()
     curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_RED,   , curses.COLOR_BLACK)
+    curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_RED,    curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-    curses.init_pair(4, curses.COLOR_CYAN  , curses.COLOR_BLACK)
+    curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
 
     try:
@@ -234,16 +235,16 @@ def display_worker():
             stdscr.clear()
             now = time.time()
             with lock:
-                a_min = sum(1 for t in accepted_timestamps if now-t < 60)
-                r_min = sum(1 for t in rejected_timestamps if now-t < 60)
+                a_min = sum(1 for t in accepted_timestamps if now-t<60)
+                r_min = sum(1 for t in rejected_timestamps if now-t<60)
 
-            stdscr.addstr(0, 0, f"Bitcoin {mode.upper()} Miner (CPU + {'GPU' if gpu_enabled else 'NO GPU'})", curses.color_pair(4)|curses.A_BOLD)
-            stdscr.addstr(2, 0, f"Block height : ~{requests.get('https://blockchain.info/q/getblockcount', timeout=5).text}", curses.color_pair(3))
-            stdscr.addstr(3, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(4, 0, f"Threads      : {num_threads}", curses.color_pair(3))
-            stdscr.addstr(5, 0, f"Shares       : {accepted} accepted / {rejected} rejected", curses.color_pair(1))
-            stdscr.addstr(6, 0, f"Per minute   : {a_min} acc / {r_min} rej", curses.color_pair(1))
-            stdscr.addstr(8, 0, "Press q to quit", curses.color_pair(3))
+            stdscr.addstr(0,0,f"Bitcoin {mode.upper()} Miner (CPU{'+GPU' if gpu_enabled else ''})", curses.color_pair(4)|curses.A_BOLD)
+            stdscr.addstr(2,0,f"Block height : ~{requests.get('https://blockchain.info/q/getblockcount',timeout=5).text}", curses.color_pair(3))
+            stdscr.addstr(3,0,f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
+            stdscr.addstr(4,0,f"Threads      : {num_threads}", curses.color_pair(3))
+            stdscr.addstr(5,0,f"Shares       : {accepted} accepted / {rejected} rejected")
+            stdscr.addstr(6,0,f"Last minute  : {a_min} acc / {r_min} rej")
+            stdscr.addstr(8,0,"Press q to quit", curses.color_pair(3))
             stdscr.refresh()
             time.sleep(1)
             if stdscr.getch() == ord('q'):
@@ -252,10 +253,10 @@ def display_worker():
     finally:
         curses.endwin()
 
-# ======================  MAIN  ======================
+# ======================  MAIN ======================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["solo", "pool"], default="pool", help="solo or pool")
+    parser.add_argument("--mode", choices=["solo","pool"], default="pool")
     args = parser.parse_args()
 
     mode = args.mode
@@ -266,6 +267,7 @@ if __name__ == "__main__":
 
     hashrates = [0] * num_threads
 
+    # start everything
     threading.Thread(target=stratum_worker, daemon=True).start()
     time.sleep(3)
 
