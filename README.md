@@ -23,7 +23,7 @@ accepted_timestamps = []
 rejected_timestamps = []
 lock = threading.Lock()
 
-# job data (will be filled by stratum)
+# job data
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
@@ -53,8 +53,8 @@ try:
     from pycuda.compiler import SourceModule
     gpu_enabled = True
     logg("[*] PyCUDA loaded – GPU support active")
-except:
-    logg("[!] PyCUDA not found – running CPU-only")
+except Exception as e:
+    logg(f"[!] PyCUDA not found ({e}) – CPU-only mode")
 
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
@@ -79,7 +79,7 @@ signal.signal(signal.SIGINT, signal_handler)
 # ======================  MERKLE ROOT ======================
 def calculate_merkle_root():
     if None in (coinb1, extranonce1, extranonce2, coinb2, merkle_branch):
-        return "0"*64
+        return "0" * 64
     coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
     h = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
     for b in merkle_branch:
@@ -111,6 +111,7 @@ def submit_share(nonce):
 
 # ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
+    # wait for job
     while None in (nbits, version, prevhash, ntime):
         time.sleep(0.5)
 
@@ -124,10 +125,10 @@ def bitcoin_miner(thread_id):
     last_report = time.time()
 
     while not fShutdown:
-        # GPU (optional)
+        # GPU batch (optional)
         if gpu_enabled:
             try:
-                batch = 10_000_000
+                batch = 8_000_000
                 grid = (batch + 1023) // 1024
                 found = np.array([0xffffffff], dtype=np.uint32)
                 found_gpu = cuda.to_device(found)
@@ -146,16 +147,17 @@ def bitcoin_miner(thread_id):
                     return
                 hashes_done += batch
                 nonce -= batch
-            except:
-                pass  # fall back to CPU silently
+            except Exception as e:
+                # silently fall back to CPU
+                pass
 
-        # CPU hashes
+        # CPU batch
         for _ in range(50000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
-            hashes_done += 1
 
+            hashes_done += 1
             if h_hex < current_target:
                 submit_share(nonce)
                 return
@@ -226,7 +228,7 @@ def display_worker():
 
             stdscr.addstr(0,0,f"Bitcoin {mode.upper()} Miner (CPU{'+GPU' if gpu_enabled else ''})", curses.color_pair(4)|curses.A_BOLD)
             try:
-                height = requests.get('https://blockchain.info/q/getblockcount', timeout=3).text
+                height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
                 height = "???"
             stdscr.addstr(2,0,f"Block height : ~{height}", curses.color_pair(3))
@@ -257,7 +259,6 @@ if __name__ == "__main__":
 
     hashrates = [0] * num_threads
 
-    # start threads
     threading.Thread(target=stratum_worker, daemon=True).start()
     time.sleep(3)
 
