@@ -16,6 +16,11 @@ import os
 import curses
 import argparse
 
+def logg(msg):
+    # basic logging 
+    logging.basicConfig(level=logging.INFO, filename="miner.log", format='%(asctime)s %(message)s') # include timestamp
+    logging.info(msg)
+
 # Optional GPU support
 gpu_enabled = False
 try:
@@ -148,11 +153,6 @@ def handler(signal_received, frame):
     global fShutdown
     fShutdown = True
     print('Terminating miner, please wait..')
-
-def logg(msg):
-    # basic logging 
-    logging.basicConfig(level=logging.INFO, filename="miner.log", format='%(asctime)s %(message)s') # include timestamp
-    logging.info(msg)
 
 def get_current_block_height():
     # returns the current network height 
@@ -331,14 +331,15 @@ def bitcoin_miner(t, restarted=False, thread_id=0):
                 try:
                     response = json.loads(ret.decode().strip())
                     if response.get('result'):
-                        with ctx.lock:
+                        with lock:
                             accepted += 1
                             accepted_timestamps.append(now)
+                        logg("[*] Share accepted.")
                     else:
-                        with ctx.lock:
+                        with lock:
                             rejected += 1
                             rejected_timestamps.append(now)
-                        logg('[*] {} rejected: {}'.format('Block' if mode == 'solo' else 'Share', response.get('error')))
+                        logg('[*] Share rejected: {}'.format(response.get('error')))
                 except:
                     logg('[*] Error parsing pool response: {}'.format(ret))
                 return True
@@ -374,8 +375,8 @@ def bitcoin_miner(t, restarted=False, thread_id=0):
             nonce_count += 1
 
         last_updated = calculate_hashrate(nonce_count, last_updated, thread_hr)
-        with ctx.lock:
-            ctx.hashrates[thread_id] = thread_hr[0]
+        with lock:
+            hashrates[thread_id] = thread_hr[0]
 
        
 
@@ -529,7 +530,6 @@ class DisplayThread(ExitedThread):
                 stdscr.addstr(5, 0, f"{label}: ")
                 stdscr.attron(curses.color_pair(1))
                 stdscr.addstr(f"Accepted {accepted} ")
-                stdscr.attroff(curses.color_pair(1))
                 stdscr.attroff(curses.color_pair(1))
                 stdscr.attron(curses.color_pair(2))
                 stdscr.addstr(f"Rejected {rejected}")
