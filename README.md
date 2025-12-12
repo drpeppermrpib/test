@@ -15,10 +15,18 @@ import sys
 import os
 import curses
 import argparse
-import numpy as np
-import pycuda.driver as cuda
-import pycuda.autoinit
-from pycuda.compiler import SourceModule
+
+# Optional GPU support
+gpu_enabled = False
+try:
+    import numpy as np
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    from pycuda.compiler import SourceModule
+    gpu_enabled = True
+    logg("[*] PyCUDA imported successfully, GPU mining enabled.")
+except ImportError as e:
+    logg("[*] PyCUDA not found: " + str(e) + ". Falling back to CPU-only mining.")
 
 # Inlined context.py content
 fShutdown = False
@@ -42,75 +50,76 @@ extranonce2_size = None
 sock = None
 
 # Optimized Scrypt CUDA kernel (based on open-source implementations like CudaMiner, with parallelization and shuffle)
-cuda_mod = SourceModule("""
-#include <stdint.h>
-#include <cuda_runtime.h>
+if gpu_enabled:
+    cuda_mod = SourceModule("""
+    #include <stdint.h>
+    #include <cuda_runtime.h>
 
-#define ROTL(a, b) (((a) << (b)) | ((a) >> (32 - (b))))
+    #define ROTL(a, b) (((a) << (b)) | ((a) >> (32 - (b))))
 
-__device__ void salsa20_8(uint32_t *B) {
-    uint32_t x[16];
-    for (int i = 0; i < 16; ++i) x[i] = B[i];
-    for (int i = 0; i < 4; ++i) {
-        x[ 4] ^= ROTL(x[ 0] + x[12], 7);  x[ 8] ^= ROTL(x[ 4] + x[ 0], 9);
-        x[12] ^= ROTL(x[ 8] + x[ 4],13);  x[ 0] ^= ROTL(x[12] + x[ 8],18);
-        x[ 9] ^= ROTL(x[ 5] + x[ 1], 7);  x[13] ^= ROTL(x[ 9] + x[ 5], 9);
-        x[ 1] ^= ROTL(x[13] + x[ 9],13);  x[ 5] ^= ROTL(x[ 1] + x[13],18);
-        x[14] ^= ROTL(x[10] + x[ 6], 7);  x[ 2] ^= ROTL(x[14] + x[10], 9);
-        x[ 6] ^= ROTL(x[ 2] + x[14],13);  x[10] ^= ROTL(x[ 6] + x[ 2],18);
-        x[ 3] ^= ROTL(x[15] + x[11], 7);  x[ 7] ^= ROTL(x[ 3] + x[15], 9);
-        x[11] ^= ROTL(x[ 7] + x[ 3],13);  x[15] ^= ROTL(x[11] + x[ 7],18);
-        x[ 1] ^= ROTL(x[ 0] + x[ 3], 7);  x[ 2] ^= ROTL(x[ 1] + x[ 0], 9);
-        x[ 3] ^= ROTL(x[ 2] + x[ 1],13);  x[ 0] ^= ROTL(x[ 3] + x[ 2],18);
-        x[ 6] ^= ROTL(x[ 5] + x[ 4], 7);  x[ 7] ^= ROTL(x[ 6] + x[ 5], 9);
-        x[ 4] ^= ROTL(x[ 7] + x[ 6],13);  x[ 5] ^= ROTL(x[ 4] + x[ 7],18);
-        x[11] ^= ROTL(x[10] + x[ 9], 7);  x[ 8] ^= ROTL(x[11] + x[10], 9);
-        x[ 9] ^= ROTL(x[ 8] + x[11],13);  x[10] ^= ROTL(x[ 9] + x[ 8],18);
-        x[12] ^= ROTL(x[15] + x[14], 7);  x[13] ^= ROTL(x[12] + x[15], 9);
-        x[14] ^= ROTL(x[13] + x[12],13);  x[15] ^= ROTL(x[14] + x[13],18);
+    __device__ void salsa20_8(uint32_t *B) {
+        uint32_t x[16];
+        for (int i = 0; i < 16; ++i) x[i] = B[i];
+        for (int i = 0; i < 4; ++i) {
+            x[ 4] ^= ROTL(x[ 0] + x[12], 7);  x[ 8] ^= ROTL(x[ 4] + x[ 0], 9);
+            x[12] ^= ROTL(x[ 8] + x[ 4],13);  x[ 0] ^= ROTL(x[12] + x[ 8],18);
+            x[ 9] ^= ROTL(x[ 5] + x[ 1], 7);  x[13] ^= ROTL(x[ 9] + x[ 5], 9);
+            x[ 1] ^= ROTL(x[13] + x[ 9],13);  x[ 5] ^= ROTL(x[ 1] + x[13],18);
+            x[14] ^= ROTL(x[10] + x[ 6], 7);  x[ 2] ^= ROTL(x[14] + x[10], 9);
+            x[ 6] ^= ROTL(x[ 2] + x[14],13);  x[10] ^= ROTL(x[ 6] + x[ 2],18);
+            x[ 3] ^= ROTL(x[15] + x[11], 7);  x[ 7] ^= ROTL(x[ 3] + x[15], 9);
+            x[11] ^= ROTL(x[ 7] + x[ 3],13);  x[15] ^= ROTL(x[11] + x[ 7],18);
+            x[ 1] ^= ROTL(x[ 0] + x[ 3], 7);  x[ 2] ^= ROTL(x[ 1] + x[ 0], 9);
+            x[ 3] ^= ROTL(x[ 2] + x[ 1],13);  x[ 0] ^= ROTL(x[ 3] + x[ 2],18);
+            x[ 6] ^= ROTL(x[ 5] + x[ 4], 7);  x[ 7] ^= ROTL(x[ 6] + x[ 5], 9);
+            x[ 4] ^= ROTL(x[ 7] + x[ 6],13);  x[ 5] ^= ROTL(x[ 4] + x[ 7],18);
+            x[11] ^= ROTL(x[10] + x[ 9], 7);  x[ 8] ^= ROTL(x[11] + x[10], 9);
+            x[ 9] ^= ROTL(x[ 8] + x[11],13);  x[10] ^= ROTL(x[ 9] + x[ 8],18);
+            x[12] ^= ROTL(x[15] + x[14], 7);  x[13] ^= ROTL(x[12] + x[15], 9);
+            x[14] ^= ROTL(x[13] + x[12],13);  x[15] ^= ROTL(x[14] + x[13],18);
+        }
+        for (int i = 0; i < 16; ++i) B[i] += x[i];
     }
-    for (int i = 0; i < 16; ++i) B[i] += x[i];
-}
 
-__device__ void scrypt_core(uint32_t *X, uint32_t *V, int N) {
-    for (int i = 0; i < N; i++) {
-        memcpy(&V[i * 32], X, 128);
-        salsa20_8((uint32_t *)&V[i * 32]);
-        salsa20_8(X);
+    __device__ void scrypt_core(uint32_t *X, uint32_t *V, int N) {
+        for (int i = 0; i < N; i++) {
+            memcpy(&V[i * 32], X, 128);
+            salsa20_8((uint32_t *)&V[i * 32]);
+            salsa20_8(X);
+        }
+        for (int i = 0; i < N; i++) {
+            int j = X[16] & (N - 1);
+            for (int k = 0; k < 32; k++) X[k] ^= V[j * 32 + k];
+            salsa20_8(X);
+        }
     }
-    for (int i = 0; i < N; i++) {
-        int j = X[16] & (N - 1);
-        for (int k = 0; k < 32; k++) X[k] ^= V[j * 32 + k];
-        salsa20_8(X);
+
+    __global__ void scrypt_kernel(uint8_t *data, uint8_t *output, uint32_t start_nonce, uint32_t num_nonces, uint8_t *target) {
+        uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= num_nonces) return;
+
+        uint32_t nonce = start_nonce + idx;
+        // Copy data and insert nonce (assume data is 80 bytes, nonce at bytes 76-79)
+        uint8_t header[80];
+        memcpy(header, data, 80);
+        *(uint32_t*)(header + 76) = nonce;  // Little-endian
+
+        // PBKDF2_SHA256 with Scrypt params (N=1024, r=1, p=1)
+        uint32_t X[32];
+        // Simplified PBKDF2 to derive X (implement full PBKDF2_SHA256 here)
+        // ...
+
+        // Allocate scratchpad V
+        extern __shared__ uint32_t V[];
+        scrypt_core(X, V, 1024);
+
+        // Final PBKDF2 to get output hash
+        // ...
+
+        // Check if hash < target
+        // ...
     }
-}
-
-__global__ void scrypt_kernel(uint8_t *data, uint8_t *output, uint32_t start_nonce, uint32_t num_nonces, uint8_t *target) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_nonces) return;
-
-    uint32_t nonce = start_nonce + idx;
-    // Copy data and insert nonce (assume data is 80 bytes, nonce at bytes 76-79)
-    uint8_t header[80];
-    memcpy(header, data, 80);
-    *(uint32_t*)(header + 76) = nonce;  // Little-endian
-
-    // PBKDF2_SHA256 with Scrypt params (N=1024, r=1, p=1)
-    uint32_t X[32];
-    // Simplified PBKDF2 to derive X (implement full PBKDF2_SHA256 here)
-    // ...
-
-    // Allocate scratchpad V
-    extern __shared__ uint32_t V[];
-    scrypt_core(X, V, 1024);
-
-    // Final PBKDF2 to get output hash
-    // ...
-
-    // Check if hash < target
-    // ...
-}
-""")
+    """)
 
 # Default configurations
 SOLO_HOST = 'solo.ckpool.org'
@@ -218,7 +227,7 @@ def bitcoin_miner(t, restarted=False, thread_id=0):
         time.sleep(1)
 
     # Use block target initially
-    block_target = (nbits[2:]+'00'*(int(nbits[2:],16) - 3)).zfill(64)
+    block_target = (nbits[2:]+'00'*(int(nbits[:2],16) - 3)).zfill(64)
     target = block_target  # Simplified, as pool target is handled separately
 
     global extranonce2_size, extranonce1, coinb1, coinb2
@@ -257,22 +266,23 @@ def bitcoin_miner(t, restarted=False, thread_id=0):
     last_updated = time.time()
     thread_hr = [0]  # Local for this thread
 
-    # GPU setup
-    header_base = (version + prevhash + merkle_root + ntime + nbits).encode('utf-8')  # Base header without nonce
-    header_len = len(header_base)
-    target_bytes = binascii.unhexlify(target)  # Target as bytes
+    # GPU setup if enabled
+    if gpu_enabled:
+        header_base = (version + prevhash + merkle_root + ntime + nbits).encode('utf-8')  # Base header without nonce
+        header_len = len(header_base)
+        target_bytes = binascii.unhexlify(target)  # Target as bytes
 
-    # Allocate GPU memory
-    header_gpu = cuda.mem_alloc(header_len)
-    target_gpu = cuda.mem_alloc(32)
-    found_nonce_gpu = cuda.mem_alloc(4)  # uint32_t for found nonce (init to max)
-    cuda.memcpy_htod(header_gpu, header_base)
-    cuda.memcpy_htod(target_gpu, target_bytes)
-    cuda.memcpy_htod(found_nonce_gpu, np.uint32(0xffffffff))
+        # Allocate GPU memory
+        header_gpu = cuda.mem_alloc(header_len)
+        target_gpu = cuda.mem_alloc(32)
+        found_nonce_gpu = cuda.mem_alloc(4)  # uint32_t for found nonce (init to max)
+        cuda.memcpy_htod(header_gpu, header_base)
+        cuda.memcpy_htod(target_gpu, target_bytes)
+        cuda.memcpy_htod(found_nonce_gpu, np.uint32(0xffffffff))
 
-    # Kernel params
-    block_size = 1024  # Threads per block (tune for GPU)
-    num_hashes_per_kernel = 10000000  # Nonces per kernel launch (adjust based on GPU memory)
+        # Kernel params
+        block_size = 1024  # Threads per block (tune for GPU)
+        num_hashes_per_kernel = 10000000  # Nonces per kernel launch (adjust based on GPU memory)
 
     while True:
         t.check_self_shutdown()
@@ -289,56 +299,57 @@ def bitcoin_miner(t, restarted=False, thread_id=0):
         # Update target if difficulty changed (for pool)
         target = ctx.target if hasattr(ctx, 'target') and ctx.mode == 'pool' else block_target
 
-        # Launch GPU kernel
-        grid_size = (num_hashes_per_kernel + block_size - 1) // block_size
-        func = cuda_mod.get_function("mine_kernel")
-        func(header_gpu, np.uint32(header_len), np.uint32(nNonce - num_hashes_per_kernel), np.uint32(num_hashes_per_kernel), target_gpu, found_nonce_gpu, block=(block_size, 1, 1), grid=(grid_size, 1))
+        # Launch GPU kernel if enabled
+        if gpu_enabled:
+            grid_size = (num_hashes_per_kernel + block_size - 1) // block_size
+            func = cuda_mod.get_function("mine_kernel")
+            func(header_gpu, np.uint32(header_len), np.uint32(nNonce - num_hashes_per_kernel), np.uint32(num_hashes_per_kernel), target_gpu, found_nonce_gpu, block=(block_size, 1, 1), grid=(grid_size, 1))
 
-        # Check if found
-        found_nonce = np.zeros(1, dtype=np.uint32)
-        cuda.memcpy_dtoh(found_nonce, found_nonce_gpu)
-        if found_nonce[0] != 0xffffffff:
-            nNonce = found_nonce[0]
-            # Submit the found nonce
-            nonce = hex(nNonce)[2:].zfill(8)
-            blockheader = version + prevhash + merkle_root + ntime + nbits + nonce
-            hash = hashlib.sha256(hashlib.sha256(binascii.unhexlify(blockheader)).digest()).digest()
-            hash = binascii.hexlify(hash).decode()
-            hash = "".join(reversed([hash[i:i+2] for i in range(0, len(hash), 2)]))
+            # Check if found
+            found_nonce = np.zeros(1, dtype=np.uint32)
+            cuda.memcpy_dtoh(found_nonce, found_nonce_gpu)
+            if found_nonce[0] != 0xffffffff:
+                nNonce = found_nonce[0]
+                # Submit the found nonce
+                nonce = hex(nNonce)[2:].zfill(8)
+                blockheader = version + prevhash + merkle_root + ntime + nbits + nonce
+                hash = hashlib.sha256(hashlib.sha256(binascii.unhexlify(blockheader)).digest()).digest()
+                hash = binascii.hexlify(hash).decode()
+                hash = "".join(reversed([hash[i:i+2] for i in range(0, len(hash), 2)]))
 
-            now = time.time()
-            if mode == 'solo':
-                logg('[*] Block {} solved.'.format(work_on+1))
-            else:
-                logg('[*] Share found for block {}.'.format(work_on+1))
-            logg('[*] Hash: {}'.format(hash))
-            logg('[*] Blockheader: {}'.format(blockheader))            
-            payload = bytes('{"params": ["' + user + '", "' + job_id + '", "' + extranonce2 + '", "' + ntime + '", "' + nonce + '"], "id": 1, "method": "mining.submit"}\n', 'utf-8')
-            logg('[*] Payload: {}'.format(payload))
-            sock.sendall(payload)
-            ret = sock.recv(1024)
-            try:
-                response = json.loads(ret.decode().strip())
-                if response.get('result'):
-                    with ctx.lock:
-                        accepted += 1
-                        accepted_timestamps.append(now)
+                now = time.time()
+                if mode == 'solo':
+                    logg('[*] Block {} solved.'.format(work_on+1))
                 else:
-                    with ctx.lock:
-                        rejected += 1
-                        rejected_timestamps.append(now)
-                    logg('[*] {} rejected: {}'.format('Block' if mode == 'solo' else 'Share', response.get('error')))
-            except:
-                logg('[*] Error parsing pool response: {}'.format(ret))
-            return True
+                    logg('[*] Share found for block {}.'.format(work_on+1))
+                logg('[*] Hash: {}'.format(hash))
+                logg('[*] Blockheader: {}'.format(blockheader))            
+                payload = bytes('{"params": ["' + user + '", "' + job_id + '", "' + extranonce2 + '", "' + ntime + '", "' + nonce + '"], "id": 1, "method": "mining.submit"}\n', 'utf-8')
+                logg('[*] Payload: {}'.format(payload))
+                sock.sendall(payload)
+                ret = sock.recv(1024)
+                try:
+                    response = json.loads(ret.decode().strip())
+                    if response.get('result'):
+                        with ctx.lock:
+                            accepted += 1
+                            accepted_timestamps.append(now)
+                    else:
+                        with ctx.lock:
+                            rejected += 1
+                            rejected_timestamps.append(now)
+                        logg('[*] {} rejected: {}'.format('Block' if mode == 'solo' else 'Share', response.get('error')))
+                except:
+                    logg('[*] Error parsing pool response: {}'.format(ret))
+                return True
 
-        nonce_count += num_hashes_per_kernel
-        last_updated = calculate_hashrate(nonce_count, last_updated, thread_hr)
-        with ctx.lock:
-            ctx.hashrates[thread_id] = thread_hr[0]
+            nonce_count += num_hashes_per_kernel
+            # decrement starting nonce for next batch
+            nNonce -= num_hashes_per_kernel
+            if nNonce < 0:
+                nNonce = 0xffffffff  # wrap around
 
-        # CPU fallback or additional hashing (for hybrid)
-        # Perform some CPU hashes in parallel
+        # CPU hashing (always runs, or as fallback if GPU not enabled)
         for _ in range(10000):  # Small batch for CPU to contribute
             nNonce -= 1
             if nNonce < 0:
@@ -362,10 +373,9 @@ def bitcoin_miner(t, restarted=False, thread_id=0):
 
             nonce_count += 1
 
-        # decrement starting nonce for next batch
-        nNonce -= num_hashes_per_kernel
-        if nNonce < 0:
-            nNonce = 0xffffffff  # wrap around
+        last_updated = calculate_hashrate(nonce_count, last_updated, thread_hr)
+        with ctx.lock:
+            ctx.hashrates[thread_id] = thread_hr[0]
 
        
 
@@ -519,6 +529,7 @@ class DisplayThread(ExitedThread):
                 stdscr.addstr(5, 0, f"{label}: ")
                 stdscr.attron(curses.color_pair(1))
                 stdscr.addstr(f"Accepted {accepted} ")
+                stdscr.attroff(curses.color_pair(1))
                 stdscr.attroff(curses.color_pair(1))
                 stdscr.attron(curses.color_pair(2))
                 stdscr.addstr(f"Rejected {rejected}")
