@@ -29,7 +29,7 @@ merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
 sock = None
 target = None
-mode = "pool"
+mode = "solo"
 host = port = user = password = None
 
 # ======================  LOGGER ======================
@@ -86,6 +86,15 @@ def submit_share(nonce):
         resp = sock.recv(1024).decode().strip()
         logg(f"[+] Share submitted → {resp}")
 
+        # Check if it's a block
+        header = version + prevhash + calculate_merkle_root() + ntime + nbits
+        full_header = header + f"{nonce:08x}"
+        h = hashlib.sha256(hashlib.sha256(binascii.unhexlify(full_header)).digest()).digest()
+        h_hex = binascii.hexlify(h[::-1]).decode()
+
+        network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+        is_block = h_hex < network_target
+
         with lock:
             if "true" in resp.lower():
                 global accepted, accepted_timestamps
@@ -97,6 +106,17 @@ def submit_share(nonce):
                 print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
                 print("="*60 + "\n")
                 print("\a", end="", flush=True)  # beep
+                if is_block:
+                    print("\n" + "="*80)
+                    print("█" + " "*78 + "█")
+                    print("█" + " "*28 + "BLOCK SOLVED!!!" + " "*33 + "█")
+                    print("█" + " "*78 + "█")
+                    print(f"█  Nonce      : {nonce:08x} ( {nonce} )")
+                    print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"█  Target met: BLOCK")
+                    print("█" + " "*78 + "█")
+                    print("="*80 + "\n")
+                    print("\a" * 3, end="", flush=True)  # triple beep for block
             else:
                 global rejected, rejected_timestamps
                 rejected += 1
@@ -239,7 +259,7 @@ def display_worker():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["solo","pool"], default="pool")
-    parser.add_argument("--benchmark", type=int, default=10, help="Run benchmark for N seconds before mining (0 to disable)")
+    parser.add_argument("--benchmark", type=int, default=0, help="Run benchmark for N seconds (0 to disable)")
     args = parser.parse_args()
 
     mode = args.mode
@@ -250,7 +270,6 @@ if __name__ == "__main__":
 
     hashrates = [0] * num_threads
 
-    # Benchmark mode
     if args.benchmark > 0:
         run_benchmark(args.benchmark)
 
