@@ -220,6 +220,7 @@ def stratum_worker():
 
 # ======================  DISPLAY ======================
 def display_worker():
+    global fShutdown
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
