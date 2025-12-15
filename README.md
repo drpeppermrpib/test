@@ -50,6 +50,18 @@ def logg(msg):
 
 logg("[*] Miner starting...")
 
+# ======================  OPTIONAL GPU (safe) ======================
+gpu_enabled = False
+try:
+    import numpy as np
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    from pycuda.compiler import SourceModule
+    gpu_enabled = True
+    logg("[*] PyCUDA loaded – GPU support active")
+except Exception as e:
+    logg(f"[!] PyCUDA not found ({e}) – CPU-only mode")
+
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
 SOLO_PORT = 3333
@@ -100,12 +112,38 @@ def submit_share(nonce):
                 global accepted, accepted_timestamps
                 accepted += 1
                 accepted_timestamps.append(time.time())
+                print("\n" + "="*60)
+                print("*** SHARE ACCEPTED ***")
+                print(f"Nonce: {nonce:08x}")
+                print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("="*60 + "\n")
+                print("\a", end="", flush=True)  # beep
             else:
                 global rejected, rejected_timestamps
                 rejected += 1
                 rejected_timestamps.append(time.time())
+                logg("[!] Share rejected")
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
+
+# ======================  BENCHMARK ======================
+def run_benchmark(seconds=10):
+    logg(f"[*] Running {seconds}-second benchmark...")
+    start_time = time.time()
+    hashes = 0
+    nonce = 0
+    dummy_header = b"dummy" * 20  # dummy data for benchmarking
+
+    while time.time() - start_time < seconds:
+        for _ in range(10000):
+            h = hashlib.sha256(hashlib.sha256(dummy_header + nonce.to_bytes(4,'little')).digest()).digest()
+            hashes += 1
+            nonce += 1
+
+    elapsed = time.time() - start_time
+    hr = int(hashes / elapsed) if elapsed > 0 else 0
+    logg(f"[*] Benchmark complete: {hr:,} H/s ({hashes:,} hashes in {elapsed:.2f}s)")
+    return hr
 
 # ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
@@ -191,9 +229,13 @@ def thread_scaler():
         load1, _, _ = os.getloadavg()
         current_load = load1
 
-        if current_load < 40:  # slowly increase until ~46
+        if current_load < 46:  # slowly increase until ~46
             num_threads = min(max_threads, num_threads + 4)
             logg(f"[*] Load {current_load:.2f} – increasing to {num_threads} threads")
+            # Add new threads if needed
+            for i in range(num_threads - len(hashrates)):
+                threading.Thread(target=bitcoin_miner, args=(len(hashrates),), daemon=True).start()
+                hashrates.append(0)
         elif current_load > 48:
             num_threads = max(initial_threads, num_threads - 4)
             logg(f"[*] Load {current_load:.2f} – decreasing to {num_threads} threads")
@@ -260,7 +302,7 @@ original_print = print
 def custom_print(*args, **kwargs):
     original_print(*args, **kwargs)
     msg = " ".join(str(a) for a in args)
-    if "[!]" in msg or "error" in msg.lower():
+    if "[*]" in msg or "error" in msg.lower():
         with lock:
             error_lines.append(msg)
 
