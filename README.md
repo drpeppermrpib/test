@@ -44,18 +44,6 @@ def logg(msg):
 
 logg("[*] Miner starting...")
 
-# ======================  OPTIONAL GPU (safe) ======================
-gpu_enabled = False
-try:
-    import numpy as np
-    import pycuda.driver as cuda
-    import pycuda.autoinit
-    from pycuda.compiler import SourceModule
-    gpu_enabled = True
-    logg("[*] PyCUDA loaded – GPU support active")
-except Exception as e:
-    logg(f"[!] PyCUDA not found ({e}) – CPU-only mode")
-
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
 SOLO_PORT = 3333
@@ -97,21 +85,49 @@ def submit_share(nonce):
         sock.sendall((json.dumps(payload) + "\n").encode())
         resp = sock.recv(1024).decode().strip()
         logg(f"[+] Share submitted → {resp}")
+
         with lock:
             if "true" in resp.lower():
                 global accepted, accepted_timestamps
                 accepted += 1
                 accepted_timestamps.append(time.time())
+                print("\n" + "="*60)
+                print("*** SHARE ACCEPTED ***")
+                print(f"Nonce: {nonce:08x}")
+                print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("="*60 + "\n")
+                print("\a", end="", flush=True)  # beep
             else:
                 global rejected, rejected_timestamps
                 rejected += 1
                 rejected_timestamps.append(time.time())
+                logg("[!] Share rejected")
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
+# ======================  BENCHMARK ======================
+def run_benchmark(seconds=10):
+    logg(f"[*] Running {seconds}-second benchmark...")
+    start_time = time.time()
+    hashes = 0
+    nonce = 0
+    dummy_header = b"dummy" * 20  # dummy data for benchmarking
+
+    while time.time() - start_time < seconds:
+        for _ in range(10000):
+            h = hashlib.sha256(hashlib.sha256(dummy_header + nonce.to_bytes(4,'little')).digest()).digest()
+            hashes += 1
+            nonce += 1
+
+    elapsed = time.time() - start_time
+    hr = int(hashes / elapsed) if elapsed > 0 else 0
+    logg(f"[*] Benchmark complete: {hr:,} H/s ({hashes:,} hashes in {elapsed:.2f}s)")
+    return hr
+
 # ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
-    # wait for job
+    global nbits, version, prevhash, ntime, target
+
     while None in (nbits, version, prevhash, ntime):
         time.sleep(0.5)
 
@@ -125,34 +141,7 @@ def bitcoin_miner(thread_id):
     last_report = time.time()
 
     while not fShutdown:
-        # GPU batch (optional)
-        if gpu_enabled:
-            try:
-                batch = 8_000_000
-                grid = (batch + 1023) // 1024
-                found = np.array([0xffffffff], dtype=np.uint32)
-                found_gpu = cuda.to_device(found)
-
-                cuda_mod.get_function("mine_kernel")(
-                    cuda.In(header_bytes), np.uint32(len(header_bytes)),
-                    np.uint32(nonce - batch), np.uint32(batch),
-                    cuda.In(binascii.unhexlify(current_target)),
-                    found_gpu,
-                    block=(1024,1,1), grid=(grid,1)
-                )
-
-                cuda.memcpy_dtoh(found, found_gpu)
-                if found[0] != 0xffffffff:
-                    submit_share(int(found[0]))
-                    return
-                hashes_done += batch
-                nonce -= batch
-            except Exception as e:
-                # silently fall back to CPU
-                pass
-
-        # CPU batch
-        for _ in range(50000):
+        for _ in range(100000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
@@ -204,6 +193,7 @@ def stratum_worker():
                     logg(f"[*] New job #{job_id}")
                 elif msg.get("method") == "mining.set_difficulty":
                     target = diff_to_target(msg["params"][0])
+                    logg(f"[*] Difficulty set to {msg['params'][0]}")
         except Exception as e:
             logg(f"[!] Stratum error: {e}")
             break
@@ -226,7 +216,7 @@ def display_worker():
                 a_min = sum(1 for t in accepted_timestamps if now-t<60)
                 r_min = sum(1 for t in rejected_timestamps if now-t<60)
 
-            stdscr.addstr(0,0,f"Bitcoin {mode.upper()} Miner (CPU{'+GPU' if gpu_enabled else ''})", curses.color_pair(4)|curses.A_BOLD)
+            stdscr.addstr(0,0,f"Bitcoin {mode.upper()} Miner (CPU)", curses.color_pair(4)|curses.A_BOLD)
             try:
                 height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
@@ -249,6 +239,7 @@ def display_worker():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["solo","pool"], default="pool")
+    parser.add_argument("--benchmark", type=int, default=10, help="Run benchmark for N seconds before mining (0 to disable)")
     args = parser.parse_args()
 
     mode = args.mode
@@ -258,6 +249,10 @@ if __name__ == "__main__":
         host, port, user, password = POOL_HOST, POOL_PORT, POOL_WORKER, POOL_PASSWORD
 
     hashrates = [0] * num_threads
+
+    # Benchmark mode
+    if args.benchmark > 0:
+        run_benchmark(args.benchmark)
 
     threading.Thread(target=stratum_worker, daemon=True).start()
     time.sleep(3)
