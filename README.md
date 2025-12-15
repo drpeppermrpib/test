@@ -15,6 +15,13 @@ import curses
 import argparse
 import signal
 
+# ======================  CRITICAL: diff_to_target MUST BE DEFINED FIRST ======================
+def diff_to_target(diff):
+    """Convert difficulty to 64-character hex target (Bitcoin format)"""
+    diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+    target_int = diff1 // int(diff)
+    return format(target_int, '064x')
+
 # ======================  GLOBALS ======================
 fShutdown = False
 hashrates = []
@@ -29,7 +36,7 @@ merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
 sock = None
 target = None
-mode = "solo"
+mode = "pool"
 host = port = user = password = None
 
 # ======================  LOGGER ======================
@@ -43,6 +50,18 @@ def logg(msg):
         pass
 
 logg("[*] Miner starting...")
+
+# ======================  OPTIONAL GPU (safe) ======================
+gpu_enabled = False
+try:
+    import numpy as np
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    from pycuda.compiler import SourceModule
+    gpu_enabled = True
+    logg("[*] PyCUDA loaded – GPU support active")
+except Exception as e:
+    logg(f"[!] PyCUDA not found ({e}) – CPU-only mode")
 
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
@@ -86,15 +105,6 @@ def submit_share(nonce):
         resp = sock.recv(1024).decode().strip()
         logg(f"[+] Share submitted → {resp}")
 
-        # Check if it's a block
-        header = version + prevhash + calculate_merkle_root() + ntime + nbits
-        full_header = header + f"{nonce:08x}"
-        h = hashlib.sha256(hashlib.sha256(binascii.unhexlify(full_header)).digest()).digest()
-        h_hex = binascii.hexlify(h[::-1]).decode()
-
-        network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
-        is_block = h_hex < network_target
-
         with lock:
             if "true" in resp.lower():
                 global accepted, accepted_timestamps
@@ -106,17 +116,6 @@ def submit_share(nonce):
                 print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
                 print("="*60 + "\n")
                 print("\a", end="", flush=True)  # beep
-                if is_block:
-                    print("\n" + "="*80)
-                    print("█" + " "*78 + "█")
-                    print("█" + " "*28 + "BLOCK SOLVED!!!" + " "*33 + "█")
-                    print("█" + " "*78 + "█")
-                    print(f"█  Nonce      : {nonce:08x} ( {nonce} )")
-                    print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                    print(f"█  Target met: BLOCK")
-                    print("█" + " "*78 + "█")
-                    print("="*80 + "\n")
-                    print("\a" * 3, end="", flush=True)  # triple beep for block
             else:
                 global rejected, rejected_timestamps
                 rejected += 1
@@ -220,7 +219,6 @@ def stratum_worker():
 
 # ======================  DISPLAY ======================
 def display_worker():
-    global fShutdown
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -247,12 +245,9 @@ def display_worker():
             stdscr.addstr(4,0,f"Threads      : {num_threads}", curses.color_pair(3))
             stdscr.addstr(5,0,f"Shares       : {accepted} accepted / {rejected} rejected")
             stdscr.addstr(6,0,f"Last minute  : {a_min} acc / {r_min} rej")
-            stdscr.addstr(8,0,"Press q to quit", curses.color_pair(3))
+            stdscr.addstr(8,0,"Press Ctrl+C to quit", curses.color_pair(3))
             stdscr.refresh()
             time.sleep(1)
-            if stdscr.getch() == ord('q'):
-                global fShutdown
-                fShutdown = True
     finally:
         curses.endwin()
 
@@ -282,7 +277,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=display_worker, daemon=True).start()
 
-    logg("[*] Miner running – press Ctrl+C or 'q' to stop")
+    logg("[*] Miner running – press Ctrl+C to stop")
     try:
         while not fShutdown:
             time.sleep(1)
