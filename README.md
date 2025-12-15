@@ -52,18 +52,13 @@ logg("[*] Miner starting...")
 
 # ======================  OPTIONAL GPU (safe) ======================
 gpu_enabled = False
+cuda_mod = None
 try:
     import numpy as np
     import pycuda.driver as cuda
     import pycuda.autoinit
     from pycuda.compiler import SourceModule
-    gpu_enabled = True
-    logg("[*] PyCUDA loaded – GPU support active")
-except Exception as e:
-    logg(f"[!] PyCUDA not found ({e}) – CPU-only mode")
-
-# CUDA kernel for SHA256 (optimized from open-source examples)
-if gpu_enabled:
+    # Try to compile kernel
     cuda_mod = SourceModule("""
     #include <stdint.h>
 
@@ -178,6 +173,7 @@ if gpu_enabled:
         uint32_t state[8];
         sha256_init(state);
         sha256_transform(state, header);
+        uint32_t state2[8];
         sha256_init(state2);
         sha256_transform(state2, (uint8_t*)state);  # double hash
 
@@ -191,7 +187,11 @@ if gpu_enabled:
             atomicMin(found_nonce, nonce);
         }
     }
-    """)
+    """, options=['--gpu-architecture=sm_89'])
+    logg("[*] CUDA kernel compiled for RTX 4090 (sm_89)")
+except Exception as e:
+    gpu_enabled = False
+    logg(f"[!] CUDA compilation failed: {e} – disabling GPU")
 
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
@@ -273,7 +273,7 @@ def run_benchmark(seconds=10):
 
     elapsed = time.time() - start_time
     hr = int(hashes / elapsed) if elapsed > 0 else 0
-    logg(f"[*] Benchmark complete: {hr:,} H/s ({hashes:,} hashes in {elapsed:.2f}s)")
+    logg(f"[*] Benchmark complete: {hr:,} H/s ({hashes:,} hashes in {elapsed:.2f}s}")
     return hr
 
 # ======================  MINING LOOP ======================
