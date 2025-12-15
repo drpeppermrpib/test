@@ -15,9 +15,8 @@ import curses
 import argparse
 import signal
 
-# ======================  CRITICAL: diff_to_target MUST BE DEFINED FIRST ======================
+# ======================  diff_to_target ======================
 def diff_to_target(diff):
-    """Convert difficulty to 64-character hex target (Bitcoin format)"""
     diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
@@ -51,18 +50,6 @@ def logg(msg):
 
 logg("[*] Miner starting...")
 
-# ======================  OPTIONAL GPU (safe) ======================
-gpu_enabled = False
-try:
-    import numpy as np
-    import pycuda.driver as cuda
-    import pycuda.autoinit
-    from pycuda.compiler import SourceModule
-    gpu_enabled = True
-    logg("[*] PyCUDA loaded – GPU support active")
-except Exception as e:
-    logg(f"[!] PyCUDA not found ({e}) – CPU-only mode")
-
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
 SOLO_PORT = 3333
@@ -73,7 +60,10 @@ POOL_PORT = 3333
 POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
-num_threads = max(1, os.cpu_count() * 2)
+# Start with low threads and slowly increase to reach high load
+initial_threads = 4
+max_threads = max(1, os.cpu_count() * 2)  # e.g. 48 on your rig
+num_threads = initial_threads
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -110,38 +100,12 @@ def submit_share(nonce):
                 global accepted, accepted_timestamps
                 accepted += 1
                 accepted_timestamps.append(time.time())
-                print("\n" + "="*60)
-                print("*** SHARE ACCEPTED ***")
-                print(f"Nonce: {nonce:08x}")
-                print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("="*60 + "\n")
-                print("\a", end="", flush=True)  # beep
             else:
                 global rejected, rejected_timestamps
                 rejected += 1
                 rejected_timestamps.append(time.time())
-                logg("[!] Share rejected")
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
-
-# ======================  BENCHMARK ======================
-def run_benchmark(seconds=10):
-    logg(f"[*] Running {seconds}-second benchmark...")
-    start_time = time.time()
-    hashes = 0
-    nonce = 0
-    dummy_header = b"dummy" * 20  # dummy data for benchmarking
-
-    while time.time() - start_time < seconds:
-        for _ in range(10000):
-            h = hashlib.sha256(hashlib.sha256(dummy_header + nonce.to_bytes(4,'little')).digest()).digest()
-            hashes += 1
-            nonce += 1
-
-    elapsed = time.time() - start_time
-    hr = int(hashes / elapsed) if elapsed > 0 else 0
-    logg(f"[*] Benchmark complete: {hr:,} H/s ({hashes:,} hashes in {elapsed:.2f}s)")
-    return hr
 
 # ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
@@ -217,6 +181,23 @@ def stratum_worker():
             logg(f"[!] Stratum error: {e}")
             break
 
+# ======================  DYNAMIC THREAD SCALING ======================
+def thread_scaler():
+    global num_threads
+    while not fShutdown:
+        time.sleep(30)  # check every 30 seconds
+        if fShutdown: break
+
+        load1, _, _ = os.getloadavg()
+        current_load = load1
+
+        if current_load < 40:  # slowly increase until ~46
+            num_threads = min(max_threads, num_threads + 4)
+            logg(f"[*] Load {current_load:.2f} – increasing to {num_threads} threads")
+        elif current_load > 48:
+            num_threads = max(initial_threads, num_threads - 4)
+            logg(f"[*] Load {current_load:.2f} – decreasing to {num_threads} threads")
+
 # ======================  DISPLAY ======================
 def display_worker():
     stdscr = curses.initscr()
@@ -225,37 +206,70 @@ def display_worker():
     curses.init_pair(2, curses.COLOR_RED,    curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
+    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)  # pink for errors
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
+
+    error_lines = []
+    max_errors = 10
 
     try:
         while not fShutdown:
             stdscr.clear()
+            height, width = stdscr.getmaxyx()
+
             now = time.time()
             with lock:
                 a_min = sum(1 for t in accepted_timestamps if now-t<60)
                 r_min = sum(1 for t in rejected_timestamps if now-t<60)
 
-            stdscr.addstr(0,0,f"Bitcoin {mode.upper()} Miner (CPU)", curses.color_pair(4)|curses.A_BOLD)
+            # Top right: Ctrl+C to quit
+            stdscr.addstr(0, max(0, width - 20), "Ctrl+C to quit", curses.color_pair(3))
+
+            # Title
+            title = f"Bitcoin {mode.upper()} Miner (CPU)"
+            stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
+
+            # Static stats
             try:
                 height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
                 height = "???"
-            stdscr.addstr(2,0,f"Block height : ~{height}", curses.color_pair(3))
-            stdscr.addstr(3,0,f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(4,0,f"Threads      : {num_threads}", curses.color_pair(3))
-            stdscr.addstr(5,0,f"Shares       : {accepted} accepted / {rejected} rejected")
-            stdscr.addstr(6,0,f"Last minute  : {a_min} acc / {r_min} rej")
-            stdscr.addstr(8,0,"Press Ctrl+C to quit", curses.color_pair(3))
+            stdscr.addstr(4, 0, f"Block height : ~{height}", curses.color_pair(3))
+            stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
+            stdscr.addstr(6, 0, f"Threads      : {num_threads}", curses.color_pair(3))
+            stdscr.addstr(7, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
+            stdscr.addstr(8, 0, f"Last minute  : {a_min} acc / {r_min} rej")
+
+            # Horizontal line
+            stdscr.addstr(10, 0, "─" * (width - 1), curses.color_pair(3))
+
+            # Dynamic log / errors on the right (pink)
+            start_y = 11
+            for i, line in enumerate(error_lines[-max_errors:]):
+                if start_y + i >= height:
+                    break
+                stdscr.addstr(start_y + i, 0, line[:width-1], curses.color_pair(5))
+
             stdscr.refresh()
             time.sleep(1)
     finally:
         curses.endwin()
 
+# Override print to capture logs for display
+original_print = print
+def custom_print(*args, **kwargs):
+    original_print(*args, **kwargs)
+    msg = " ".join(str(a) for a in args)
+    if "[!]" in msg or "error" in msg.lower():
+        with lock:
+            error_lines.append(msg)
+
+print = custom_print
+
 # ======================  MAIN ======================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["solo","pool"], default="pool")
-    parser.add_argument("--benchmark", type=int, default=0, help="Run benchmark for N seconds (0 to disable)")
     args = parser.parse_args()
 
     mode = args.mode
@@ -266,15 +280,17 @@ if __name__ == "__main__":
 
     hashrates = [0] * num_threads
 
-    if args.benchmark > 0:
-        run_benchmark(args.benchmark)
-
     threading.Thread(target=stratum_worker, daemon=True).start()
     time.sleep(3)
 
-    for i in range(num_threads):
+    # Start initial miners
+    for i in range(initial_threads):
         threading.Thread(target=bitcoin_miner, args=(i,), daemon=True).start()
 
+    # Dynamic thread scaler
+    threading.Thread(target=thread_scaler, daemon=True).start()
+
+    # Display
     threading.Thread(target=display_worker, daemon=True).start()
 
     logg("[*] Miner running – press Ctrl+C to stop")
