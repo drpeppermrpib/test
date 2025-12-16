@@ -14,6 +14,7 @@ import os
 import curses
 import argparse
 import signal
+import threading  # <-- Added this import to fix "name 'threading' is not defined"
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -45,11 +46,10 @@ def get_ckpool_stats():
     try:
         r = requests.get(url, timeout=10)
         text = r.text
-        # Updated regex to match current page format
-        hashrate = re.search(r'Hashrate.*?([0-9\.]+ ?[KMGT]H/s)', text, re.DOTALL)
-        last_share = re.search(r'Last Share.*?([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})', text, re.DOTALL)
-        best_share = re.search(r'Best Share.*?([0-9\.]+[KMGT])', text, re.DOTALL)
-        shares = re.search(r'Shares.*?([0-9,]+)', text, re.DOTALL)
+        hashrate = re.search(r'Hashrate</td><td>([^<]+)', text)
+        last_share = re.search(r'Last Share</td><td>([^<]+)', text)
+        best_share = re.search(r'Best Share</td><td>([^<]+)', text)
+        shares = re.search(r'Shares</td><td>([^<]+)', text)
 
         return {
             "hashrate": hashrate.group(1).strip() if hashrate else "N/A",
@@ -101,7 +101,7 @@ POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
 num_cores = os.cpu_count()
-num_processes = num_cores  # Use all physical cores for true scaling
+num_processes = num_cores  # Use all physical cores
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -195,7 +195,6 @@ def bitcoin_miner_process(process_id):
                     print("="*80 + "\n")
                     print("\a" * 5, end="", flush=True)  # loud beep for block
 
-            # Report hashrate more frequently
             if hashes_done % 500000 == 0:
                 now = time.time()
                 elapsed = now - last_report
@@ -281,15 +280,13 @@ def display_worker():
             stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            # ckpool stats (moved above the line)
+            # ckpool stats
             stats = get_ckpool_stats()
-            stdscr.addstr(11, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
-            stdscr.addstr(12, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
-            stdscr.addstr(13, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
-            stdscr.addstr(14, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
-
-            # Horizontal line
-            stdscr.addstr(16, 0, "─" * (screen_width - 1), curses.color_pair(3))
+            stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
+            stdscr.addstr(12, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
+            stdscr.addstr(13, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
+            stdscr.addstr(14, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
+            stdscr.addstr(15, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
 
             stdscr.refresh()
             time.sleep(1)
