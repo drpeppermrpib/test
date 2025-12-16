@@ -14,7 +14,7 @@ import os
 import curses
 import argparse
 import signal
-import re  # for parsing ckpool stats page
+import re  # for parsing ckpool stats
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -25,7 +25,7 @@ def diff_to_target(diff):
 # ======================  CPU TEMPERATURE ======================
 def get_cpu_temp():
     temps = []
-    for zone in range(20):  # check multiple thermal zones
+    for zone in range(20):
         path = f"/sys/class/thermal/thermal_zone{zone}/temp"
         if os.path.exists(path):
             try:
@@ -40,25 +40,23 @@ def get_cpu_temp():
         return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
     return "N/A"
 
-# ======================  CKPOOL STATS FETCHER ======================
+# ======================  CKPOOL STATS ======================
 def get_ckpool_stats():
     url = "https://solostats.ckpool.org/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
     try:
         r = requests.get(url, timeout=10)
         text = r.text
-
         hashrate = re.search(r'Hashrate</td><td>([^<]+)', text)
         last_share = re.search(r'Last Share</td><td>([^<]+)', text)
         best_share = re.search(r'Best Share</td><td>([^<]+)', text)
         shares = re.search(r'Shares</td><td>([^<]+)', text)
 
-        stats = {
+        return {
             "hashrate": hashrate.group(1).strip() if hashrate else "N/A",
             "last_share": last_share.group(1).strip() if last_share else "N/A",
             "best_share": best_share.group(1).strip() if best_share else "N/A",
             "shares": shares.group(1).strip() if shares else "N/A"
         }
-        return stats
     except:
         return {"hashrate": "N/A", "last_share": "N/A", "best_share": "N/A", "shares": "N/A"}
 
@@ -326,7 +324,7 @@ def display_worker():
             stdscr.addstr(8, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            # ckpool stats on the left
+            # ckpool stats
             stats = get_ckpool_stats()
             stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
             stdscr.addstr(12, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
@@ -334,12 +332,12 @@ def display_worker():
             stdscr.addstr(14, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
             stdscr.addstr(15, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
 
-            # Dynamic log / errors on the right (pink)
-            start_y = 12
+            # Dynamic log / errors (pink)
+            start_y = 17
             for i, line in enumerate(error_lines[-max_errors:]):
                 if start_y + i >= screen_height:
                     break
-                stdscr.addstr(start_y + i, 40, line[:screen_width-41], curses.color_pair(5))
+                stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
 
             stdscr.refresh()
             time.sleep(1)
