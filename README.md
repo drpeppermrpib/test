@@ -77,9 +77,14 @@ target = None
 mode = "pool"
 host = port = user = password = None
 
+# Global error lines for display
+error_lines = []
+max_errors = 10
+
 # ======================  LOGGER ======================
 def logg(msg):
-    print(msg)
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
     try:
         logging.basicConfig(level=logging.INFO, filename="miner.log",
                             format='%(asctime)s %(message)s', force=True)
@@ -151,12 +156,14 @@ def submit_share(nonce):
                 global accepted, accepted_timestamps
                 accepted += 1
                 accepted_timestamps.append(time.time())
-                print("\n" + "="*60)
-                print("*** SHARE ACCEPTED ***")
-                print(f"Nonce: {nonce:08x}")
-                print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("="*60 + "\n")
-                print("\a", end="", flush=True)  # beep
+                sys.stdout.write("\n" + "="*60 + "\n")
+                sys.stdout.write("*** SHARE ACCEPTED ***\n")
+                sys.stdout.write(f"Nonce: {nonce:08x}\n")
+                sys.stdout.write(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                sys.stdout.write("="*60 + "\n")
+                sys.stdout.flush()
+                sys.stdout.write("\a")
+                sys.stdout.flush()
             else:
                 global rejected, rejected_timestamps
                 rejected += 1
@@ -281,6 +288,7 @@ def thread_scaler():
 
 # ======================  DISPLAY ======================
 def display_worker():
+    global error_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -289,9 +297,6 @@ def display_worker():
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)  # pink for errors
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
-
-    error_lines = []
-    max_errors = 10
 
     try:
         while not fShutdown:
