@@ -14,12 +14,53 @@ import os
 import curses
 import argparse
 import signal
+import re  # for parsing ckpool stats page
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
     diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
+
+# ======================  CPU TEMPERATURE ======================
+def get_cpu_temp():
+    temps = []
+    for zone in range(20):  # check multiple thermal zones
+        path = f"/sys/class/thermal/thermal_zone{zone}/temp"
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    temp = int(f.read().strip()) / 1000
+                    temps.append(temp)
+            except:
+                pass
+    if temps:
+        avg = sum(temps) / len(temps)
+        max_temp = max(temps)
+        return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
+    return "N/A"
+
+# ======================  CKPOOL STATS FETCHER ======================
+def get_ckpool_stats():
+    url = "https://solostats.ckpool.org/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
+    try:
+        r = requests.get(url, timeout=10)
+        text = r.text
+
+        hashrate = re.search(r'Hashrate</td><td>([^<]+)', text)
+        last_share = re.search(r'Last Share</td><td>([^<]+)', text)
+        best_share = re.search(r'Best Share</td><td>([^<]+)', text)
+        shares = re.search(r'Shares</td><td>([^<]+)', text)
+
+        stats = {
+            "hashrate": hashrate.group(1).strip() if hashrate else "N/A",
+            "last_share": last_share.group(1).strip() if last_share else "N/A",
+            "best_share": best_share.group(1).strip() if best_share else "N/A",
+            "shares": shares.group(1).strip() if shares else "N/A"
+        }
+        return stats
+    except:
+        return {"hashrate": "N/A", "last_share": "N/A", "best_share": "N/A", "shares": "N/A"}
 
 # ======================  GLOBALS ======================
 fShutdown = False
@@ -38,14 +79,9 @@ target = None
 mode = "pool"
 host = port = user = password = None
 
-# Global error lines for display (defined early to avoid NameError)
-error_lines = []
-max_errors = 10
-
 # ======================  LOGGER ======================
 def logg(msg):
-    sys.stdout.write(msg + "\n")
-    sys.stdout.flush()
+    print(msg)
     try:
         logging.basicConfig(level=logging.INFO, filename="miner.log",
                             format='%(asctime)s %(message)s', force=True)
@@ -117,14 +153,12 @@ def submit_share(nonce):
                 global accepted, accepted_timestamps
                 accepted += 1
                 accepted_timestamps.append(time.time())
-                sys.stdout.write("\n" + "="*60 + "\n")
-                sys.stdout.write("*** SHARE ACCEPTED ***\n")
-                sys.stdout.write(f"Nonce: {nonce:08x}\n")
-                sys.stdout.write(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                sys.stdout.write("="*60 + "\n")
-                sys.stdout.flush()
-                sys.stdout.write("\a")
-                sys.stdout.flush()
+                print("\n" + "="*60)
+                print("*** SHARE ACCEPTED ***")
+                print(f"Nonce: {nonce:08x}")
+                print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("="*60 + "\n")
+                print("\a", end="", flush=True)  # beep
             else:
                 global rejected, rejected_timestamps
                 rejected += 1
@@ -218,7 +252,7 @@ def stratum_worker():
                 if msg.get("method") == "mining.notify":
                     (job_id, prevhash, coinb1, coinb2,
                      merkle_branch, version, nbits, ntime, _) = msg["params"]
-                    logg(f"[*] New job #{job_id}")
+                    logg(f"[*] New job #{job_id} | Prevhash: {prevhash}")
                 elif msg.get("method") == "mining.set_difficulty":
                     target = diff_to_target(msg["params"][0])
                     logg(f"[*] Difficulty set to {msg['params'][0]}")
@@ -249,7 +283,6 @@ def thread_scaler():
 
 # ======================  DISPLAY ======================
 def display_worker():
-    global error_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -258,6 +291,9 @@ def display_worker():
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)  # pink for errors
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
+
+    error_lines = []
+    max_errors = 10
 
     try:
         while not fShutdown:
@@ -268,6 +304,8 @@ def display_worker():
             with lock:
                 a_min = sum(1 for t in accepted_timestamps if now-t<60)
                 r_min = sum(1 for t in rejected_timestamps if now-t<60)
+
+            cpu_temp = get_cpu_temp()
 
             # Top right: Ctrl+C to quit
             stdscr.addstr(0, max(0, screen_width - 20), "Ctrl+C to quit", curses.color_pair(3))
@@ -283,19 +321,25 @@ def display_worker():
                 block_height = "???"
             stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
             stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(6, 0, f"Threads      : {num_threads}", curses.color_pair(3))
-            stdscr.addstr(7, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
-            stdscr.addstr(8, 0, f"Last minute  : {a_min} acc / {r_min} rej")
+            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
+            stdscr.addstr(7, 0, f"Threads      : {num_threads}", curses.color_pair(3))
+            stdscr.addstr(8, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
+            stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            # Horizontal line
-            stdscr.addstr(10, 0, "─" * (screen_width - 1), curses.color_pair(3))
+            # ckpool stats on the left
+            stats = get_ckpool_stats()
+            stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
+            stdscr.addstr(12, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
+            stdscr.addstr(13, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
+            stdscr.addstr(14, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
+            stdscr.addstr(15, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
 
             # Dynamic log / errors on the right (pink)
-            start_y = 11
+            start_y = 12
             for i, line in enumerate(error_lines[-max_errors:]):
                 if start_y + i >= screen_height:
                     break
-                stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
+                stdscr.addstr(start_y + i, 40, line[:screen_width-41], curses.color_pair(5))
 
             stdscr.refresh()
             time.sleep(1)
@@ -307,7 +351,7 @@ original_print = print
 def custom_print(*args, **kwargs):
     original_print(*args, **kwargs)
     msg = " ".join(str(a) for a in args)
-    if "[*]" in msg or "error" in msg.lower():
+    if "[*]" in msg or "[!]" in msg or "error" in msg.lower():
         with lock:
             error_lines.append(msg)
 
