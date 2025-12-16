@@ -14,6 +14,7 @@ import os
 import curses
 import argparse
 import signal
+import threading  # <-- This import fixes the "name 'threading' is not defined" error
 import re  # for parsing ckpool stats
 
 # ======================  diff_to_target ======================
