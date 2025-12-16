@@ -14,8 +14,7 @@ import os
 import curses
 import argparse
 import signal
-import threading  # <-- This import fixes the "name 'threading' is not defined" error
-import re  # for parsing ckpool stats
+import threading  # for display
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -70,7 +69,7 @@ rejected = manager.Value('i', 0)
 accepted_timestamps = manager.list()
 rejected_timestamps = manager.list()
 
-# job data
+# job data (updated by stratum)
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
@@ -113,6 +112,7 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # ======================  MERKLE ROOT ======================
 def calculate_merkle_root():
+    global extranonce2
     if None in (coinb1, extranonce1, extranonce2, coinb2, merkle_branch):
         return "0" * 64
     coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
@@ -153,28 +153,45 @@ def submit_share(nonce):
 
 # ======================  MINING PROCESS ======================
 def bitcoin_miner_process(process_id):
-    global nbits, version, prevhash, ntime, target
+    global nbits, version, prevhash, ntime, target, extranonce2
 
-    # Wait for job
-    while None in (nbits, version, prevhash, ntime):
-        time.sleep(0.5)
-
-    header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
-    header_bytes = binascii.unhexlify(header_static)
-
-    # Network (block) target
-    network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
-
-    # Share target for reporting hashrate (low in solo mode)
-    share_target = diff_to_target(4096) if mode == "solo" else target
+    last_prevhash = None
+    header_bytes = b""
+    current_target = "0" * 64
+    share_target = "0" * 64
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
     while not fShutdown.is_set():
-        # Larger batch for better efficiency and faster hashrate reporting
-        for _ in range(500000):
+        # Detect new job and recalc header
+        if prevhash != last_prevhash:
+            last_prevhash = prevhash
+            if None in (nbits, version, prevhash, ntime):
+                time.sleep(0.5)
+                continue
+
+            # Fixed extranonce2 = zeros for simplicity (works for ckpool solo)
+            global extranonce2_size
+            if extranonce2_size is not None:
+                extranonce2 = "00" * extranonce2_size
+            else:
+                extranonce2 = "00000000"  # fallback
+
+            header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
+            header_bytes = binascii.unhexlify(header_static)
+
+            # Network target for block
+            network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+
+            # Low share target for frequent reporting in solo
+            share_target = diff_to_target(4096)
+
+            logg(f"[*] New job detected – recalculated header for prevhash {prevhash}")
+
+        # Mining
+        for _ in range(200000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
@@ -194,7 +211,7 @@ def bitcoin_miner_process(process_id):
                     print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
                     print("█" + " "*78 + "█")
                     print("="*80 + "\n")
-                    print("\a" * 5, end="", flush=True)  # loud beep for block
+                    print("\a" * 5, end="", flush=True)
 
             if hashes_done % 500000 == 0:
                 now = time.time()
@@ -214,7 +231,11 @@ def stratum_worker():
     sock = s
 
     s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
-    s.recv(4096)
+    lines = s.recv(4096).decode().split('\n')
+    response = json.loads(lines[0])
+    extranonce1 = response['result'][1]
+    extranonce2_size = response['result'][2]
+    logg(f"[*] Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
 
     auth = {"id":2,"method":"mining.authorize","params":[user,password]}
     s.sendall((json.dumps(auth)+"\n").encode())
