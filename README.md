@@ -14,36 +14,12 @@ import os
 import curses
 import argparse
 import signal
-import re  # for parsing ckpool stats page
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
     diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
-
-# ======================  CKPOOL STATS FETCHER ======================
-def get_ckpool_stats():
-    url = "https://solostats.ckpool.org/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
-    try:
-        r = requests.get(url, timeout=10)
-        text = r.text
-
-        # Parse key stats (simple regex – reliable for ckpool page)
-        hashrate = re.search(r'Hashrate</td><td>([^<]+)', text)
-        last_share = re.search(r'Last Share</td><td>([^<]+)', text)
-        best_share = re.search(r'Best Share</td><td>([^<]+)', text)
-        shares = re.search(r'Shares</td><td>([^<]+)', text)
-
-        stats = {
-            "hashrate": hashrate.group(1).strip() if hashrate else "N/A",
-            "last_share": last_share.group(1).strip() if last_share else "N/A",
-            "best_share": best_share.group(1).strip() if best_share else "N/A",
-            "shares": shares.group(1).strip() if shares else "N/A"
-        }
-        return stats
-    except:
-        return {"hashrate": "N/A", "last_share": "N/A", "best_share": "N/A", "shares": "N/A"}
 
 # ======================  GLOBALS ======================
 fShutdown = False
@@ -62,6 +38,10 @@ target = None
 mode = "pool"
 host = port = user = password = None
 
+# Global error lines for display
+error_lines = []
+max_errors = 10
+
 # ======================  LOGGER ======================
 def logg(msg):
     print(msg)
@@ -73,6 +53,18 @@ def logg(msg):
         pass
 
 logg("[*] Miner starting...")
+
+# ======================  OPTIONAL GPU (safe) ======================
+gpu_enabled = False
+try:
+    import numpy as np
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    from pycuda.compiler import SourceModule
+    gpu_enabled = True
+    logg("[*] PyCUDA loaded – GPU support active")
+except Exception as e:
+    logg(f"[!] PyCUDA not found ({e}) – CPU-only mode")
 
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
@@ -167,10 +159,7 @@ def bitcoin_miner(thread_id):
     header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
     header_bytes = binascii.unhexlify(header_static)
 
-    # For solo, use a low share difficulty to submit shares regularly (shows hashrate on dashboard)
-    share_diff = 1024  # reasonable for solo to show activity
-    share_target = diff_to_target(share_diff)
-    network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+    current_target = target or (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
     nonce = 0xffffffff
     hashes_done = 0
@@ -183,20 +172,9 @@ def bitcoin_miner(thread_id):
             h_hex = binascii.hexlify(h[::-1]).decode()
 
             hashes_done += 1
-            # Submit share if meets share difficulty
-            if h_hex < share_target:
+            if h_hex < current_target:
                 submit_share(nonce)
-                # Check if it's a block
-                if h_hex < network_target:
-                    print("\n" + "="*80)
-                    print("█" + " "*78 + "█")
-                    print("█" + " "*28 + "BLOCK SOLVED!!!" + " "*33 + "█")
-                    print("█" + " "*78 + "█")
-                    print(f"█  Nonce      : {nonce:08x}")
-                    print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                    print("█" + " "*78 + "█")
-                    print("="*80 + "\n")
-                    print("\a" * 5, end="", flush=True)  # loud beep for block
+                return
 
             if hashes_done % 1_000_000 == 0:
                 now = time.time()
@@ -237,7 +215,7 @@ def stratum_worker():
                 if msg.get("method") == "mining.notify":
                     (job_id, prevhash, coinb1, coinb2,
                      merkle_branch, version, nbits, ntime, _) = msg["params"]
-                    logg(f"[*] New job #{job_id} | Prevhash: {prevhash}")
+                    logg(f"[*] New job #{job_id}")
                 elif msg.get("method") == "mining.set_difficulty":
                     target = diff_to_target(msg["params"][0])
                     logg(f"[*] Difficulty set to {msg['params'][0]}")
@@ -268,6 +246,7 @@ def thread_scaler():
 
 # ======================  DISPLAY ======================
 def display_worker():
+    global error_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -276,9 +255,6 @@ def display_worker():
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)  # pink for errors
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
-
-    error_lines = []
-    max_errors = 10
 
     try:
         while not fShutdown:
@@ -308,20 +284,15 @@ def display_worker():
             stdscr.addstr(7, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
             stdscr.addstr(8, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            # ckpool stats on the left
-            stats = get_ckpool_stats()
+            # Horizontal line
             stdscr.addstr(10, 0, "─" * (width - 1), curses.color_pair(3))
-            stdscr.addstr(11, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
-            stdscr.addstr(12, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
-            stdscr.addstr(13, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
-            stdscr.addstr(14, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
 
             # Dynamic log / errors on the right (pink)
             start_y = 11
             for i, line in enumerate(error_lines[-max_errors:]):
                 if start_y + i >= height:
                     break
-                stdscr.addstr(start_y + i, 40, line[:width-41], curses.color_pair(5))
+                stdscr.addstr(start_y + i, 0, line[:width-1], curses.color_pair(5))
 
             stdscr.refresh()
             time.sleep(1)
