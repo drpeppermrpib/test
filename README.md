@@ -38,10 +38,6 @@ target = None
 mode = "pool"
 host = port = user = password = None
 
-# Global error lines for display
-error_lines = []
-max_errors = 10
-
 # ======================  LOGGER ======================
 def logg(msg):
     print(msg)
@@ -246,7 +242,6 @@ def thread_scaler():
 
 # ======================  DISPLAY ======================
 def display_worker():
-    global error_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -256,10 +251,13 @@ def display_worker():
     curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)  # pink for errors
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
 
+    error_lines = []
+    max_errors = 10
+
     try:
         while not fShutdown:
             stdscr.clear()
-            height, width = stdscr.getmaxyx()
+            screen_height, screen_width = stdscr.getmaxyx()
 
             now = time.time()
             with lock:
@@ -267,7 +265,7 @@ def display_worker():
                 r_min = sum(1 for t in rejected_timestamps if now-t<60)
 
             # Top right: Ctrl+C to quit
-            stdscr.addstr(0, max(0, width - 20), "Ctrl+C to quit", curses.color_pair(3))
+            stdscr.addstr(0, max(0, screen_width - 20), "Ctrl+C to quit", curses.color_pair(3))
 
             # Title
             title = f"Bitcoin {mode.upper()} Miner (CPU)"
@@ -275,24 +273,24 @@ def display_worker():
 
             # Static stats
             try:
-                height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
+                block_height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
-                height = "???"
-            stdscr.addstr(4, 0, f"Block height : ~{height}", curses.color_pair(3))
+                block_height = "???"
+            stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
             stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
             stdscr.addstr(6, 0, f"Threads      : {num_threads}", curses.color_pair(3))
             stdscr.addstr(7, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
             stdscr.addstr(8, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
             # Horizontal line
-            stdscr.addstr(10, 0, "─" * (width - 1), curses.color_pair(3))
+            stdscr.addstr(10, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
             # Dynamic log / errors on the right (pink)
             start_y = 11
             for i, line in enumerate(error_lines[-max_errors:]):
-                if start_y + i >= height:
+                if start_y + i >= screen_height:
                     break
-                stdscr.addstr(start_y + i, 0, line[:width-1], curses.color_pair(5))
+                stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
 
             stdscr.refresh()
             time.sleep(1)
