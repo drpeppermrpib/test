@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import threading
+import multiprocessing
 import requests
 import binascii
 import hashlib
@@ -60,13 +60,14 @@ def get_ckpool_stats():
     except:
         return {"hashrate": "N/A", "last_share": "N/A", "best_share": "N/A", "shares": "N/A"}
 
-# ======================  GLOBALS ======================
-fShutdown = False
-hashrates = []
-accepted = rejected = 0
-accepted_timestamps = []
-rejected_timestamps = []
-lock = threading.Lock()
+# ======================  GLOBALS (shared via Manager) ======================
+manager = multiprocessing.Manager()
+fShutdown = manager.Event()
+hashrates = manager.list()
+accepted = manager.Value('i', 0)
+rejected = manager.Value('i', 0)
+accepted_timestamps = manager.list()
+rejected_timestamps = manager.list()
 
 # job data
 job_id = prevhash = coinb1 = coinb2 = None
@@ -74,17 +75,12 @@ merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
 sock = None
 target = None
-mode = "pool"
+mode = "solo"  # default to solo as requested
 host = port = user = password = None
-
-# Global error lines for display
-error_lines = []
-max_errors = 10
 
 # ======================  LOGGER ======================
 def logg(msg):
-    sys.stdout.write(msg + "\n")
-    sys.stdout.flush()
+    print(msg)
     try:
         logging.basicConfig(level=logging.INFO, filename="miner.log",
                             format='%(asctime)s %(message)s', force=True)
@@ -93,18 +89,6 @@ def logg(msg):
         pass
 
 logg("[*] Miner starting...")
-
-# ======================  OPTIONAL GPU (safe) ======================
-gpu_enabled = False
-try:
-    import numpy as np
-    import pycuda.driver as cuda
-    import pycuda.autoinit
-    from pycuda.compiler import SourceModule
-    gpu_enabled = True
-    logg("[*] PyCUDA loaded – GPU support active")
-except Exception as e:
-    logg(f"[!] PyCUDA not found ({e}) – CPU-only mode")
 
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
@@ -116,15 +100,12 @@ POOL_PORT = 3333
 POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
-# Start with low threads and slowly increase to reach high load
-initial_threads = 4
-max_threads = max(1, os.cpu_count() * 2)  # e.g. 48 on your rig
-num_threads = initial_threads
+num_cores = os.cpu_count()
+num_processes = num_cores  # Use all physical cores for true scaling
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
-    global fShutdown
-    fShutdown = True
+    fShutdown.set()
     logg("\n[!] Shutting down...")
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -151,83 +132,75 @@ def submit_share(nonce):
         resp = sock.recv(1024).decode().strip()
         logg(f"[+] Share submitted → {resp}")
 
-        with lock:
-            if "true" in resp.lower():
-                global accepted, accepted_timestamps
-                accepted += 1
-                accepted_timestamps.append(time.time())
-                sys.stdout.write("\n" + "="*60 + "\n")
-                sys.stdout.write("*** SHARE ACCEPTED ***\n")
-                sys.stdout.write(f"Nonce: {nonce:08x}\n")
-                sys.stdout.write(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                sys.stdout.write("="*60 + "\n")
-                sys.stdout.flush()
-                sys.stdout.write("\a")
-                sys.stdout.flush()
-            else:
-                global rejected, rejected_timestamps
-                rejected += 1
-                rejected_timestamps.append(time.time())
-                logg("[!] Share rejected")
+        if "true" in resp.lower():
+            with accepted.get_lock():
+                accepted.value += 1
+            accepted_timestamps.append(time.time())
+            print("\n" + "="*60)
+            print("*** SHARE ACCEPTED ***")
+            print(f"Nonce: {nonce:08x}")
+            print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print("="*60 + "\n")
+            print("\a", end="", flush=True)
+        else:
+            with rejected.get_lock():
+                rejected.value += 1
+            rejected_timestamps.append(time.time())
+            logg("[!] Share rejected")
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
-# ======================  BENCHMARK ======================
-def run_benchmark(seconds=10):
-    logg(f"[*] Running {seconds}-second benchmark...")
-    start_time = time.time()
-    hashes = 0
-    nonce = 0
-    dummy_header = b"dummy" * 20  # dummy data for benchmarking
-
-    while time.time() - start_time < seconds:
-        for _ in range(10000):
-            h = hashlib.sha256(hashlib.sha256(dummy_header + nonce.to_bytes(4,'little')).digest()).digest()
-            hashes += 1
-            nonce += 1
-
-    elapsed = time.time() - start_time
-    hr = int(hashes / elapsed) if elapsed > 0 else 0
-    logg(f"[*] Benchmark complete: {hr:,} H/s ({hashes:,} hashes in {elapsed:.2f}s)")
-    return hr
-
-# ======================  MINING LOOP ======================
-def bitcoin_miner(thread_id):
+# ======================  MINING PROCESS ======================
+def bitcoin_miner_process(process_id):
     global nbits, version, prevhash, ntime, target
 
+    # Wait for job
     while None in (nbits, version, prevhash, ntime):
         time.sleep(0.5)
 
     header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
     header_bytes = binascii.unhexlify(header_static)
 
-    current_target = target or (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+    # Network (block) target
+    network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+
+    # Share target for reporting hashrate (low in solo mode)
+    share_target = diff_to_target(4096) if mode == "solo" else target
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
-    while not fShutdown:
-        for _ in range(100000):
+    while not fShutdown.is_set():
+        for _ in range(200000):  # Larger batch for better efficiency
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
 
             hashes_done += 1
-            if h_hex < current_target:
-                submit_share(nonce)
-                return
 
-            if hashes_done % 1_000_000 == 0:
+            # Submit if meets share target
+            if h_hex < share_target:
+                is_block = h_hex < network_target
+                submit_share(nonce)
+                if is_block:
+                    print("\n" + "="*80)
+                    print("█" + " "*78 + "█")
+                    print("█" + " "*28 + "BLOCK SOLVED!!!" + " "*33 + "█")
+                    print("█" + " "*78 + "█")
+                    print(f"█  Nonce      : {nonce:08x}")
+                    print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print("█" + " "*78 + "█")
+                    print("="*80 + "\n")
+                    print("\a" * 5, end="", flush=True)  # loud beep for block
+
+            if hashes_done % 2_000_000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(1_000_000 / elapsed)
-                    with lock:
-                        hashrates[thread_id] = hr
+                    hr = int(2_000_000 / elapsed)
+                    hashrates[process_id] = hr
                 last_report = now
-
-        time.sleep(0.001)
 
 # ======================  STRATUM ======================
 def stratum_worker():
@@ -245,7 +218,7 @@ def stratum_worker():
     s.sendall((json.dumps(auth)+"\n").encode())
 
     buf = b""
-    while not fShutdown:
+    while not fShutdown.is_set():
         try:
             data = s.recv(4096)
             if not data: break
@@ -265,48 +238,25 @@ def stratum_worker():
             logg(f"[!] Stratum error: {e}")
             break
 
-# ======================  DYNAMIC THREAD SCALING ======================
-def thread_scaler():
-    global num_threads
-    while not fShutdown:
-        time.sleep(30)  # check every 30 seconds
-        if fShutdown: break
-
-        load1, _, _ = os.getloadavg()
-        current_load = load1
-
-        if current_load < 46:  # slowly increase until ~46
-            num_threads = min(max_threads, num_threads + 4)
-            logg(f"[*] Load {current_load:.2f} – increasing to {num_threads} threads")
-            # Add new threads if needed
-            for i in range(num_threads - len(hashrates)):
-                threading.Thread(target=bitcoin_miner, args=(len(hashrates),), daemon=True).start()
-                hashrates.append(0)
-        elif current_load > 48:
-            num_threads = max(initial_threads, num_threads - 4)
-            logg(f"[*] Load {current_load:.2f} – decreasing to {num_threads} threads")
-
 # ======================  DISPLAY ======================
 def display_worker():
-    global error_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
     curses.init_pair(2, curses.COLOR_RED,    curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
-    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)  # pink for errors
+    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
 
     try:
-        while not fShutdown:
+        while not fShutdown.is_set():
             stdscr.clear()
             screen_height, screen_width = stdscr.getmaxyx()
 
             now = time.time()
-            with lock:
-                a_min = sum(1 for t in accepted_timestamps if now-t<60)
-                r_min = sum(1 for t in rejected_timestamps if now-t<60)
+            a_min = sum(1 for t in accepted_timestamps if now-t<60)
+            r_min = sum(1 for t in rejected_timestamps if now-t<60)
 
             cpu_temp = get_cpu_temp()
 
@@ -325,8 +275,8 @@ def display_worker():
             stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
             stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
             stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
-            stdscr.addstr(7, 0, f"Threads      : {num_threads}", curses.color_pair(3))
-            stdscr.addstr(8, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
+            stdscr.addstr(7, 0, f"Processes    : {num_processes}", curses.color_pair(3))
+            stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
             # ckpool stats
@@ -337,33 +287,15 @@ def display_worker():
             stdscr.addstr(14, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
             stdscr.addstr(15, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
 
-            # Dynamic log / errors (pink)
-            start_y = 17
-            for i, line in enumerate(error_lines[-max_errors:]):
-                if start_y + i >= screen_height:
-                    break
-                stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
-
             stdscr.refresh()
             time.sleep(1)
     finally:
         curses.endwin()
 
-# Override print to capture logs for display
-original_print = print
-def custom_print(*args, **kwargs):
-    original_print(*args, **kwargs)
-    msg = " ".join(str(a) for a in args)
-    if "[*]" in msg or "[!]" in msg or "error" in msg.lower():
-        with lock:
-            error_lines.append(msg)
-
-print = custom_print
-
 # ======================  MAIN ======================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["solo","pool"], default="pool")
+    parser.add_argument("--mode", choices=["solo","pool"], default="solo")
     args = parser.parse_args()
 
     mode = args.mode
@@ -372,25 +304,34 @@ if __name__ == "__main__":
     else:
         host, port, user, password = POOL_HOST, POOL_PORT, POOL_WORKER, POOL_PASSWORD
 
-    hashrates = [0] * num_threads
+    # Initialize shared hashrates list
+    for _ in range(num_processes):
+        hashrates.append(0)
 
-    threading.Thread(target=stratum_worker, daemon=True).start()
+    # Start stratum
+    p_stratum = multiprocessing.Process(target=stratum_worker, daemon=True)
+    p_stratum.start()
     time.sleep(3)
 
-    # Start initial miners
-    for i in range(initial_threads):
-        threading.Thread(target=bitcoin_miner, args=(i,), daemon=True).start()
-
-    # Dynamic thread scaler
-    threading.Thread(target=thread_scaler, daemon=True).start()
+    # Start mining processes
+    processes = []
+    for i in range(num_processes):
+        p = multiprocessing.Process(target=bitcoin_miner_process, args=(i,))
+        p.start()
+        processes.append(p)
 
     # Display
     threading.Thread(target=display_worker, daemon=True).start()
 
     logg("[*] Miner running – press Ctrl+C to stop")
     try:
-        while not fShutdown:
+        while not fShutdown.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         pass
+
+    fShutdown.set()
+    for p in processes:
+        p.join()
+    p_stratum.join()
     logg("[*] Shutdown complete")
