@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import multiprocessing
+import threading
 import requests
 import binascii
 import hashlib
@@ -14,7 +14,7 @@ import os
 import curses
 import argparse
 import signal
-import threading  # <-- This was missing in some versions – now explicitly added
+import re  # for parsing ckpool stats page
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -22,32 +22,36 @@ def diff_to_target(diff):
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
 
-# ======================  CPU TEMPERATURE ======================
-def get_cpu_temp():
-    temps = []
-    for zone in range(20):  # check multiple thermal zones (common on AMD/Intel)
-        path = f"/sys/class/thermal/thermal_zone{zone}/temp"
-        if os.path.exists(path):
-            try:
-                with open(path) as f:
-                    temp = int(f.read().strip()) / 1000.0
-                    temps.append(temp)
-            except:
-                pass
-    if temps:
-        avg = sum(temps) / len(temps)
-        max_temp = max(temps)
-        return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
-    return "N/A"
+# ======================  CKPOOL STATS FETCHER ======================
+def get_ckpool_stats():
+    url = "https://solostats.ckpool.org/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
+    try:
+        r = requests.get(url, timeout=10)
+        text = r.text
 
-# ======================  GLOBALS (shared via Manager) ======================
-manager = multiprocessing.Manager()
-fShutdown = manager.Event()
-hashrates = manager.list()
-accepted = manager.Value('i', 0)
-rejected = manager.Value('i', 0)
-accepted_timestamps = manager.list()
-rejected_timestamps = manager.list()
+        # Parse key stats (simple regex – reliable for ckpool page)
+        hashrate = re.search(r'Hashrate</td><td>([^<]+)', text)
+        last_share = re.search(r'Last Share</td><td>([^<]+)', text)
+        best_share = re.search(r'Best Share</td><td>([^<]+)', text)
+        shares = re.search(r'Shares</td><td>([^<]+)', text)
+
+        stats = {
+            "hashrate": hashrate.group(1).strip() if hashrate else "N/A",
+            "last_share": last_share.group(1).strip() if last_share else "N/A",
+            "best_share": best_share.group(1).strip() if best_share else "N/A",
+            "shares": shares.group(1).strip() if shares else "N/A"
+        }
+        return stats
+    except:
+        return {"hashrate": "N/A", "last_share": "N/A", "best_share": "N/A", "shares": "N/A"}
+
+# ======================  GLOBALS ======================
+fShutdown = False
+hashrates = []
+accepted = rejected = 0
+accepted_timestamps = []
+rejected_timestamps = []
+lock = threading.Lock()
 
 # job data
 job_id = prevhash = coinb1 = coinb2 = None
@@ -80,12 +84,15 @@ POOL_PORT = 3333
 POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
-num_cores = os.cpu_count()
-num_processes = num_cores  # Use all physical cores
+# Start with low threads and slowly increase to reach high load
+initial_threads = 4
+max_threads = max(1, os.cpu_count() * 2)  # e.g. 48 on your rig
+num_threads = initial_threads
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
-    fShutdown.set()
+    global fShutdown
+    fShutdown = True
     logg("\n[!] Shutting down...")
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -112,59 +119,95 @@ def submit_share(nonce):
         resp = sock.recv(1024).decode().strip()
         logg(f"[+] Share submitted → {resp}")
 
-        if "true" in resp.lower():
-            with accepted.get_lock():
-                accepted.value += 1
-            accepted_timestamps.append(time.time())
-            print("\n" + "="*60)
-            print("*** SHARE ACCEPTED ***")
-            print(f"Nonce: {nonce:08x}")
-            print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print("="*60 + "\n")
-            print("\a", end="", flush=True)
-        else:
-            with rejected.get_lock():
-                rejected.value += 1
-            rejected_timestamps.append(time.time())
-            logg("[!] Share rejected")
+        with lock:
+            if "true" in resp.lower():
+                global accepted, accepted_timestamps
+                accepted += 1
+                accepted_timestamps.append(time.time())
+                print("\n" + "="*60)
+                print("*** SHARE ACCEPTED ***")
+                print(f"Nonce: {nonce:08x}")
+                print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("="*60 + "\n")
+                print("\a", end="", flush=True)  # beep
+            else:
+                global rejected, rejected_timestamps
+                rejected += 1
+                rejected_timestamps.append(time.time())
+                logg("[!] Share rejected")
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
-# ======================  MINING PROCESS ======================
-def bitcoin_miner_process(process_id):
+# ======================  BENCHMARK ======================
+def run_benchmark(seconds=10):
+    logg(f"[*] Running {seconds}-second benchmark...")
+    start_time = time.time()
+    hashes = 0
+    nonce = 0
+    dummy_header = b"dummy" * 20  # dummy data for benchmarking
+
+    while time.time() - start_time < seconds:
+        for _ in range(10000):
+            h = hashlib.sha256(hashlib.sha256(dummy_header + nonce.to_bytes(4,'little')).digest()).digest()
+            hashes += 1
+            nonce += 1
+
+    elapsed = time.time() - start_time
+    hr = int(hashes / elapsed) if elapsed > 0 else 0
+    logg(f"[*] Benchmark complete: {hr:,} H/s ({hashes:,} hashes in {elapsed:.2f}s)")
+    return hr
+
+# ======================  MINING LOOP ======================
+def bitcoin_miner(thread_id):
     global nbits, version, prevhash, ntime, target
 
-    # Wait for job
     while None in (nbits, version, prevhash, ntime):
         time.sleep(0.5)
 
     header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
     header_bytes = binascii.unhexlify(header_static)
 
-    current_target = target or (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+    # For solo, use a low share difficulty to submit shares regularly (shows hashrate on dashboard)
+    share_diff = 1024  # reasonable for solo to show activity
+    share_target = diff_to_target(share_diff)
+    network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
-    while not fShutdown.is_set():
-        for _ in range(200000):  # Larger batch for better efficiency
+    while not fShutdown:
+        for _ in range(100000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
 
             hashes_done += 1
-            if h_hex < current_target:
+            # Submit share if meets share difficulty
+            if h_hex < share_target:
                 submit_share(nonce)
-                return
+                # Check if it's a block
+                if h_hex < network_target:
+                    print("\n" + "="*80)
+                    print("█" + " "*78 + "█")
+                    print("█" + " "*28 + "BLOCK SOLVED!!!" + " "*33 + "█")
+                    print("█" + " "*78 + "█")
+                    print(f"█  Nonce      : {nonce:08x}")
+                    print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print("█" + " "*78 + "█")
+                    print("="*80 + "\n")
+                    print("\a" * 5, end="", flush=True)  # loud beep for block
 
-            if hashes_done % 2_000_000 == 0:
+            if hashes_done % 1_000_000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(2_000_000 / elapsed)
-                    hashrates[process_id] = hr
+                    hr = int(1_000_000 / elapsed)
+                    with lock:
+                        hashrates[thread_id] = hr
                 last_report = now
+
+        time.sleep(0.001)
 
 # ======================  STRATUM ======================
 def stratum_worker():
@@ -182,7 +225,7 @@ def stratum_worker():
     s.sendall((json.dumps(auth)+"\n").encode())
 
     buf = b""
-    while not fShutdown.is_set():
+    while not fShutdown:
         try:
             data = s.recv(4096)
             if not data: break
@@ -194,13 +237,34 @@ def stratum_worker():
                 if msg.get("method") == "mining.notify":
                     (job_id, prevhash, coinb1, coinb2,
                      merkle_branch, version, nbits, ntime, _) = msg["params"]
-                    logg(f"[*] New job #{job_id}")
+                    logg(f"[*] New job #{job_id} | Prevhash: {prevhash}")
                 elif msg.get("method") == "mining.set_difficulty":
                     target = diff_to_target(msg["params"][0])
                     logg(f"[*] Difficulty set to {msg['params'][0]}")
         except Exception as e:
             logg(f"[!] Stratum error: {e}")
             break
+
+# ======================  DYNAMIC THREAD SCALING ======================
+def thread_scaler():
+    global num_threads
+    while not fShutdown:
+        time.sleep(30)  # check every 30 seconds
+        if fShutdown: break
+
+        load1, _, _ = os.getloadavg()
+        current_load = load1
+
+        if current_load < 46:  # slowly increase until ~46
+            num_threads = min(max_threads, num_threads + 4)
+            logg(f"[*] Load {current_load:.2f} – increasing to {num_threads} threads")
+            # Add new threads if needed
+            for i in range(num_threads - len(hashrates)):
+                threading.Thread(target=bitcoin_miner, args=(len(hashrates),), daemon=True).start()
+                hashrates.append(0)
+        elif current_load > 48:
+            num_threads = max(initial_threads, num_threads - 4)
+            logg(f"[*] Load {current_load:.2f} – decreasing to {num_threads} threads")
 
 # ======================  DISPLAY ======================
 def display_worker():
@@ -210,40 +274,70 @@ def display_worker():
     curses.init_pair(2, curses.COLOR_RED,    curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
-    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)  # pink for errors
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
 
+    error_lines = []
+    max_errors = 10
+
     try:
-        while not fShutdown.is_set():
+        while not fShutdown:
             stdscr.clear()
             height, width = stdscr.getmaxyx()
 
             now = time.time()
-            a_min = sum(1 for t in accepted_timestamps if now-t<60)
-            r_min = sum(1 for t in rejected_timestamps if now-t<60)
+            with lock:
+                a_min = sum(1 for t in accepted_timestamps if now-t<60)
+                r_min = sum(1 for t in rejected_timestamps if now-t<60)
 
-            cpu_temp = get_cpu_temp()
-
+            # Top right: Ctrl+C to quit
             stdscr.addstr(0, max(0, width - 20), "Ctrl+C to quit", curses.color_pair(3))
-            stdscr.addstr(2, 0, f"Bitcoin {mode.upper()} Miner (CPU)", curses.color_pair(4)|curses.A_BOLD)
 
+            # Title
+            title = f"Bitcoin {mode.upper()} Miner (CPU)"
+            stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
+
+            # Static stats
             try:
                 height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
                 height = "???"
             stdscr.addstr(4, 0, f"Block height : ~{height}", curses.color_pair(3))
             stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
-            stdscr.addstr(7, 0, f"Processes    : {num_processes}", curses.color_pair(3))
-            stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
-            stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
+            stdscr.addstr(6, 0, f"Threads      : {num_threads}", curses.color_pair(3))
+            stdscr.addstr(7, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
+            stdscr.addstr(8, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            stdscr.addstr(11, 0, "─" * (width - 1), curses.color_pair(3))
+            # ckpool stats on the left
+            stats = get_ckpool_stats()
+            stdscr.addstr(10, 0, "─" * (width - 1), curses.color_pair(3))
+            stdscr.addstr(11, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
+            stdscr.addstr(12, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
+            stdscr.addstr(13, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
+            stdscr.addstr(14, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
+
+            # Dynamic log / errors on the right (pink)
+            start_y = 11
+            for i, line in enumerate(error_lines[-max_errors:]):
+                if start_y + i >= height:
+                    break
+                stdscr.addstr(start_y + i, 40, line[:width-41], curses.color_pair(5))
 
             stdscr.refresh()
             time.sleep(1)
     finally:
         curses.endwin()
+
+# Override print to capture logs for display
+original_print = print
+def custom_print(*args, **kwargs):
+    original_print(*args, **kwargs)
+    msg = " ".join(str(a) for a in args)
+    if "[*]" in msg or "error" in msg.lower():
+        with lock:
+            error_lines.append(msg)
+
+print = custom_print
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
@@ -257,34 +351,25 @@ if __name__ == "__main__":
     else:
         host, port, user, password = POOL_HOST, POOL_PORT, POOL_WORKER, POOL_PASSWORD
 
-    # Initialize shared hashrates list
-    for _ in range(num_processes):
-        hashrates.append(0)
+    hashrates = [0] * num_threads
 
-    # Start stratum
-    p_stratum = multiprocessing.Process(target=stratum_worker, daemon=True)
-    p_stratum.start()
+    threading.Thread(target=stratum_worker, daemon=True).start()
     time.sleep(3)
 
-    # Start mining processes
-    processes = []
-    for i in range(num_processes):
-        p = multiprocessing.Process(target=bitcoin_miner_process, args=(i,))
-        p.start()
-        processes.append(p)
+    # Start initial miners
+    for i in range(initial_threads):
+        threading.Thread(target=bitcoin_miner, args=(i,), daemon=True).start()
+
+    # Dynamic thread scaler
+    threading.Thread(target=thread_scaler, daemon=True).start()
 
     # Display
     threading.Thread(target=display_worker, daemon=True).start()
 
     logg("[*] Miner running – press Ctrl+C to stop")
     try:
-        while not fShutdown.is_set():
+        while not fShutdown:
             time.sleep(1)
     except KeyboardInterrupt:
         pass
-
-    fShutdown.set()
-    for p in processes:
-        p.join()
-    p_stratum.join()
     logg("[*] Shutdown complete")
