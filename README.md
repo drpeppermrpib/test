@@ -14,7 +14,7 @@ import os
 import curses
 import argparse
 import signal
-import re  # for parsing ckpool stats
+import threading  # <-- Added this import to fix NameError
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -75,7 +75,7 @@ merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
 sock = None
 target = None
-mode = "solo"  # default to solo as requested
+mode = "solo"
 host = port = user = password = None
 
 # ======================  LOGGER ======================
@@ -101,7 +101,7 @@ POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
 num_cores = os.cpu_count()
-num_processes = num_cores  # Use all physical cores for true scaling
+num_processes = num_cores  # Use all physical cores
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
