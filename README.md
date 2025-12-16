@@ -14,7 +14,7 @@ import os
 import curses
 import argparse
 import signal
-import threading  # <-- Added this import to fix "name 'threading' is not defined"
+import re  # for parsing ckpool stats
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -101,7 +101,7 @@ POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
 num_cores = os.cpu_count()
-num_processes = num_cores  # Use all physical cores
+num_processes = num_cores  # Use all physical cores for true scaling
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
