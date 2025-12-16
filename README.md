@@ -14,6 +14,7 @@ import os
 import curses
 import argparse
 import signal
+import threading  # <-- This was missing in some versions – now explicitly added
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -24,12 +25,12 @@ def diff_to_target(diff):
 # ======================  CPU TEMPERATURE ======================
 def get_cpu_temp():
     temps = []
-    for zone in range(20):  # check multiple thermal zones
+    for zone in range(20):  # check multiple thermal zones (common on AMD/Intel)
         path = f"/sys/class/thermal/thermal_zone{zone}/temp"
         if os.path.exists(path):
             try:
                 with open(path) as f:
-                    temp = int(f.read().strip()) / 1000
+                    temp = int(f.read().strip()) / 1000.0
                     temps.append(temp)
             except:
                 pass
@@ -193,7 +194,7 @@ def stratum_worker():
                 if msg.get("method") == "mining.notify":
                     (job_id, prevhash, coinb1, coinb2,
                      merkle_branch, version, nbits, ntime, _) = msg["params"]
-                    logg(f"[*] New job #{job_id} | Prevhash: {prevhash}")
+                    logg(f"[*] New job #{job_id}")
                 elif msg.get("method") == "mining.set_difficulty":
                     target = diff_to_target(msg["params"][0])
                     logg(f"[*] Difficulty set to {msg['params'][0]}")
@@ -232,7 +233,7 @@ def display_worker():
                 height = "???"
             stdscr.addstr(4, 0, f"Block height : ~{height}", curses.color_pair(3))
             stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3) if 'N/A' not in cpu_temp else curses.color_pair(2))
+            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
             stdscr.addstr(7, 0, f"Processes    : {num_processes}", curses.color_pair(3))
             stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
