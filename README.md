@@ -14,7 +14,7 @@ import os
 import curses
 import argparse
 import signal
-import threading  # for display
+import threading
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -22,8 +22,27 @@ def diff_to_target(diff):
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
 
-# ======================  CPU TEMPERATURE ======================
+# ======================  CPU TEMPERATURE (improved for HiveOS) ======================
 def get_cpu_temp():
+    # HiveOS often uses sensors command or different zones
+    try:
+        # Try 'sensors' command if available
+        import subprocess
+        result = subprocess.check_output(["sensors"], text=True)
+        temps = []
+        for line in result.splitlines():
+            if 'Core' in line or 'Tdie' in line or 'Tctl' in line:
+                match = re.search(r'\+([\d\.]+)°C', line)
+                if match:
+                    temps.append(float(match.group(1)))
+        if temps:
+            avg = sum(temps) / len(temps)
+            max_temp = max(temps)
+            return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
+    except:
+        pass
+
+    # Fallback to /sys thermal zones
     temps = []
     for zone in range(20):
         path = f"/sys/class/thermal/thermal_zone{zone}/temp"
@@ -69,7 +88,7 @@ rejected = manager.Value('i', 0)
 accepted_timestamps = manager.list()
 rejected_timestamps = manager.list()
 
-# job data (updated by stratum)
+# job data
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
@@ -112,7 +131,6 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # ======================  MERKLE ROOT ======================
 def calculate_merkle_root():
-    global extranonce2
     if None in (coinb1, extranonce1, extranonce2, coinb2, merkle_branch):
         return "0" * 64
     coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
@@ -153,45 +171,28 @@ def submit_share(nonce):
 
 # ======================  MINING PROCESS ======================
 def bitcoin_miner_process(process_id):
-    global nbits, version, prevhash, ntime, target, extranonce2
+    global nbits, version, prevhash, ntime, target
 
-    last_prevhash = None
-    header_bytes = b""
-    current_target = "0" * 64
-    share_target = "0" * 64
+    # Wait for job
+    while None in (nbits, version, prevhash, ntime):
+        time.sleep(0.5)
+
+    header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
+    header_bytes = binascii.unhexlify(header_static)
+
+    # Network (block) target
+    network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+
+    # Share target for reporting hashrate (low in solo mode)
+    share_target = diff_to_target(4096) if mode == "solo" else target
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
     while not fShutdown.is_set():
-        # Detect new job and recalc header
-        if prevhash != last_prevhash:
-            last_prevhash = prevhash
-            if None in (nbits, version, prevhash, ntime):
-                time.sleep(0.5)
-                continue
-
-            # Fixed extranonce2 = zeros for simplicity (works for ckpool solo)
-            global extranonce2_size
-            if extranonce2_size is not None:
-                extranonce2 = "00" * extranonce2_size
-            else:
-                extranonce2 = "00000000"  # fallback
-
-            header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
-            header_bytes = binascii.unhexlify(header_static)
-
-            # Network target for block
-            network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
-
-            # Low share target for frequent reporting in solo
-            share_target = diff_to_target(4096)
-
-            logg(f"[*] New job detected – recalculated header for prevhash {prevhash}")
-
-        # Mining
-        for _ in range(200000):
+        # Larger batch for better efficiency and faster hashrate reporting
+        for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
@@ -211,7 +212,7 @@ def bitcoin_miner_process(process_id):
                     print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
                     print("█" + " "*78 + "█")
                     print("="*80 + "\n")
-                    print("\a" * 5, end="", flush=True)
+                    print("\a" * 5, end="", flush=True)  # loud beep for block
 
             if hashes_done % 500000 == 0:
                 now = time.time()
@@ -272,6 +273,9 @@ def display_worker():
     curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
 
+    log_lines = []
+    max_log = 20
+
     try:
         while not fShutdown.is_set():
             stdscr.clear()
@@ -310,10 +314,26 @@ def display_worker():
             stdscr.addstr(14, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
             stdscr.addstr(15, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
 
+            # Log area (scrolling, stable)
+            start_y = 17
+            for i, line in enumerate(log_lines[-max_log:]):
+                if start_y + i >= screen_height:
+                    break
+                stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
+
             stdscr.refresh()
             time.sleep(1)
     finally:
         curses.endwin()
+
+# Override print to capture logs for display (stable list)
+original_print = print
+def custom_print(*args, **kwargs):
+    original_print(*args, **kwargs)
+    msg = " ".join(str(a) for a in args)
+    log_lines.append(msg)
+
+print = custom_print
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
