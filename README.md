@@ -24,17 +24,16 @@ def diff_to_target(diff):
 
 # ======================  CPU TEMPERATURE (improved for HiveOS) ======================
 def get_cpu_temp():
-    # HiveOS often uses sensors command or different zones
+    # First try 'sensors' command (common on HiveOS)
     try:
-        # Try 'sensors' command if available
         import subprocess
         result = subprocess.check_output(["sensors"], text=True)
         temps = []
         for line in result.splitlines():
-            if 'Core' in line or 'Tdie' in line or 'Tctl' in line:
-                match = re.search(r'\+([\d\.]+)°C', line)
+            if 'Core' in line or 'Tdie' in line or 'Tctl' in line or 'temp1' in line:
+                match = re.search(r'[\+\-]?[\d\.]+°C', line)
                 if match:
-                    temps.append(float(match.group(1)))
+                    temps.append(float(match.group(0).replace('°C', '').strip()))
         if temps:
             avg = sum(temps) / len(temps)
             max_temp = max(temps)
@@ -42,7 +41,7 @@ def get_cpu_temp():
     except:
         pass
 
-    # Fallback to /sys thermal zones
+    # Fallback to thermal zones
     temps = []
     for zone in range(20):
         path = f"/sys/class/thermal/thermal_zone{zone}/temp"
@@ -120,7 +119,9 @@ POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
 num_cores = os.cpu_count()
-num_processes = num_cores  # Use all physical cores for true scaling
+num_processes = max(4, num_cores // 2)  # Start with half cores to control heat
+
+MAX_TEMP = 80  # Reduce load if temp > 80°C
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -183,15 +184,14 @@ def bitcoin_miner_process(process_id):
     # Network (block) target
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-    # Share target for reporting hashrate (low in solo mode)
-    share_target = diff_to_target(4096) if mode == "solo" else target
+    # Very low share target for solo to show live hashrate on dashboard
+    share_target = diff_to_target(256)  # ~every few seconds on CPU
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
     while not fShutdown.is_set():
-        # Larger batch for better efficiency and faster hashrate reporting
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
@@ -212,7 +212,7 @@ def bitcoin_miner_process(process_id):
                     print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
                     print("█" + " "*78 + "█")
                     print("="*80 + "\n")
-                    print("\a" * 5, end="", flush=True)  # loud beep for block
+                    print("\a" * 5, end="", flush=True)
 
             if hashes_done % 500000 == 0:
                 now = time.time()
@@ -232,11 +232,7 @@ def stratum_worker():
     sock = s
 
     s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
-    lines = s.recv(4096).decode().split('\n')
-    response = json.loads(lines[0])
-    extranonce1 = response['result'][1]
-    extranonce2_size = response['result'][2]
-    logg(f"[*] Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+    s.recv(4096)
 
     auth = {"id":2,"method":"mining.authorize","params":[user,password]}
     s.sendall((json.dumps(auth)+"\n").encode())
@@ -262,6 +258,24 @@ def stratum_worker():
             logg(f"[!] Stratum error: {e}")
             break
 
+# ======================  TEMPERATURE THROTTLING ======================
+def temp_throttler():
+    global num_processes
+    while not fShutdown.is_set():
+        time.sleep(10)
+        cpu_temp_str = get_cpu_temp()
+        if "N/A" in cpu_temp_str:
+            continue
+        max_temp = float(cpu_temp_str.split("/")[1].strip().replace("°C (max)", "").strip())
+        if max_temp > 80:
+            old = num_processes
+            num_processes = max(4, num_processes - 4)
+            logg(f"[!] Temp {max_temp:.1f}°C – reducing to {num_processes} processes")
+        elif max_temp < 70 and num_processes < num_cores:
+            old = num_processes
+            num_processes = min(num_cores, num_processes + 4)
+            logg(f"[*] Temp {max_temp:.1f}°C – increasing to {num_processes} processes")
+
 # ======================  DISPLAY ======================
 def display_worker():
     stdscr = curses.initscr()
@@ -272,9 +286,6 @@ def display_worker():
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
-
-    log_lines = []
-    max_log = 20
 
     try:
         while not fShutdown.is_set():
@@ -301,7 +312,7 @@ def display_worker():
                 block_height = "???"
             stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
             stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
+            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3) if max_temp < 80 else curses.color_pair(2))
             stdscr.addstr(7, 0, f"Processes    : {num_processes}", curses.color_pair(3))
             stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
@@ -314,26 +325,10 @@ def display_worker():
             stdscr.addstr(14, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
             stdscr.addstr(15, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
 
-            # Log area (scrolling, stable)
-            start_y = 17
-            for i, line in enumerate(log_lines[-max_log:]):
-                if start_y + i >= screen_height:
-                    break
-                stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
-
             stdscr.refresh()
             time.sleep(1)
     finally:
         curses.endwin()
-
-# Override print to capture logs for display (stable list)
-original_print = print
-def custom_print(*args, **kwargs):
-    original_print(*args, **kwargs)
-    msg = " ".join(str(a) for a in args)
-    log_lines.append(msg)
-
-print = custom_print
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
@@ -362,6 +357,9 @@ if __name__ == "__main__":
         p = multiprocessing.Process(target=bitcoin_miner_process, args=(i,))
         p.start()
         processes.append(p)
+
+    # Temperature throttler
+    threading.Thread(target=temp_throttler, daemon=True).start()
 
     # Display
     threading.Thread(target=display_worker, daemon=True).start()
