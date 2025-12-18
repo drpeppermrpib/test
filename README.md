@@ -174,7 +174,7 @@ def submit_share(nonce):
             rejected_timestamps.append(time.time())
             logg("[!] Share rejected")
     except BrokenPipeError:
-        logg("[!] Broken pipe – connection lost")
+        logg("[!] Broken pipe – connection lost, will reconnect")
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
@@ -192,8 +192,8 @@ def bitcoin_miner_process(process_id):
     # Network (block) target
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-    # Low share target for solo to show live hashrate
-    share_target = diff_to_target(256)
+    # Very low share target for solo to show live hashrate
+    share_target = diff_to_target(128)  # even lower for more frequent submits
 
     nonce = 0xffffffff
     hashes_done = 0
@@ -231,44 +231,48 @@ def bitcoin_miner_process(process_id):
                     hashrates[process_id] = hr
                 last_report = now
 
-# ======================  STRATUM ======================
+# ======================  STRATUM (with reconnection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size
 
-    s = socket.socket()
-    s.connect((host, port))
-    sock = s
-
-    s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
-    s.recv(4096)
-
-    auth = {"id":2,"method":"mining.authorize","params":[user,password]}
-    s.sendall((json.dumps(auth)+"\n").encode())
-
-    buf = b""
     while not fShutdown.is_set():
         try:
-            data = s.recv(4096)
-            if not data: break
-            buf += data
-            while b'\n' in buf:
-                line, buf = buf.split(b'\n', 1)
-                if not line.strip(): continue
-                msg = json.loads(line)
-                if msg.get("method") == "mining.notify":
-                    (job_id, prevhash, coinb1, coinb2,
-                     merkle_branch, version, nbits, ntime, _) = msg["params"]
-                    logg(f"[*] New job #{job_id} | Prevhash: {prevhash}")
-                elif msg.get("method") == "mining.set_difficulty":
-                    target = diff_to_target(msg["params"][0])
-                    logg(f"[*] Difficulty set to {msg['params'][0]}")
-        except BrokenPipeError:
-            logg("[!] Broken pipe in stratum – reconnecting...")
-            break
+            s = socket.socket()
+            s.connect((host, port))
+            sock = s
+
+            s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
+            lines = s.recv(4096).decode().split('\n')
+            response = json.loads(lines[0])
+            extranonce1 = response['result'][1]
+            extranonce2_size = response['result'][2]
+            logg(f"[*] Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+
+            auth = {"id":2,"method":"mining.authorize","params":[user,password]}
+            s.sendall((json.dumps(auth)+"\n").encode())
+
+            buf = b""
+            while not fShutdown.is_set():
+                data = s.recv(4096)
+                if not data:
+                    logg("[!] Connection lost – reconnecting...")
+                    break
+                buf += data
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    if not line.strip(): continue
+                    msg = json.loads(line)
+                    if msg.get("method") == "mining.notify":
+                        (job_id, prevhash, coinb1, coinb2,
+                         merkle_branch, version, nbits, ntime, _) = msg["params"]
+                        logg(f"[*] New job #{job_id} | Prevhash: {prevhash}")
+                    elif msg.get("method") == "mining.set_difficulty":
+                        target = diff_to_target(msg["params"][0])
+                        logg(f"[*] Difficulty set to {msg['params'][0]}")
         except Exception as e:
-            logg(f"[!] Stratum error: {e}")
-            break
+            logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
+            time.sleep(10)
 
 # ======================  DISPLAY ======================
 def display_worker():
@@ -359,10 +363,9 @@ if __name__ == "__main__":
     for _ in range(num_processes):
         hashrates.append(0)
 
-    # Start stratum
+    # Start stratum (with reconnection)
     p_stratum = multiprocessing.Process(target=stratum_worker, daemon=True)
     p_stratum.start()
-    time.sleep(3)
 
     # Start mining processes
     processes = []
