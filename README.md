@@ -103,7 +103,9 @@ max_log = 15
 
 # ======================  LOGGER ======================
 def logg(msg):
-    sys.stdout.write(msg + "\n")
+    timestamp = int(time.time() * 100000)  # mimic LV06 timestamp style
+    prefixed_msg = f"₿ ({timestamp}) {msg}"
+    sys.stdout.write(prefixed_msg + "\n")
     sys.stdout.flush()
     try:
         logging.basicConfig(level=logging.INFO, filename="miner.log",
@@ -112,7 +114,7 @@ def logg(msg):
     except:
         pass
 
-logg("[*] Miner starting...")
+logg("Miner starting...")
 
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
@@ -193,7 +195,7 @@ def bitcoin_miner_process(process_id):
     # Network (block) target
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-    # Very low share target for solo to show live hashrate
+    # Low share target for solo to show live hashrate
     share_target = diff_to_target(128)
 
     nonce = 0xffffffff
@@ -209,10 +211,10 @@ def bitcoin_miner_process(process_id):
             hashes_done += 1
 
             if h_hex < share_target:
-                # Calculate difficulty for log (like LV06)
+                # Calculate share difficulty for LV06-style log
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 371.")  # 371 is example from photo
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 371.")  # 371 from your LV06 photo
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -252,7 +254,7 @@ def stratum_worker():
             response = json.loads(lines[0])
             extranonce1 = response['result'][1]
             extranonce2_size = response['result'][2]
-            logg(f"[*] Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+            logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
 
             auth = {"id":2,"method":"mining.authorize","params":[user,password]}
             s.sendall((json.dumps(auth)+"\n").encode())
@@ -272,7 +274,7 @@ def stratum_worker():
                     if msg.get("method") == "mining.notify":
                         (job_id, prevhash, coinb1, coinb2,
                          merkle_branch, version, nbits, ntime, _) = msg["params"]
-                        logg(f"[*] New job #{job_id} | Prevhash: {prevhash}")
+                        logg(f"create_jobs_task: New Work Dequeued {job_id}")
                     elif msg.get("method") == "mining.set_difficulty":
                         target = diff_to_target(msg["params"][0])
                         logg(f"[*] Difficulty set to {msg['params'][0]}")
@@ -310,29 +312,29 @@ def display_worker():
             title = f"Bitcoin {mode.upper()} Miner (CPU)"
             stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
 
-            # ckpool stats (moved above the line)
-            stats = get_ckpool_stats()
-            stdscr.addstr(4, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
-            stdscr.addstr(5, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
-            stdscr.addstr(6, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
-            stdscr.addstr(7, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
-
-            # Horizontal line
-            stdscr.addstr(9, 0, "─" * (screen_width - 1), curses.color_pair(3))
-
-            # Static stats below line
+            # Static stats
             try:
                 block_height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
                 block_height = "???"
-            stdscr.addstr(10, 0, f"Block height : ~{block_height}", curses.color_pair(3))
-            stdscr.addstr(11, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(12, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
-            stdscr.addstr(13, 0, f"Processes    : {num_processes}", curses.color_pair(3))
-            stdscr.addstr(14, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
-            stdscr.addstr(15, 0, f"Last minute  : {a_min} acc / {r_min} rej")
+            stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
+            stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
+            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
+            stdscr.addstr(7, 0, f"Processes    : {num_processes}", curses.color_pair(3))
+            stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
+            stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            # Scrolling log area (stable)
+            # ckpool stats under last minute, above yellow line
+            stats = get_ckpool_stats()
+            stdscr.addstr(11, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
+            stdscr.addstr(12, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
+            stdscr.addstr(13, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
+            stdscr.addstr(14, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
+
+            # Yellow line
+            stdscr.addstr(16, 0, "─" * (screen_width - 1), curses.color_pair(3))
+
+            # Scrolling log area (stable, no flashing)
             start_y = 17
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
@@ -395,7 +397,7 @@ if __name__ == "__main__":
 
     fShutdown.set()
     for p in processes:
-        p.terminate()  # Force kill if join hangs
+        p.terminate()
         p.join()
     p_stratum.terminate()
     p_stratum.join()
