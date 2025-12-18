@@ -14,7 +14,7 @@ import os
 import curses
 import argparse
 import signal
-import threading  # <-- This import fixes "name 'threading' is not defined"
+import threading
 import subprocess  # for accurate temp
 import re  # for parsing ckpool stats
 
@@ -182,28 +182,36 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
-# ======================  MINING PROCESS (optimized, LV06 logs) ======================
+# ======================  MINING PROCESS (optimized, LV06 logs, nonce shuffling) ======================
 def bitcoin_miner_process(process_id):
     global nbits, version, prevhash, ntime, target
 
-    # Wait for job
-    while None in (nbits, version, prevhash, ntime):
-        time.sleep(0.5)
+    last_job_id = None
 
-    header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
-    header_bytes = binascii.unhexlify(header_static)
-
-    # Network (block) target
-    network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
-
-    # Low share target for solo to show live hashrate
-    share_target = diff_to_target(128)
-
-    nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
     while not fShutdown.is_set():
+        if job_id != last_job_id:
+            last_job_id = job_id
+            if None in (nbits, version, prevhash, ntime):
+                time.sleep(0.5)
+                continue
+
+            logg(f"create_jobs_task: New Work Dequeued {job_id}")
+
+            header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
+            header_bytes = binascii.unhexlify(header_static)
+
+            # Network (block) target
+            network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+
+            # Low share target for solo to show live hashrate
+            share_target = diff_to_target(128)
+
+            # Shuffle starting nonce for this job (random start to avoid overlap)
+            nonce = random.randint(0, 0xffffffff)
+
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
