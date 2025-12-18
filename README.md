@@ -59,7 +59,7 @@ def get_cpu_temp():
         return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
     return "N/A"
 
-# ======================  CKPOOL STATS (updated regex for current page) ======================
+# ======================  CKPOOL STATS ======================
 def get_ckpool_stats():
     url = "https://solostats.ckpool.org/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
     try:
@@ -209,7 +209,7 @@ def bitcoin_miner_process(process_id):
             # Low share target for solo to show live hashrate
             share_target = diff_to_target(128)
 
-            # Shuffle starting nonce for this job (random start to avoid overlap)
+            # Shuffle starting nonce for this job
             nonce = random.randint(0, 0xffffffff)
 
         for _ in range(500000):
@@ -238,11 +238,11 @@ def bitcoin_miner_process(process_id):
                     sys.stdout.write("\a" * 5)
                     sys.stdout.flush()
 
-            if hashes_done % 500000 == 0:
+            if hashes_done % 100000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(500000 / elapsed)
+                    hr = int(100000 / elapsed)
                     hashrates[process_id] = hr
                 last_report = now
 
