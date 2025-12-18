@@ -101,16 +101,16 @@ host = port = user = password = None
 log_lines = []
 max_log = 15
 
-# ======================  LOGGER ======================
+# ======================  LOGGER (LV06 style with ₿ timestamp) ======================
 def logg(msg):
-    timestamp = int(time.time() * 100000)  # mimic LV06 timestamp style
+    timestamp = int(time.time() * 100000)  # mimic LV06 timestamp
     prefixed_msg = f"₿ ({timestamp}) {msg}"
     sys.stdout.write(prefixed_msg + "\n")
     sys.stdout.flush()
     try:
         logging.basicConfig(level=logging.INFO, filename="miner.log",
                             format='%(asctime)s %(message)s', force=True)
-        logging.info(msg)
+        logging.info(prefixed_msg)
     except:
         pass
 
@@ -146,7 +146,7 @@ def calculate_merkle_root():
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE ======================
+# ======================  SUBMIT SHARE (LV06 style logs) ======================
 def submit_share(nonce):
     payload = {
         "id": 1,
@@ -181,7 +181,7 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
-# ======================  MINING PROCESS ======================
+# ======================  MINING PROCESS (optimized, LV06 logs) ======================
 def bitcoin_miner_process(process_id):
     global nbits, version, prevhash, ntime, target
 
@@ -203,6 +203,7 @@ def bitcoin_miner_process(process_id):
     last_report = time.time()
 
     while not fShutdown.is_set():
+        # Larger batch for better efficiency
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
@@ -211,10 +212,10 @@ def bitcoin_miner_process(process_id):
             hashes_done += 1
 
             if h_hex < share_target:
-                # Calculate share difficulty for LV06-style log
+                # LV06 style difficulty log
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 371.")  # 371 from your LV06 photo
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 371.")
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -230,15 +231,16 @@ def bitcoin_miner_process(process_id):
                     sys.stdout.write("\a" * 5)
                     sys.stdout.flush()
 
-            if hashes_done % 500000 == 0:
+            # More frequent hashrate reporting
+            if hashes_done % 100000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(500000 / elapsed)
+                    hr = int(100000 / elapsed)
                     hashrates[process_id] = hr
                 last_report = now
 
-# ======================  STRATUM ======================
+# ======================  STRATUM (LV06 style logs) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size
@@ -324,7 +326,7 @@ def display_worker():
             stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            # ckpool stats under last minute, above yellow line
+            # ckpool stats under last minute
             stats = get_ckpool_stats()
             stdscr.addstr(11, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
             stdscr.addstr(12, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
@@ -334,7 +336,7 @@ def display_worker():
             # Yellow line
             stdscr.addstr(16, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
-            # Scrolling log area (stable, no flashing)
+            # Scrolling log area (stable list)
             start_y = 17
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
