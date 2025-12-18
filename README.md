@@ -173,6 +173,8 @@ def submit_share(nonce):
                 rejected.value += 1
             rejected_timestamps.append(time.time())
             logg("[!] Share rejected")
+    except BrokenPipeError:
+        logg("[!] Broken pipe – connection lost")
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
@@ -261,6 +263,9 @@ def stratum_worker():
                 elif msg.get("method") == "mining.set_difficulty":
                     target = diff_to_target(msg["params"][0])
                     logg(f"[*] Difficulty set to {msg['params'][0]}")
+        except BrokenPipeError:
+            logg("[!] Broken pipe in stratum – reconnecting...")
+            break
         except Exception as e:
             logg(f"[!] Stratum error: {e}")
             break
