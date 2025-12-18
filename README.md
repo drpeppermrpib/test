@@ -16,7 +16,7 @@ import argparse
 import signal
 import threading
 import subprocess  # for accurate temp
-import re  # for ckpool stats
+import re  # for parsing ckpool stats
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -97,13 +97,14 @@ target = None
 mode = "solo"
 host = port = user = password = None
 
-# Global log lines for stable display
-error_lines = []
-max_errors = 15
+# Global log lines for display (defined early to avoid NameError)
+log_lines = []
+max_log = 15
 
 # ======================  LOGGER ======================
 def logg(msg):
-    print(msg)
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
     try:
         logging.basicConfig(level=logging.INFO, filename="miner.log",
                             format='%(asctime)s %(message)s', force=True)
@@ -124,7 +125,7 @@ POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
 num_cores = os.cpu_count()
-num_processes = num_cores  # Use all physical cores
+num_processes = num_cores  # Use all physical cores for true scaling
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -159,12 +160,14 @@ def submit_share(nonce):
             with accepted.get_lock():
                 accepted.value += 1
             accepted_timestamps.append(time.time())
-            print("\n" + "="*60)
-            print("*** SHARE ACCEPTED ***")
-            print(f"Nonce: {nonce:08x}")
-            print(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print("="*60 + "\n")
-            print("\a", end="", flush=True)
+            sys.stdout.write("\n" + "="*60 + "\n")
+            sys.stdout.write("*** SHARE ACCEPTED ***\n")
+            sys.stdout.write(f"Nonce: {nonce:08x}\n")
+            sys.stdout.write(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            sys.stdout.write("="*60 + "\n")
+            sys.stdout.flush()
+            sys.stdout.write("\a")
+            sys.stdout.flush()
         else:
             with rejected.get_lock():
                 rejected.value += 1
@@ -206,15 +209,17 @@ def bitcoin_miner_process(process_id):
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
-                    print("\n" + "="*80)
-                    print("█" + " "*78 + "█")
-                    print("█" + " "*28 + "BLOCK SOLVED!!!" + " "*33 + "█")
-                    print("█" + " "*78 + "█")
-                    print(f"█  Nonce      : {nonce:08x}")
-                    print(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                    print("█" + " "*78 + "█")
-                    print("="*80 + "\n")
-                    print("\a" * 5, end="", flush=True)
+                    sys.stdout.write("\n" + "="*80 + "\n")
+                    sys.stdout.write("█" + " "*78 + "█\n")
+                    sys.stdout.write("█" + " "*28 + "BLOCK SOLVED!!!" + " "*33 + "█\n")
+                    sys.stdout.write("█" + " "*78 + "█\n")
+                    sys.stdout.write(f"█  Nonce      : {nonce:08x}\n")
+                    sys.stdout.write(f"█  Time      : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    sys.stdout.write("█" + " "*78 + "█\n")
+                    sys.stdout.write("="*80 + "\n")
+                    sys.stdout.flush()
+                    sys.stdout.write("\a" * 5)
+                    sys.stdout.flush()
 
             if hashes_done % 500000 == 0:
                 now = time.time()
@@ -262,7 +267,7 @@ def stratum_worker():
 
 # ======================  DISPLAY ======================
 def display_worker():
-    global error_lines
+    global log_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -312,7 +317,7 @@ def display_worker():
 
             # Scrolling log area (stable)
             start_y = 17
-            for i, line in enumerate(error_lines[-max_errors:]):
+            for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
                     break
                 stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
@@ -327,9 +332,7 @@ original_print = print
 def custom_print(*args, **kwargs):
     original_print(*args, **kwargs)
     msg = " ".join(str(a) for a in args)
-    if "[*]" in msg or "[!]" in msg or "error" in msg.lower():
-        with lock:
-            error_lines.append(msg)
+    log_lines.append(msg)
 
 print = custom_print
 
