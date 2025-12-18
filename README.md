@@ -59,7 +59,7 @@ def get_cpu_temp():
         return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
     return "N/A"
 
-# ======================  CKPOOL STATS (updated regex for current page) ======================
+# ======================  CKPOOL STATS ======================
 def get_ckpool_stats():
     url = "https://solostats.ckpool.org/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
     try:
@@ -101,20 +101,18 @@ host = port = user = password = None
 log_lines = []
 max_log = 15
 
-# ======================  LOGGER (LV06 style with ₿ timestamp) ======================
+# ======================  LOGGER ======================
 def logg(msg):
-    timestamp = int(time.time() * 100000)  # mimic LV06 timestamp
-    prefixed_msg = f"₿ ({timestamp}) {msg}"
-    sys.stdout.write(prefixed_msg + "\n")
+    sys.stdout.write(msg + "\n")
     sys.stdout.flush()
     try:
         logging.basicConfig(level=logging.INFO, filename="miner.log",
                             format='%(asctime)s %(message)s', force=True)
-        logging.info(prefixed_msg)
+        logging.info(msg)
     except:
         pass
 
-logg("Miner starting...")
+logg("[*] Miner starting...")
 
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
@@ -146,7 +144,7 @@ def calculate_merkle_root():
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE (LV06 style logs) ======================
+# ======================  SUBMIT SHARE ======================
 def submit_share(nonce):
     payload = {
         "id": 1,
@@ -181,7 +179,7 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
-# ======================  MINING PROCESS (optimized, LV06 logs) ======================
+# ======================  MINING PROCESS ======================
 def bitcoin_miner_process(process_id):
     global nbits, version, prevhash, ntime, target
 
@@ -196,14 +194,13 @@ def bitcoin_miner_process(process_id):
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
     # Low share target for solo to show live hashrate
-    share_target = diff_to_target(128)
+    share_target = diff_to_target(128)  # even lower for more submits
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
     while not fShutdown.is_set():
-        # Larger batch for better efficiency
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
@@ -231,16 +228,15 @@ def bitcoin_miner_process(process_id):
                     sys.stdout.write("\a" * 5)
                     sys.stdout.flush()
 
-            # More frequent hashrate reporting
-            if hashes_done % 100000 == 0:
+            if hashes_done % 500000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(100000 / elapsed)
+                    hr = int(500000 / elapsed)
                     hashrates[process_id] = hr
                 last_report = now
 
-# ======================  STRATUM (LV06 style logs) ======================
+# ======================  STRATUM ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size
@@ -286,7 +282,6 @@ def stratum_worker():
 
 # ======================  DISPLAY ======================
 def display_worker():
-    global log_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -336,7 +331,7 @@ def display_worker():
             # Yellow line
             stdscr.addstr(16, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
-            # Scrolling log area (stable list)
+            # Scrolling log area (stable)
             start_y = 17
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
