@@ -97,7 +97,7 @@ target = None
 mode = "solo"
 host = port = user = password = None
 
-# Global log lines for display (defined early to avoid NameError)
+# Global log lines for display
 log_lines = []
 max_log = 15
 
@@ -152,9 +152,11 @@ def submit_share(nonce):
         "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
     }
     try:
+        logg(f"stratum_api: tx: {json.dumps(payload)}")
         sock.sendall((json.dumps(payload) + "\n").encode())
         resp = sock.recv(1024).decode().strip()
-        logg(f"[+] Share submitted → {resp}")
+        logg(f"stratum_task: rx: {resp}")
+        logg("stratum_task: message result accepted" if "true" in resp.lower() else "[!] Share rejected")
 
         if "true" in resp.lower():
             with accepted.get_lock():
@@ -172,9 +174,8 @@ def submit_share(nonce):
             with rejected.get_lock():
                 rejected.value += 1
             rejected_timestamps.append(time.time())
-            logg("[!] Share rejected")
     except BrokenPipeError:
-        logg("[!] Broken pipe – connection lost, will reconnect")
+        logg("[!] Broken pipe – connection lost")
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
@@ -193,7 +194,7 @@ def bitcoin_miner_process(process_id):
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
     # Very low share target for solo to show live hashrate
-    share_target = diff_to_target(128)  # even lower for more frequent submits
+    share_target = diff_to_target(128)
 
     nonce = 0xffffffff
     hashes_done = 0
@@ -208,6 +209,10 @@ def bitcoin_miner_process(process_id):
             hashes_done += 1
 
             if h_hex < share_target:
+                # Calculate difficulty for log (like LV06)
+                diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+                share_diff = diff1 / int(h_hex, 16)
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 371.")  # 371 is example from photo
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -231,7 +236,7 @@ def bitcoin_miner_process(process_id):
                     hashrates[process_id] = hr
                 last_report = now
 
-# ======================  STRATUM (with reconnection) ======================
+# ======================  STRATUM ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size
@@ -263,6 +268,7 @@ def stratum_worker():
                     line, buf = buf.split(b'\n', 1)
                     if not line.strip(): continue
                     msg = json.loads(line)
+                    logg(f"stratum_task: rx: {json.dumps(msg)}")
                     if msg.get("method") == "mining.notify":
                         (job_id, prevhash, coinb1, coinb2,
                          merkle_branch, version, nbits, ntime, _) = msg["params"]
@@ -304,25 +310,27 @@ def display_worker():
             title = f"Bitcoin {mode.upper()} Miner (CPU)"
             stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
 
-            # Static stats
+            # ckpool stats (moved above the line)
+            stats = get_ckpool_stats()
+            stdscr.addstr(4, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
+            stdscr.addstr(5, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
+            stdscr.addstr(6, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
+            stdscr.addstr(7, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
+
+            # Horizontal line
+            stdscr.addstr(9, 0, "─" * (screen_width - 1), curses.color_pair(3))
+
+            # Static stats below line
             try:
                 block_height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
                 block_height = "???"
-            stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
-            stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
-            stdscr.addstr(7, 0, f"Processes    : {num_processes}", curses.color_pair(3))
-            stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
-            stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
-
-            # ckpool stats
-            stats = get_ckpool_stats()
-            stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
-            stdscr.addstr(12, 0, f"ckpool Hashrate : {stats['hashrate']}", curses.color_pair(1))
-            stdscr.addstr(13, 0, f"Last Share      : {stats['last_share']}", curses.color_pair(3))
-            stdscr.addstr(14, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
-            stdscr.addstr(15, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
+            stdscr.addstr(10, 0, f"Block height : ~{block_height}", curses.color_pair(3))
+            stdscr.addstr(11, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
+            stdscr.addstr(12, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
+            stdscr.addstr(13, 0, f"Processes    : {num_processes}", curses.color_pair(3))
+            stdscr.addstr(14, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
+            stdscr.addstr(15, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
             # Scrolling log area (stable)
             start_y = 17
@@ -363,9 +371,10 @@ if __name__ == "__main__":
     for _ in range(num_processes):
         hashrates.append(0)
 
-    # Start stratum (with reconnection)
+    # Start stratum
     p_stratum = multiprocessing.Process(target=stratum_worker, daemon=True)
     p_stratum.start()
+    time.sleep(3)
 
     # Start mining processes
     processes = []
@@ -386,6 +395,8 @@ if __name__ == "__main__":
 
     fShutdown.set()
     for p in processes:
+        p.terminate()  # Force kill if join hangs
         p.join()
+    p_stratum.terminate()
     p_stratum.join()
     logg("[*] Shutdown complete")
