@@ -97,22 +97,25 @@ target = None
 mode = "solo"
 host = port = user = password = None
 
-# Global log lines for display (defined early to avoid NameError)
+# Global log lines for display
 log_lines = []
 max_log = 15
 
-# ======================  LOGGER ======================
+# ======================  LOGGER (LV06 style with ₿ timestamp) ======================
 def logg(msg):
-    sys.stdout.write(msg + "\n")
+    timestamp = int(time.time() * 100000)  # mimic LV06 timestamp
+    prefixed_msg = f"₿ ({timestamp}) {msg}"
+    sys.stdout.write(prefixed_msg + "\n")
     sys.stdout.flush()
+    log_lines.append(prefixed_msg)
     try:
         logging.basicConfig(level=logging.INFO, filename="miner.log",
                             format='%(asctime)s %(message)s', force=True)
-        logging.info(msg)
+        logging.info(prefixed_msg)
     except:
         pass
 
-logg("[*] Miner starting...")
+logg("Miner starting...")
 
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
@@ -144,7 +147,7 @@ def calculate_merkle_root():
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE ======================
+# ======================  SUBMIT SHARE (LV06 style logs) ======================
 def submit_share(nonce):
     payload = {
         "id": 1,
@@ -179,9 +182,11 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
-# ======================  MINING PROCESS ======================
+# ======================  MINING PROCESS (optimized, LV06 logs) ======================
 def bitcoin_miner_process(process_id):
-    global nbits, version, prevhash, ntime, target
+    global nbits, version, prevhash, ntime, target, extranonce2
+
+    extranonce2_bytes = b'\x00' * 8  # start with zeros, increment when nonce wraps
 
     # Wait for job
     while None in (nbits, version, prevhash, ntime):
@@ -194,7 +199,7 @@ def bitcoin_miner_process(process_id):
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
     # Low share target for solo to show live hashrate
-    share_target = diff_to_target(128)  # even lower for more submits
+    share_target = diff_to_target(128)
 
     nonce = 0xffffffff
     hashes_done = 0
@@ -203,13 +208,16 @@ def bitcoin_miner_process(process_id):
     while not fShutdown.is_set():
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
+            current_extranonce2 = extranonce2_bytes.hex()
+            full_header = header_static.replace(extranonce2, current_extranonce2)
+            header_bytes = binascii.unhexlify(full_header)
+
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
 
             hashes_done += 1
 
             if h_hex < share_target:
-                # LV06 style difficulty log
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
                 logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 371.")
@@ -228,15 +236,20 @@ def bitcoin_miner_process(process_id):
                     sys.stdout.write("\a" * 5)
                     sys.stdout.flush()
 
-            if hashes_done % 500000 == 0:
+            if hashes_done % 100000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(500000 / elapsed)
+                    hr = int(100000 / elapsed)
                     hashrates[process_id] = hr
                 last_report = now
 
-# ======================  STRATUM ======================
+        # When nonce wraps, increment extranonce2
+        extranonce2_int = int.from_bytes(extranonce2_bytes, 'big')
+        extranonce2_int += 1
+        extranonce2_bytes = extranonce2_int.to_bytes(8, 'big')
+
+# ======================  STRATUM (with reconnection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size
@@ -248,11 +261,6 @@ def stratum_worker():
             sock = s
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
-            lines = s.recv(4096).decode().split('\n')
-            response = json.loads(lines[0])
-            extranonce1 = response['result'][1]
-            extranonce2_size = response['result'][2]
-            logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
 
             auth = {"id":2,"method":"mining.authorize","params":[user,password]}
             s.sendall((json.dumps(auth)+"\n").encode())
@@ -269,7 +277,11 @@ def stratum_worker():
                     if not line.strip(): continue
                     msg = json.loads(line)
                     logg(f"stratum_task: rx: {json.dumps(msg)}")
-                    if msg.get("method") == "mining.notify":
+                    if "result" in msg and msg["id"] == 1:
+                        extranonce1 = msg["result"][1]
+                        extranonce2_size = msg["result"][2]
+                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+                    elif msg.get("method") == "mining.notify":
                         (job_id, prevhash, coinb1, coinb2,
                          merkle_branch, version, nbits, ntime, _) = msg["params"]
                         logg(f"create_jobs_task: New Work Dequeued {job_id}")
@@ -344,15 +356,6 @@ def display_worker():
     finally:
         curses.endwin()
 
-# Override print to capture logs for display (stable list)
-original_print = print
-def custom_print(*args, **kwargs):
-    original_print(*args, **kwargs)
-    msg = " ".join(str(a) for a in args)
-    log_lines.append(msg)
-
-print = custom_print
-
 # ======================  MAIN ======================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -374,7 +377,6 @@ if __name__ == "__main__":
     # Start stratum
     p_stratum = multiprocessing.Process(target=stratum_worker, daemon=True)
     p_stratum.start()
-    time.sleep(3)
 
     # Start mining processes
     processes = []
