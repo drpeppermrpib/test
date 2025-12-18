@@ -15,8 +15,8 @@ import curses
 import argparse
 import signal
 import threading
-import subprocess  # for accurate temp on HiveOS
-import re
+import subprocess  # for accurate temp
+import re  # for ckpool stats
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -26,7 +26,7 @@ def diff_to_target(diff):
 
 # ======================  CPU TEMPERATURE (accurate for HiveOS/AMD) ======================
 def get_cpu_temp():
-    # HiveOS uses 'sensors' for accurate AMD temps (Tctl/Tdie)
+    # HiveOS/AMD: use 'sensors' for Tctl/Tdie
     try:
         result = subprocess.check_output(["sensors"], text=True)
         temps = []
@@ -42,7 +42,7 @@ def get_cpu_temp():
     except:
         pass
 
-    # Fallback
+    # Fallback thermal zones
     temps = []
     for zone in range(20):
         path = f"/sys/class/thermal/thermal_zone{zone}/temp"
@@ -59,7 +59,7 @@ def get_cpu_temp():
         return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
     return "N/A"
 
-# ======================  CKPOOL STATS (updated regex) ======================
+# ======================  CKPOOL STATS (updated regex for current page) ======================
 def get_ckpool_stats():
     url = "https://solostats.ckpool.org/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
     try:
@@ -97,6 +97,10 @@ target = None
 mode = "solo"
 host = port = user = password = None
 
+# Global log lines for stable display
+error_lines = []
+max_errors = 15
+
 # ======================  LOGGER ======================
 def logg(msg):
     print(msg)
@@ -112,7 +116,7 @@ logg("[*] Miner starting...")
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
 SOLO_PORT = 3333
-SOLO_ADDRESS = 'bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.001'
+SOLO_ADDRESS = 'bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e'
 
 POOL_HOST = 'ss.antpool.com'
 POOL_PORT = 3333
@@ -120,7 +124,7 @@ POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
 num_cores = os.cpu_count()
-num_processes = num_cores  # Use all physical cores for max hashrate
+num_processes = num_cores  # Use all physical cores
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -183,15 +187,14 @@ def bitcoin_miner_process(process_id):
     # Network (block) target
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-    # Low share target for solo to show live hashrate on dashboard
-    share_target = diff_to_target(256)  # very low – submits every few seconds
+    # Low share target for solo to show live hashrate
+    share_target = diff_to_target(256)
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
     while not fShutdown.is_set():
-        # Larger batch for better efficiency and faster hashrate reporting
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
@@ -199,7 +202,6 @@ def bitcoin_miner_process(process_id):
 
             hashes_done += 1
 
-            # Submit if meets share target
             if h_hex < share_target:
                 is_block = h_hex < network_target
                 submit_share(nonce)
@@ -260,6 +262,7 @@ def stratum_worker():
 
 # ======================  DISPLAY ======================
 def display_worker():
+    global error_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -268,9 +271,6 @@ def display_worker():
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
-
-    log_lines = []
-    max_log = 15
 
     try:
         while not fShutdown.is_set():
@@ -310,9 +310,9 @@ def display_worker():
             stdscr.addstr(14, 0, f"Best Share      : {stats['best_share']}", curses.color_pair(1))
             stdscr.addstr(15, 0, f"Total Shares    : {stats['shares']}", curses.color_pair(3))
 
-            # Log area (scrolling, stable list)
+            # Scrolling log area (stable)
             start_y = 17
-            for i, line in enumerate(log_lines[-max_log:]):
+            for i, line in enumerate(error_lines[-max_errors:]):
                 if start_y + i >= screen_height:
                     break
                 stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
@@ -327,7 +327,9 @@ original_print = print
 def custom_print(*args, **kwargs):
     original_print(*args, **kwargs)
     msg = " ".join(str(a) for a in args)
-    log_lines.append(msg)
+    if "[*]" in msg or "[!]" in msg or "error" in msg.lower():
+        with lock:
+            error_lines.append(msg)
 
 print = custom_print
 
@@ -335,11 +337,13 @@ print = custom_print
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["solo","pool"], default="solo")
+    parser.add_argument("--worker", type=str, default="002", help="Worker name (e.g., 001 for LV06, 002 for Python miner)")
     args = parser.parse_args()
 
     mode = args.mode
+    worker = args.worker
     if mode == "solo":
-        host, port, user, password = SOLO_HOST, SOLO_PORT, SOLO_ADDRESS, "x"
+        host, port, user, password = SOLO_HOST, SOLO_PORT, f"{SOLO_ADDRESS}.{worker}", "x"
     else:
         host, port, user, password = POOL_HOST, POOL_PORT, POOL_WORKER, POOL_PASSWORD
 
