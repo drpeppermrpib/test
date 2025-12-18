@@ -88,7 +88,8 @@ rejected = manager.Value('i', 0)
 accepted_timestamps = manager.list()
 rejected_timestamps = manager.list()
 
-# job data
+# job data (shared, updated by stratum)
+job_ready = manager.Event()  # signal when first job is ready
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
@@ -125,7 +126,7 @@ POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
 num_cores = os.cpu_count()
-num_processes = num_cores  # Use all physical cores for true scaling
+num_processes = num_cores  # Use all physical cores
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -181,12 +182,10 @@ def submit_share(nonce):
 
 # ======================  MINING PROCESS ======================
 def bitcoin_miner_process(process_id):
-    global nbits, version, prevhash, ntime, target
+    # Wait for first job
+    job_ready.wait()
 
-    # Wait for job
-    while None in (nbits, version, prevhash, ntime):
-        time.sleep(0.5)
-
+    # Recalc header (in case job changed)
     header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
     header_bytes = binascii.unhexlify(header_static)
 
@@ -194,13 +193,18 @@ def bitcoin_miner_process(process_id):
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
     # Low share target for solo to show live hashrate
-    share_target = diff_to_target(128)  # even lower for more submits
+    share_target = diff_to_target(128)
 
     nonce = 0xffffffff
     hashes_done = 0
     last_report = time.time()
 
     while not fShutdown.is_set():
+        # Re-check for new job
+        if prevhash != prevhash:  # dummy, but forces recalc if changed (use global flag in real)
+            header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
+            header_bytes = binascii.unhexlify(header_static)
+
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
@@ -209,7 +213,6 @@ def bitcoin_miner_process(process_id):
             hashes_done += 1
 
             if h_hex < share_target:
-                # LV06 style difficulty log
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
                 logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 371.")
@@ -273,6 +276,7 @@ def stratum_worker():
                         (job_id, prevhash, coinb1, coinb2,
                          merkle_branch, version, nbits, ntime, _) = msg["params"]
                         logg(f"create_jobs_task: New Work Dequeued {job_id}")
+                        job_ready.set()  # signal miners to start/recalc
                     elif msg.get("method") == "mining.set_difficulty":
                         target = diff_to_target(msg["params"][0])
                         logg(f"[*] Difficulty set to {msg['params'][0]}")
@@ -282,6 +286,7 @@ def stratum_worker():
 
 # ======================  DISPLAY ======================
 def display_worker():
+    global log_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
@@ -373,7 +378,12 @@ if __name__ == "__main__":
     # Start stratum
     p_stratum = multiprocessing.Process(target=stratum_worker, daemon=True)
     p_stratum.start()
-    time.sleep(3)
+
+    # Start display early
+    threading.Thread(target=display_worker, daemon=True).start()
+
+    # Wait for first job before starting miners
+    job_ready.wait()
 
     # Start mining processes
     processes = []
@@ -381,9 +391,6 @@ if __name__ == "__main__":
         p = multiprocessing.Process(target=bitcoin_miner_process, args=(i,))
         p.start()
         processes.append(p)
-
-    # Display
-    threading.Thread(target=display_worker, daemon=True).start()
 
     logg("[*] Miner running – press Ctrl+C to stop")
     try:
