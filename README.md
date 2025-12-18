@@ -15,6 +15,8 @@ import curses
 import argparse
 import signal
 import threading
+import subprocess  # for better temp reading
+import re
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -22,15 +24,14 @@ def diff_to_target(diff):
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
 
-# ======================  CPU TEMPERATURE (improved for HiveOS) ======================
+# ======================  CPU TEMPERATURE (best for HiveOS/AMD) ======================
 def get_cpu_temp():
-    # First try 'sensors' command (common on HiveOS)
+    # First try 'sensors' command (accurate on HiveOS for AMD Threadripper)
     try:
-        import subprocess
         result = subprocess.check_output(["sensors"], text=True)
         temps = []
         for line in result.splitlines():
-            if 'Core' in line or 'Tdie' in line or 'Tctl' in line or 'temp1' in line:
+            if 'Tdie' in line or 'Tctl' in line or 'edge' in line or 'junction' in line:
                 match = re.search(r'[\+\-]?[\d\.]+°C', line)
                 if match:
                     temps.append(float(match.group(0).replace('°C', '').strip()))
@@ -111,7 +112,7 @@ logg("[*] Miner starting...")
 # ======================  CONFIG ======================
 SOLO_HOST = 'solo.ckpool.org'
 SOLO_PORT = 3333
-SOLO_ADDRESS = 'bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.001'
+SOLO_ADDRESS = 'bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e'
 
 POOL_HOST = 'ss.antpool.com'
 POOL_PORT = 3333
@@ -119,9 +120,7 @@ POOL_WORKER = 'Xk2000.001'
 POOL_PASSWORD = 'x'
 
 num_cores = os.cpu_count()
-num_processes = max(4, num_cores // 2)  # Start with half cores to control heat
-
-MAX_TEMP = 80  # Reduce load if temp > 80°C
+num_processes = num_cores  # Use all physical cores for true scaling
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -185,7 +184,7 @@ def bitcoin_miner_process(process_id):
     network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
     # Very low share target for solo to show live hashrate on dashboard
-    share_target = diff_to_target(256)  # ~every few seconds on CPU
+    share_target = diff_to_target(256)  # very low – submits frequently
 
     nonce = 0xffffffff
     hashes_done = 0
@@ -258,24 +257,6 @@ def stratum_worker():
             logg(f"[!] Stratum error: {e}")
             break
 
-# ======================  TEMPERATURE THROTTLING ======================
-def temp_throttler():
-    global num_processes
-    while not fShutdown.is_set():
-        time.sleep(10)
-        cpu_temp_str = get_cpu_temp()
-        if "N/A" in cpu_temp_str:
-            continue
-        max_temp = float(cpu_temp_str.split("/")[1].strip().replace("°C (max)", "").strip())
-        if max_temp > 80:
-            old = num_processes
-            num_processes = max(4, num_processes - 4)
-            logg(f"[!] Temp {max_temp:.1f}°C – reducing to {num_processes} processes")
-        elif max_temp < 70 and num_processes < num_cores:
-            old = num_processes
-            num_processes = min(num_cores, num_processes + 4)
-            logg(f"[*] Temp {max_temp:.1f}°C – increasing to {num_processes} processes")
-
 # ======================  DISPLAY ======================
 def display_worker():
     stdscr = curses.initscr()
@@ -312,7 +293,7 @@ def display_worker():
                 block_height = "???"
             stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
             stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
-            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3) if max_temp < 80 else curses.color_pair(2))
+            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
             stdscr.addstr(7, 0, f"Processes    : {num_processes}", curses.color_pair(3))
             stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
@@ -334,11 +315,13 @@ def display_worker():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["solo","pool"], default="solo")
+    parser.add_argument("--worker", type=str, default="001", help="Worker name (e.g., 001 or 002)")
     args = parser.parse_args()
 
     mode = args.mode
+    worker = args.worker
     if mode == "solo":
-        host, port, user, password = SOLO_HOST, SOLO_PORT, SOLO_ADDRESS, "x"
+        host, port, user, password = SOLO_HOST, SOLO_PORT, f"{SOLO_ADDRESS}.{worker}", "x"
     else:
         host, port, user, password = POOL_HOST, POOL_PORT, POOL_WORKER, POOL_PASSWORD
 
@@ -357,9 +340,6 @@ if __name__ == "__main__":
         p = multiprocessing.Process(target=bitcoin_miner_process, args=(i,))
         p.start()
         processes.append(p)
-
-    # Temperature throttler
-    threading.Thread(target=temp_throttler, daemon=True).start()
 
     # Display
     threading.Thread(target=display_worker, daemon=True).start()
