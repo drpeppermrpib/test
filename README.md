@@ -85,12 +85,8 @@ def logg(msg):
 logg("Miner starting...")
 
 # ======================  CONFIG ======================
-SERVER_MAP = {
-    "us": "us.mining.prohashing.com",
-    "eu": "eu.mining.prohashing.com",
-    "asia": "asia.mining.prohashing.com"
-}
-PROHASHING_PORT = 3335
+BRAIINS_HOST = 'stratum.braiins.com'
+BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
 num_threads = num_cores * 4  # heavier load for Threadripper
@@ -214,57 +210,48 @@ def bitcoin_miner(thread_id):
         extranonce2_int += 1
         extranonce2 = f"{extranonce2_int:0{extranonce2_size*2}x}"
 
-# ======================  STRATUM (LV06 style logs, reconnection, multiple servers) ======================
+# ======================  STRATUM (LV06 style logs, reconnection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size
 
-    servers = ["us.mining.prohashing.com", "eu.mining.prohashing.com", "asia.mining.prohashing.com"]
-
     while not fShutdown:
-        for server in servers:
-            try:
-                logg(f"Trying server {server}...")
-                s = socket.socket()
-                s.settimeout(30)
-                s.connect((server, PROHASHING_PORT))
-                sock = s
-                logg(f"Connected to {server}")
+        try:
+            s = socket.socket()
+            s.connect((host, port))
+            sock = s
 
-                s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
+            s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
 
-                auth = {"id":2,"method":"mining.authorize","params":[user,password]}
-                s.sendall((json.dumps(auth)+"\n").encode())
+            auth = {"id":2,"method":"mining.authorize","params":[user,password]}
+            s.sendall((json.dumps(auth)+"\n").encode())
 
-                buf = b""
-                while not fShutdown:
-                    data = s.recv(4096)
-                    if not data:
-                        logg("[!] Connection lost – trying next server...")
-                        break
-                    buf += data
-                    while b'\n' in buf:
-                        line, buf = buf.split(b'\n', 1)
-                        if not line.strip(): continue
-                        msg = json.loads(line)
-                        logg(f"stratum_task: rx: {json.dumps(msg)}")
-                        if "result" in msg and msg["id"] == 1:
-                            extranonce1 = msg["result"][1]
-                            extranonce2_size = msg["result"][2]
-                            logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
-                        elif msg.get("method") == "mining.notify":
-                            (job_id, prevhash, coinb1, coinb2,
-                             merkle_branch, version, nbits, ntime, _) = msg["params"]
-                            logg(f"create_jobs_task: New Work Dequeued {job_id}")
-                        elif msg.get("method") == "mining.set_difficulty":
-                            target = diff_to_target(msg["params"][0])
-                            logg(f"[*] Difficulty set to {msg['params'][0]}")
-                break  # if connection lost, try next server
-            except socket.timeout:
-                logg(f"[!] Timeout connecting to {server} – trying next...")
-            except Exception as e:
-                logg(f"[!] Error with {server}: {e} – trying next...")
-        time.sleep(10)  # wait before retry cycle
+            buf = b""
+            while not fShutdown:
+                data = s.recv(4096)
+                if not data:
+                    logg("[!] Connection lost – reconnecting...")
+                    break
+                buf += data
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    if not line.strip(): continue
+                    msg = json.loads(line)
+                    logg(f"stratum_task: rx: {json.dumps(msg)}")
+                    if "result" in msg and msg["id"] == 1:
+                        extranonce1 = msg["result"][1]
+                        extranonce2_size = msg["result"][2]
+                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+                    elif msg.get("method") == "mining.notify":
+                        (job_id, prevhash, coinb1, coinb2,
+                         merkle_branch, version, nbits, ntime, _) = msg["params"]
+                        logg(f"create_jobs_task: New Work Dequeued {job_id}")
+                    elif msg.get("method") == "mining.set_difficulty":
+                        target = diff_to_target(msg["params"][0])
+                        logg(f"[*] Difficulty set to {msg['params'][0]}")
+        except Exception as e:
+            logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
+            time.sleep(10)
 
 # ======================  DISPLAY (stable top bar, scrolling logs) ======================
 def display_worker():
@@ -293,7 +280,7 @@ def display_worker():
             stdscr.addstr(0, max(0, screen_width - 20), "Ctrl+C to quit", curses.color_pair(3))
 
             # Title
-            title = "Bitcoin Miner (CPU) - ProHashing"
+            title = "Bitcoin Miner (CPU) - Braiins Pool"
             stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
 
             # Static stats
@@ -325,25 +312,22 @@ def display_worker():
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ProHashing SHA-256 CPU Miner")
-    parser.add_argument("--username", type=str, required=True, help="ProHashing username")
-    parser.add_argument("--worker", type=str, default="002", help="Worker name (e.g., 002)")
-    parser.add_argument("--group", type=str, default="kx2000", help="Group name (e.g., kx2000)")
-    parser.add_argument("--wattage", type=int, default=1000, help="Wattage for tracking (e.g., 1000)")
-    parser.add_argument("--price", type=float, default=1.45, help="Electricity price $/kWh (e.g., 1.45)")
+    parser = argparse.ArgumentParser(description="Braiins Pool SHA-256 CPU Miner")
+    parser.add_argument("--username", type=str, required=True, help="Braiins Pool username (your account name or address)")
+    parser.add_argument("--worker", type=str, default="cpu002", help="Worker name (e.g., cpu002)")
     args = parser.parse_args()
 
-    # Construct ProHashing password string
-    password = f"a=sha-256,c=bitcoin,w={args.wattage},p={args.price},n={args.worker},o={args.group}"
-
-    user = args.username
+    host = BRAIINS_HOST
+    port = BRAIINS_PORT
+    user = f"{args.username}.{args.worker}"
+    password = "x"  # Braiins uses any password, "x" is standard
 
     # Fixed size hashrates list for stability
     hashrates = [0] * num_threads
 
-    # Start stratum (auto tries all servers)
+    # Start stratum
     threading.Thread(target=stratum_worker, daemon=True).start()
-    time.sleep(5)  # give time to connect
+    time.sleep(3)
 
     # Start mining threads
     for i in range(num_threads):
