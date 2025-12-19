@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import threading
+import multiprocessing
 import requests
 import binascii
 import hashlib
@@ -56,41 +56,36 @@ def get_cpu_temp():
         return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
     return "N/A"
 
-# ======================  GLOBALS ======================
-fShutdown = False
-hashrates = [0] * 192  # fixed size for stability
-accepted = rejected = 0
-accepted_timestamps = []
-rejected_timestamps = []
-lock = threading.Lock()
+# ======================  GLOBALS (shared via Manager) ======================
+manager = multiprocessing.Manager()
+fShutdown = manager.Event()
+hashrates = manager.list()
+accepted = manager.Value('i', 0)
+rejected = manager.Value('i', 0)
+accepted_timestamps = manager.list()
+rejected_timestamps = manager.list()
 
-# job data
-job_id = None
-prevhash = None
-coinb1 = None
-coinb2 = None
-merkle_branch = []
-version = None
-nbits = None
-ntime = None
-extranonce1 = "00000000"
-extranonce2 = "00000000"
-extranonce2_size = 4
-sock = None
-target = None
-pool_diff = 128  # default, updated from set_difficulty
-connected = False  # connection status
+# job data (shared)
+job_id = manager.Value('c', None)
+prevhash = manager.Value('c', None)
+coinb1 = manager.Value('c', None)
+coinb2 = manager.Value('c', None)
+merkle_branch = manager.list()
+version = manager.Value('c', None)
+nbits = manager.Value('c', None)
+ntime = manager.Value('c', None)
+extranonce1 = manager.Value('c', "00000000")
+extranonce2 = manager.Value('c', "00000000")
+extranonce2_size = manager.Value('i', 4)
+target = manager.Value('c', None)
+pool_diff = manager.Value('i', 128)
 
 # Global log lines for display
-log_lines = []
+log_lines = manager.list()
 max_log = 15
-
-# Last error time to rate limit
-last_error_time = 0
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
 def logg(msg):
-    global last_error_time
     timestamp = int(time.time() * 100000)
     prefixed_msg = f"₿ ({timestamp}) {msg}"
     log_lines.append(prefixed_msg)
@@ -102,34 +97,29 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 4  # heavy load for Threadripper
+num_processes = num_cores * 2  # heavy load for ~45-50 load average on HiveOS
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
-    global fShutdown
-    fShutdown = True
+    fShutdown.set()
     logg("\n[!] Shutting down...")
 
 signal.signal(signal.SIGINT, signal_handler)
 
 # ======================  MERKLE ROOT ======================
 def calculate_merkle_root():
-    coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
+    coinbase = coinb1.value + extranonce1.value + extranonce2.value + coinb2.value
     h = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
     for b in merkle_branch:
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE (LV06 style logs, skip if not connected) ======================
+# ======================  SUBMIT SHARE (LV06 style logs) ======================
 def submit_share(nonce):
-    global connected
-    if not connected or sock is None:
-        return  # skip submission if disconnected
-
     payload = {
         "id": 1,
         "method": "mining.submit",
-        "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
+        "params": [user, job_id.value, extranonce2.value, ntime.value, f"{nonce:08x}"]
     }
     try:
         logg(f"stratum_api: tx: {json.dumps(payload)}")
@@ -139,38 +129,22 @@ def submit_share(nonce):
         logg("stratum_task: message result accepted" if "true" in resp.lower() else "[!] Share rejected")
 
         if "true" in resp.lower():
-            global accepted
-            with lock:
-                accepted += 1
+            accepted.value += 1
             accepted_timestamps.append(time.time())
             log_lines.append("*** SHARE ACCEPTED ***")
             log_lines.append(f"Nonce: {nonce:08x}")
             log_lines.append(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
             curses.beep()
         else:
-            global rejected
-            with lock:
-                rejected += 1
+            rejected.value += 1
             rejected_timestamps.append(time.time())
     except BrokenPipeError:
-        global connected
-        connected = False
-        current_time = time.time()
-        if current_time - last_error_time > 10:
-            logg("[!] Broken pipe – connection lost")
-            last_error_time = current_time
+        logg("[!] Broken pipe – connection lost")
     except Exception as e:
-        current_time = time.time()
-        if current_time - last_error_time > 10:
-            logg(f"[!] Submit failed: {e}")
-            last_error_time = current_time
+        logg(f"[!] Submit failed: {e}")
 
-# ======================  MINING LOOP (optimized, LV06 logs, nonce shuffling, heavy load) ======================
-def bitcoin_miner(thread_id):
-    global nbits, version, prevhash, ntime, target, extranonce2, pool_diff
-
-    last_job_id = None
-
+# ======================  MINING PROCESS (optimized for 16 MH/s+, heavy load) ======================
+def bitcoin_miner_process(process_id):
     hashes_done = 0
     last_report = time.time()
 
@@ -178,32 +152,33 @@ def bitcoin_miner(thread_id):
     header_bytes = b''
     nonce = 0
 
-    while not fShutdown:
-        if job_id != last_job_id:
-            last_job_id = job_id
-            if None in (nbits, version, prevhash, ntime):
-                time.sleep(0.5)
-                continue
+    while not fShutdown.is_set():
+        if job_id.value is None:
+            time.sleep(0.5)
+            continue
 
-            logg(f"create_jobs_task: New Work Dequeued {job_id}")
+        if hashes_done == 0 or job_id.value != last_job_id:  # rebuild on new job
+            last_job_id = job_id.value
 
-            # Reset extranonce2 for new job
-            extranonce2 = "00" * extranonce2_size
+            logg(f"create_jobs_task: New Work Dequeued {job_id.value}")
 
-            # Shuffle starting nonce
+            # Reset extranonce2
+            extranonce2.value = "00" * extranonce2_size.value
+
+            # Shuffle nonce
             nonce = random.randint(0, 0xffffffff)
 
-            header_static = version + prevhash + coinb1 + extranonce1 + extranonce2 + coinb2 + ntime + nbits
+            header_static = version.value + prevhash.value + coinb1.value + extranonce1.value + extranonce2.value + coinb2.value + ntime.value + nbits.value
             header_bytes = binascii.unhexlify(header_static)
 
-            # Network (block) target
-            network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+            # Network target
+            network_target = (nbits.value[2:] + '00' * (int(nbits.value[:2],16) - 3)).zfill(64)
 
-            # Very low local share target to submit frequently (keeps worker online)
-            share_target = diff_to_target(1)  # submit every few seconds on CPU
+            # Low local target for frequent submits (keeps worker online)
+            share_target = diff_to_target(4)  # ~every few seconds on CPU for 16 MH/s
 
-        # Larger batch for higher hashrate
-        for _ in range(1000000):
+        # Very large batch for max hashrate / low overhead
+        for _ in range(2000000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
@@ -213,7 +188,7 @@ def bitcoin_miner(thread_id):
             if h_hex < share_target:
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff}")
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 4.")
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -227,33 +202,30 @@ def bitcoin_miner(thread_id):
                     curses.beep()
                     curses.beep()
 
-            if hashes_done % 100000 == 0:
+            if hashes_done % 200000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(100000 / elapsed)
-                    with lock:
-                        hashrates[thread_id] = hr
+                    hr = int(200000 / elapsed)
+                    hashrates[process_id] = hr
                 last_report = now
 
-        # Increment extranonce2 when nonce wraps
-        extranonce2_int = int(extranonce2, 16)
+        # Increment extranonce2 on wrap
+        extranonce2_int = int(extranonce2.value, 16)
         extranonce2_int += 1
-        extranonce2 = f"{extranonce2_int:0{extranonce2_size*2}x}"
+        extranonce2.value = f"{extranonce2_int:0{extranonce2_size.value*2}x}"
 
 # ======================  STRATUM (LV06 style logs, reconnection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
-    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
+    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff
 
-    while not fShutdown:
+    while not fShutdown.is_set():
         try:
             s = socket.socket()
             s.settimeout(30)
             s.connect((host, port))
             sock = s
-            connected = True
-            logg(f"Connected to {host}:{port}")
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
 
@@ -261,10 +233,9 @@ def stratum_worker():
             s.sendall((json.dumps(auth)+"\n").encode())
 
             buf = b""
-            while not fShutdown:
+            while not fShutdown.is_set():
                 data = s.recv(4096)
                 if not data:
-                    connected = False
                     logg("[!] Connection lost – reconnecting...")
                     break
                 buf += data
@@ -274,29 +245,27 @@ def stratum_worker():
                     msg = json.loads(line)
                     logg(f"stratum_task: rx: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
-                        extranonce1 = msg["result"][1]
-                        extranonce2_size = msg["result"][2]
-                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+                        extranonce1.value = msg["result"][1]
+                        extranonce2_size.value = msg["result"][2]
+                        logg(f"Subscribed – extranonce1: {extranonce1.value}, size: {extranonce2_size.value}")
                     elif msg.get("method") == "mining.notify":
                         params = msg["params"]
-                        job_id = params[0]
-                        prevhash = params[1]
-                        coinb1 = params[2]
-                        coinb2 = params[3]
-                        merkle_branch = params[4]
-                        version = params[5]
-                        nbits = params[6]
-                        ntime = params[7]
-                        logg(f"create_jobs_task: New Work Dequeued {job_id}")
+                        job_id.value = params[0]
+                        prevhash.value = params[1]
+                        coinb1.value = params[2]
+                        coinb2.value = params[3]
+                        merkle_branch[:] = params[4]
+                        version.value = params[5]
+                        nbits.value = params[6]
+                        ntime.value = params[7]
+                        logg(f"create_jobs_task: New Work Dequeued {job_id.value}")
                     elif msg.get("method") == "mining.set_difficulty":
-                        pool_diff = msg["params"][0]
-                        target = diff_to_target(pool_diff)
-                        logg(f"[*] Difficulty set to {pool_diff}")
+                        pool_diff.value = msg["params"][0]
+                        target.value = diff_to_target(pool_diff.value)
+                        logg(f"[*] Difficulty set to {pool_diff.value}")
         except socket.timeout:
-            connected = False
             logg("[!] Timeout – reconnecting...")
         except Exception as e:
-            connected = False
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
 
@@ -313,7 +282,7 @@ def display_worker():
     curses.noecho(); curses.cbreak(); stdscr.keypad(True)
 
     try:
-        while not fShutdown:
+        while not fShutdown.is_set():
             stdscr.clear()
             screen_height, screen_width = stdscr.getmaxyx()
 
@@ -338,19 +307,15 @@ def display_worker():
             stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
             stdscr.addstr(5, 0, f"Hashrate     : {sum(hashrates):,} H/s", curses.color_pair(1))
             stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
-            stdscr.addstr(7, 0, f"Threads      : {num_threads}", curses.color_pair(3))
-            stdscr.addstr(8, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
+            stdscr.addstr(7, 0, f"Processes    : {num_processes}", curses.color_pair(3))
+            stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            # Connection status
-            status = "Connected" if connected else "Disconnected"
-            stdscr.addstr(10, 0, f"Status       : {status}", curses.color_pair(1 if connected else 2))
-
             # Yellow line
-            stdscr.addstr(12, 0, "─" * (screen_width - 1), curses.color_pair(3))
+            stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
             # Scrolling log area (stable)
-            start_y = 13
+            start_y = 12
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
                     break
@@ -373,27 +338,36 @@ if __name__ == "__main__":
     user = f"{args.username}.{args.worker}"
     password = "x"
 
-    # Fixed size hashrates list
-    hashrates = [0] * num_threads
+    # Initialize shared hashrates list
+    for _ in range(num_processes):
+        hashrates.append(0)
 
     # Start stratum
-    threading.Thread(target=stratum_worker, daemon=True).start()
+    p_stratum = multiprocessing.Process(target=stratum_worker, daemon=True)
+    p_stratum.start()
     time.sleep(5)
 
-    # Start mining threads
-    for i in range(num_threads):
-        threading.Thread(target=bitcoin_miner, args=(i,), daemon=True).start()
+    # Start mining processes
+    processes = []
+    for i in range(num_processes):
+        p = multiprocessing.Process(target=bitcoin_miner_process, args=(i,))
+        p.start()
+        processes.append(p)
 
     # Display
     threading.Thread(target=display_worker, daemon=True).start()
 
     logg("[*] Miner running – press Ctrl+C to stop")
     try:
-        while not fShutdown:
+        while not fShutdown.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         pass
 
-    fShutdown = True
-    time.sleep(2)
+    fShutdown.set()
+    for p in processes:
+        p.terminate()
+        p.join()
+    p_stratum.terminate()
+    p_stratum.join()
     logg("[*] Shutdown complete")
