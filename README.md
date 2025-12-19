@@ -13,7 +13,6 @@ import os
 import curses
 import argparse
 import signal
-import threading  # <-- Fixed: Added import to resolve NameError
 import subprocess  # for accurate temp
 
 # ======================  diff_to_target ======================
@@ -66,19 +65,23 @@ rejected = manager.Value('i', 0)
 accepted_timestamps = manager.list()
 rejected_timestamps = manager.list()
 
-# job data
-job_id = prevhash = coinb1 = coinb2 = None
-merkle_branch = version = nbits = ntime = None
-extranonce1 = "00000000"
-extranonce2 = "00000000"
-extranonce2_size = 4
-sock = None
-target = None
-pool_diff = 128  # default
-host = port = user = password = None
+# job data (shared)
+job_id = manager.Value('c', None)
+prevhash = manager.Value('c', None)
+coinb1 = manager.Value('c', None)
+coinb2 = manager.Value('c', None)
+merkle_branch = manager.list()
+version = manager.Value('c', None)
+nbits = manager.Value('c', None)
+ntime = manager.Value('c', None)
+extranonce1 = manager.Value('c', "00000000")
+extranonce2 = manager.Value('c', "00000000")
+extranonce2_size = manager.Value('i', 4)
+target = manager.Value('c', None)
+pool_diff = manager.Value('i', 128)
 
 # Global log lines for display
-log_lines = []
+log_lines = manager.list()
 max_log = 15
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
@@ -105,7 +108,7 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # ======================  MERKLE ROOT ======================
 def calculate_merkle_root():
-    coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
+    coinbase = coinb1.value + extranonce1.value + extranonce2.value + coinb2.value
     h = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
     for b in merkle_branch:
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
@@ -116,7 +119,7 @@ def submit_share(nonce):
     payload = {
         "id": 1,
         "method": "mining.submit",
-        "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
+        "params": [user, job_id.value, extranonce2.value, ntime.value, f"{nonce:08x}"]
     }
     try:
         logg(f"stratum_api: tx: {json.dumps(payload)}")
@@ -142,41 +145,28 @@ def submit_share(nonce):
 
 # ======================  MINING PROCESS (optimized, LV06 logs, nonce shuffling, max load) ======================
 def bitcoin_miner_process(process_id):
-    global nbits, version, prevhash, ntime, target, extranonce2, pool_diff
-
-    last_job_id = None
-
     hashes_done = 0
     last_report = time.time()
 
-    # Initial values to avoid UnboundLocalError
-    header_bytes = b''
+    # Initial values
     nonce = 0
-    share_target = diff_to_target(128)
 
     while not fShutdown.is_set():
-        if job_id != last_job_id:
-            last_job_id = job_id
-            if None in (nbits, version, prevhash, ntime):
-                time.sleep(0.5)
-                continue
+        # Wait for first job
+        if job_id.value is None:
+            time.sleep(0.5)
+            continue
 
-            logg(f"create_jobs_task: New Work Dequeued {job_id}")
-
-            # Reset extranonce2 for new job
-            extranonce2 = "00" * extranonce2_size
-
-            # Shuffle starting nonce
-            nonce = random.randint(0, 0xffffffff)
-
-            header_static = version + prevhash + coinb1 + extranonce1 + extranonce2 + coinb2 + ntime + nbits
+        # Rebuild header on new job
+        if hashes_done == 0 or job_id.value != last_job_id:  # dummy last_job_id
+            header_static = version.value + prevhash.value + calculate_merkle_root() + ntime.value + nbits.value
             header_bytes = binascii.unhexlify(header_static)
 
-            # Network (block) target
-            network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+            network_target = (nbits.value[2:] + '00' * (int(nbits.value[:2],16) - 3)).zfill(64)
 
-            # Use pool difficulty for share target
-            share_target = target if target else diff_to_target(pool_diff)
+            share_target = target.value if target.value else diff_to_target(pool_diff.value)
+
+            nonce = random.randint(0, 0xffffffff)
 
         # Larger batch for higher hashrate
         for _ in range(1000000):
@@ -189,7 +179,7 @@ def bitcoin_miner_process(process_id):
             if h_hex < share_target:
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff}")
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff.value}")
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -212,9 +202,9 @@ def bitcoin_miner_process(process_id):
                 last_report = now
 
         # Increment extranonce2 when nonce wraps
-        extranonce2_int = int(extranonce2, 16)
+        extranonce2_int = int(extranonce2.value, 16)
         extranonce2_int += 1
-        extranonce2 = f"{extranonce2_int:0{extranonce2_size*2}x}"
+        extranonce2.value = f"{extranonce2_int:0{extranonce2_size.value*2}x}"
 
 # ======================  STRATUM (LV06 style logs, reconnection) ======================
 def stratum_worker():
@@ -246,17 +236,24 @@ def stratum_worker():
                     msg = json.loads(line)
                     logg(f"stratum_task: rx: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
-                        extranonce1 = msg["result"][1]
-                        extranonce2_size = msg["result"][2]
-                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+                        extranonce1.value = msg["result"][1]
+                        extranonce2_size.value = msg["result"][2]
+                        logg(f"Subscribed – extranonce1: {extranonce1.value}, size: {extranonce2_size.value}")
                     elif msg.get("method") == "mining.notify":
-                        (job_id, prevhash, coinb1, coinb2,
-                         merkle_branch, version, nbits, ntime, _) = msg["params"]
-                        logg(f"create_jobs_task: New Work Dequeued {job_id}")
+                        params = msg["params"]
+                        job_id.value = params[0]
+                        prevhash.value = params[1]
+                        coinb1.value = params[2]
+                        coinb2.value = params[3]
+                        merkle_branch[:] = params[4]
+                        version.value = params[5]
+                        nbits.value = params[6]
+                        ntime.value = params[7]
+                        logg(f"create_jobs_task: New Work Dequeued {job_id.value}")
                     elif msg.get("method") == "mining.set_difficulty":
-                        pool_diff = msg["params"][0]
-                        target = diff_to_target(pool_diff)
-                        logg(f"[*] Difficulty set to {pool_diff}")
+                        pool_diff.value = msg["params"][0]
+                        target.value = diff_to_target(pool_diff.value)
+                        logg(f"[*] Difficulty set to {pool_diff.value}")
         except socket.timeout:
             logg("[!] Timeout – reconnecting...")
         except Exception as e:
