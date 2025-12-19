@@ -67,7 +67,9 @@ lock = threading.Lock()
 # job data
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = version = nbits = ntime = None
-extranonce1 = extranonce2 = extranonce2_size = None
+extranonce1 = "00000000"  # default
+extranonce2 = "00000000"  # default 4 bytes
+extranonce2_size = 4  # default
 sock = None
 target = None
 host = port = user = password = None
@@ -89,7 +91,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 4  # heavier load for Threadripper
+num_threads = num_cores * 4  # heavy load for Threadripper
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -101,8 +103,6 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # ======================  MERKLE ROOT ======================
 def calculate_merkle_root():
-    if None in (coinb1, extranonce1, extranonce2, coinb2, merkle_branch):
-        return "0" * 64
     coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
     h = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
     for b in merkle_branch:
@@ -142,9 +142,9 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit failed: {e}")
 
-# ======================  MINING LOOP (optimized, LV06 logs, nonce shuffling, heavier load) ======================
+# ======================  MINING LOOP (optimized, LV06 logs, nonce shuffling, heavy load) ======================
 def bitcoin_miner(thread_id):
-    global nbits, version, prevhash, ntime, target
+    global nbits, version, prevhash, ntime, target, extranonce2
 
     last_job_id = None
 
@@ -160,17 +160,20 @@ def bitcoin_miner(thread_id):
 
             logg(f"create_jobs_task: New Work Dequeued {job_id}")
 
-            header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
+            # Reset extranonce2 for new job
+            extranonce2 = "00" * extranonce2_size
+
+            # Shuffle starting nonce
+            nonce = random.randint(0, 0xffffffff)
+
+            header_static = version + prevhash + coinb1 + extranonce1 + extranonce2 + coinb2 + ntime + nbits
             header_bytes = binascii.unhexlify(header_static)
 
             # Network (block) target
             network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-            # Low share target for solo to show live hashrate
-            share_target = diff_to_target(128)
-
-            # Shuffle starting nonce
-            nonce = random.randint(0, 0xffffffff)
+            # Use pool difficulty if set, else low for live stats
+            share_target = target if target else diff_to_target(128)
 
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
@@ -218,6 +221,7 @@ def stratum_worker():
     while not fShutdown:
         try:
             s = socket.socket()
+            s.settimeout(30)
             s.connect((host, port))
             sock = s
 
@@ -249,6 +253,8 @@ def stratum_worker():
                     elif msg.get("method") == "mining.set_difficulty":
                         target = diff_to_target(msg["params"][0])
                         logg(f"[*] Difficulty set to {msg['params'][0]}")
+        except socket.timeout:
+            logg("[!] Timeout – reconnecting...")
         except Exception as e:
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
@@ -313,21 +319,21 @@ def display_worker():
 # ======================  MAIN ======================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Braiins Pool SHA-256 CPU Miner")
-    parser.add_argument("--username", type=str, required=True, help="Braiins Pool username (your account name or address)")
-    parser.add_argument("--worker", type=str, default="cpu002", help="Worker name (e.g., cpu002)")
+    parser.add_argument("--username", type=str, required=True, help="Braiins username or payout address")
+    parser.add_argument("--worker", type=str, default="cpu002", help="Worker name")
     args = parser.parse_args()
 
     host = BRAIINS_HOST
     port = BRAIINS_PORT
     user = f"{args.username}.{args.worker}"
-    password = "x"  # Braiins uses any password, "x" is standard
+    password = "x"
 
-    # Fixed size hashrates list for stability
+    # Fixed size hashrates list
     hashrates = [0] * num_threads
 
     # Start stratum
     threading.Thread(target=stratum_worker, daemon=True).start()
-    time.sleep(3)
+    time.sleep(5)  # give time to connect
 
     # Start mining threads
     for i in range(num_threads):
