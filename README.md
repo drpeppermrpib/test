@@ -147,6 +147,9 @@ def bitcoin_miner_process(process_id):
     hashes_done = 0
     last_report = time.time()
 
+    # Initialize nonce to avoid UnboundLocalError
+    nonce = 0
+
     while not fShutdown.is_set():
         if job_id != last_job_id:
             last_job_id = job_id
@@ -168,10 +171,11 @@ def bitcoin_miner_process(process_id):
             # Network (block) target
             network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-            # Low share target for live stats
-            share_target = diff_to_target(128)
+            # Use pool difficulty for share target (fluctuates)
+            share_target = target if target else diff_to_target(128)
 
-        for _ in range(1000000):  # larger batch for higher hashrate
+        # Larger batch for higher hashrate
+        for _ in range(1000000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
@@ -181,7 +185,7 @@ def bitcoin_miner_process(process_id):
             if h_hex < share_target:
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 128.")
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff}")
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -211,11 +215,12 @@ def bitcoin_miner_process(process_id):
 # ======================  STRATUM (LV06 style logs, reconnection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
-    global version, nbits, ntime, target, extranonce1, extranonce2_size
+    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff
 
     while not fShutdown.is_set():
         try:
             s = socket.socket()
+            s.settimeout(30)
             s.connect((host, port))
             sock = s
 
@@ -245,8 +250,11 @@ def stratum_worker():
                          merkle_branch, version, nbits, ntime, _) = msg["params"]
                         logg(f"create_jobs_task: New Work Dequeued {job_id}")
                     elif msg.get("method") == "mining.set_difficulty":
-                        target = diff_to_target(msg["params"][0])
-                        logg(f"[*] Difficulty set to {msg['params'][0]}")
+                        pool_diff = msg["params"][0]
+                        target = diff_to_target(pool_diff)
+                        logg(f"[*] Difficulty set to {pool_diff}")
+        except socket.timeout:
+            logg("[!] Timeout – reconnecting...")
         except Exception as e:
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
