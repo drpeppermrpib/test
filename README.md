@@ -124,7 +124,7 @@ def calculate_merkle_root():
 def submit_share(nonce):
     global connected
     if not connected or sock is None:
-        return  # skip if not connected
+        return  # skip submission if disconnected
 
     payload = {
         "id": 1,
@@ -155,7 +155,10 @@ def submit_share(nonce):
     except BrokenPipeError:
         global connected
         connected = False
-        logg("[!] Broken pipe – connection lost")
+        current_time = time.time()
+        if current_time - last_error_time > 10:
+            logg("[!] Broken pipe – connection lost")
+            last_error_time = current_time
     except Exception as e:
         current_time = time.time()
         if current_time - last_error_time > 10:
