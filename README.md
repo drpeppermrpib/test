@@ -65,7 +65,7 @@ rejected = manager.Value('i', 0)
 accepted_timestamps = manager.list()
 rejected_timestamps = manager.list()
 
-# job data (shared)
+# job data
 job_id = manager.Value('c', None)
 prevhash = manager.Value('c', None)
 coinb1 = manager.Value('c', None)
@@ -78,15 +78,19 @@ extranonce1 = manager.Value('c', "00000000")
 extranonce2 = manager.Value('c', "00000000")
 extranonce2_size = manager.Value('i', 4)
 target = manager.Value('c', None)
-pool_diff = manager.Value('i', 128)
+pool_diff = manager.Value('i', 128)  # default, updated from set_difficulty
+sock = manager.Value('i', 0)  # dummy for shared, actual sock in stratum
 
 # Global log lines for display
 log_lines = manager.list()
 max_log = 15
 
+# Last error time to rate limit logs
+last_error_time = manager.Value('d', 0)
+
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
 def logg(msg):
-    timestamp = int(time.time() * 100000)  # mimic LV06 timestamp
+    timestamp = int(time.time() * 100000)
     prefixed_msg = f"₿ ({timestamp}) {msg}"
     log_lines.append(prefixed_msg)
 
@@ -114,7 +118,7 @@ def calculate_merkle_root():
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE (LV06 style logs) ======================
+# ======================  SUBMIT SHARE (LV06 style logs, rate limited error) ======================
 def submit_share(nonce):
     payload = {
         "id": 1,
@@ -139,34 +143,52 @@ def submit_share(nonce):
             rejected.value += 1
             rejected_timestamps.append(time.time())
     except BrokenPipeError:
-        logg("[!] Broken pipe – connection lost")
+        current_time = time.time()
+        if current_time - last_error_time.value > 10:  # log only every 10s
+            logg("[!] Broken pipe – connection lost, skipping share")
+            last_error_time.value = current_time
     except Exception as e:
-        logg(f"[!] Submit failed: {e}")
+        current_time = time.time()
+        if current_time - last_error_time.value > 10:
+            logg(f"[!] Submit failed: {e}")
+            last_error_time.value = current_time
 
 # ======================  MINING PROCESS (optimized, LV06 logs, nonce shuffling, max load) ======================
 def bitcoin_miner_process(process_id):
+    global nbits, version, prevhash, ntime, target, extranonce2, pool_diff
+
+    last_job_id = None
+
     hashes_done = 0
     last_report = time.time()
 
     # Initial values
+    header_bytes = b''
     nonce = 0
 
     while not fShutdown.is_set():
-        # Wait for first job
-        if job_id.value is None:
-            time.sleep(0.5)
-            continue
+        if job_id.value != last_job_id:
+            last_job_id = job_id.value
+            if None in (nbits.value, version.value, prevhash.value, ntime.value):
+                time.sleep(0.5)
+                continue
 
-        # Rebuild header on new job
-        if hashes_done == 0 or job_id.value != last_job_id:  # dummy last_job_id
-            header_static = version.value + prevhash.value + calculate_merkle_root() + ntime.value + nbits.value
+            logg(f"create_jobs_task: New Work Dequeued {job_id.value}")
+
+            # Reset extranonce2 for new job
+            extranonce2.value = "00" * extranonce2_size.value
+
+            # Shuffle starting nonce
+            nonce = random.randint(0, 0xffffffff)
+
+            header_static = version.value + prevhash.value + coinb1.value + extranonce1.value + extranonce2.value + coinb2.value + ntime.value + nbits.value
             header_bytes = binascii.unhexlify(header_static)
 
+            # Network (block) target
             network_target = (nbits.value[2:] + '00' * (int(nbits.value[:2],16) - 3)).zfill(64)
 
+            # Use pool difficulty for share target (fluctuates)
             share_target = target.value if target.value else diff_to_target(pool_diff.value)
-
-            nonce = random.randint(0, 0xffffffff)
 
         # Larger batch for higher hashrate
         for _ in range(1000000):
@@ -251,7 +273,7 @@ def stratum_worker():
                         ntime.value = params[7]
                         logg(f"create_jobs_task: New Work Dequeued {job_id.value}")
                     elif msg.get("method") == "mining.set_difficulty":
-                        pool_diff.value = msg["params"][0]
+                        pool_diff.value = int(msg["params"][0])
                         target.value = diff_to_target(pool_diff.value)
                         logg(f"[*] Difficulty set to {pool_diff.value}")
         except socket.timeout:
