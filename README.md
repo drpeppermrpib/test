@@ -78,7 +78,7 @@ extranonce2 = "00000000"
 extranonce2_size = 4
 sock = None
 target = None
-pool_diff = 128
+pool_diff = 128  # default, updated from set_difficulty
 connected = False  # connection status
 
 # Global log lines for display
@@ -102,7 +102,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 4  # heavier load for Threadripper
+num_threads = num_cores * 4  # heavy load for Threadripper
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -165,7 +165,7 @@ def submit_share(nonce):
             logg(f"[!] Submit failed: {e}")
             last_error_time = current_time
 
-# ======================  MINING LOOP (optimized, LV06 logs, nonce shuffling, heavier load) ======================
+# ======================  MINING LOOP (optimized, LV06 logs, nonce shuffling, heavy load) ======================
 def bitcoin_miner(thread_id):
     global nbits, version, prevhash, ntime, target, extranonce2, pool_diff
 
@@ -199,8 +199,8 @@ def bitcoin_miner(thread_id):
             # Network (block) target
             network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-            # Use pool difficulty for share target
-            share_target = target if target else diff_to_target(pool_diff)
+            # Very low local share target to submit frequently (keeps worker online)
+            share_target = diff_to_target(1)  # submit every few seconds on CPU
 
         # Larger batch for higher hashrate
         for _ in range(1000000):
@@ -342,11 +342,15 @@ def display_worker():
             stdscr.addstr(8, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
+            # Connection status
+            status = "Connected" if connected else "Disconnected"
+            stdscr.addstr(10, 0, f"Status       : {status}", curses.color_pair(1 if connected else 2))
+
             # Yellow line
-            stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
+            stdscr.addstr(12, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
             # Scrolling log area (stable)
-            start_y = 12
+            start_y = 13
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
                     break
