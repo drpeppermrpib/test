@@ -14,6 +14,7 @@ import curses
 import argparse
 import signal
 import subprocess  # for accurate temp
+import re  # for parsing ckpool stats (unused but kept)
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -58,7 +59,7 @@ def get_cpu_temp():
 
 # ======================  GLOBALS ======================
 fShutdown = False
-hashrates = [0] * 192  # larger fixed size for stability
+hashrates = [0] * 192  # fixed size for stability
 accepted = rejected = 0
 accepted_timestamps = []
 rejected_timestamps = []
@@ -70,13 +71,14 @@ merkle_branch = version = nbits = ntime = None
 extranonce1 = extranonce2 = extranonce2_size = None
 sock = None
 target = None
+pool_diff = 10000  # default, updated from set_difficulty
 host = port = user = password = None
 
 # Global log lines for display
 log_lines = []
 max_log = 15
 
-# ======================  LOGGER (LV06 style with ₿ timestamp, only append to log_lines) ======================
+# ======================  LOGGER (LV06 style with ₿ timestamp) ======================
 def logg(msg):
     timestamp = int(time.time() * 100000)  # mimic LV06 timestamp
     prefixed_msg = f"₿ ({timestamp}) {msg}"
@@ -85,11 +87,11 @@ def logg(msg):
 logg("Miner starting...")
 
 # ======================  CONFIG ======================
-PROHASHING_HOST = 'us.mining.prohashing.com'
+PROHASHING_HOST = 'us.mining.prohashing.com'  # change to 'eu' or 'asia' if timeout
 PROHASHING_PORT = 3335
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 4  # heavier load for Threadripper (hyper-threading + extra)
+num_threads = num_cores * 4  # heavier load for Threadripper
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -144,7 +146,7 @@ def submit_share(nonce):
 
 # ======================  MINING LOOP (optimized, LV06 logs, nonce shuffling, heavier load) ======================
 def bitcoin_miner(thread_id):
-    global nbits, version, prevhash, ntime, target, extranonce2
+    global nbits, version, prevhash, ntime, target, pool_diff
 
     last_job_id = None
 
@@ -160,20 +162,17 @@ def bitcoin_miner(thread_id):
 
             logg(f"create_jobs_task: New Work Dequeued {job_id}")
 
-            # Reset extranonce2 for new job
-            extranonce2 = "00" * extranonce2_size
-
-            # Shuffle starting nonce
-            nonce = random.randint(0, 0xffffffff)
-
-            header_static = version + prevhash + coinb1 + extranonce1 + extranonce2 + coinb2 + ntime + nbits
+            header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
             header_bytes = binascii.unhexlify(header_static)
 
             # Network (block) target
             network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-            # Low share target for solo to show live hashrate
-            share_target = diff_to_target(128)
+            # Use pool difficulty for share target (fluctuates)
+            share_target = target if target else diff_to_target(128)
+
+            # Shuffle starting nonce
+            nonce = random.randint(0, 0xffffffff)
 
         for _ in range(500000):
             nonce = (nonce - 1) & 0xffffffff
@@ -185,7 +184,7 @@ def bitcoin_miner(thread_id):
             if h_hex < share_target:
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 128.")
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff}")
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -216,16 +215,30 @@ def bitcoin_miner(thread_id):
 # ======================  STRATUM (LV06 style logs, reconnection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
-    global version, nbits, ntime, target, extranonce1, extranonce2_size
+    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff
 
     while not fShutdown:
         try:
             s = socket.socket()
+            s.settimeout(30)  # longer timeout
             s.connect((host, port))
             sock = s
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
 
+            # Handle subscribe response
+            buf = b""
+            while b'\n' not in buf:
+                data = s.recv(4096)
+                buf += data
+            line, buf = buf.split(b'\n', 1)
+            msg = json.loads(line)
+            logg(f"stratum_task: rx: {json.dumps(msg)}")
+            extranonce1 = msg["result"][1]
+            extranonce2_size = msg["result"][2]
+            logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+
+            # Authorize
             auth = {"id":2,"method":"mining.authorize","params":[user,password]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
@@ -241,17 +254,17 @@ def stratum_worker():
                     if not line.strip(): continue
                     msg = json.loads(line)
                     logg(f"stratum_task: rx: {json.dumps(msg)}")
-                    if "result" in msg and msg["id"] == 1:
-                        extranonce1 = msg["result"][1]
-                        extranonce2_size = msg["result"][2]
-                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
-                    elif msg.get("method") == "mining.notify":
+                    if msg.get("method") == "mining.notify":
                         (job_id, prevhash, coinb1, coinb2,
                          merkle_branch, version, nbits, ntime, _) = msg["params"]
                         logg(f"create_jobs_task: New Work Dequeued {job_id}")
                     elif msg.get("method") == "mining.set_difficulty":
-                        target = diff_to_target(msg["params"][0])
-                        logg(f"[*] Difficulty set to {msg['params'][0]}")
+                        pool_diff = int(msg["params"][0])
+                        target = diff_to_target(pool_diff)
+                        logg(f"[*] Difficulty set to {pool_diff}")
+        except socket.timeout:
+            logg("[!] Connection timed out – reconnecting in 10s...")
+            time.sleep(10)
         except Exception as e:
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
@@ -321,12 +334,18 @@ if __name__ == "__main__":
     parser.add_argument("--group", type=str, default="kx2000", help="Group name (e.g., kx2000)")
     parser.add_argument("--wattage", type=int, default=1000, help="Wattage for tracking (e.g., 1000)")
     parser.add_argument("--price", type=float, default=1.45, help="Electricity price $/kWh (e.g., 1.45)")
+    parser.add_argument("--server", type=str, default="us", help="Server region (us, eu, asia)")
     args = parser.parse_args()
 
     # Construct ProHashing password string
     password = f"a=sha-256,c=bitcoin,w={args.wattage},p={args.price},n={args.worker},o={args.group}"
 
-    host = PROHASHING_HOST
+    server_map = {
+        "us": "us.mining.prohashing.com",
+        "eu": "eu.mining.prohashing.com",
+        "asia": "asia.mining.prohashing.com"
+    }
+    host = server_map.get(args.server.lower(), PROHASHING_HOST)
     port = PROHASHING_PORT
     user = args.username
 
