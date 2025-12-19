@@ -14,7 +14,6 @@ import curses
 import argparse
 import signal
 import subprocess  # for accurate temp
-import re  # for parsing ckpool stats (unused but kept)
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -149,33 +148,37 @@ def bitcoin_miner_process(process_id):
     hashes_done = 0
     last_report = time.time()
 
-    # Initialize variables to avoid UnboundLocalError
-    header_bytes = b''
-    nonce = 0
+    # Initial wait for first job
+    while None in (nbits, version, prevhash, ntime):
+        time.sleep(0.5)
+
+    # Initial initialization
+    header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
+    header_bytes = binascii.unhexlify(header_static)
+
+    network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+
+    share_target = target if target else diff_to_target(pool_diff)
+
+    nonce = random.randint(0, 0xffffffff)
+
+    last_job_id = job_id
 
     while not fShutdown.is_set():
+        # Check for new job
         if job_id != last_job_id:
             last_job_id = job_id
-            if None in (nbits, version, prevhash, ntime):
-                time.sleep(0.5)
-                continue
-
             logg(f"create_jobs_task: New Work Dequeued {job_id}")
 
-            # Reset extranonce2 for new job
-            extranonce2 = "00" * extranonce2_size
-
-            # Shuffle starting nonce
-            nonce = random.randint(0, 0xffffffff)
-
-            header_static = version + prevhash + coinb1 + extranonce1 + extranonce2 + coinb2 + ntime + nbits
+            # Re-initialize for new job
+            header_static = version + prevhash + calculate_merkle_root() + ntime + nbits
             header_bytes = binascii.unhexlify(header_static)
 
-            # Network (block) target
             network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-            # Use pool difficulty for share target
             share_target = target if target else diff_to_target(pool_diff)
+
+            nonce = random.randint(0, 0xffffffff)
 
         # Larger batch for higher hashrate
         for _ in range(1000000):
