@@ -14,6 +14,7 @@ import curses
 import argparse
 import signal
 import subprocess  # for accurate temp
+import re  # for parsing ckpool stats (unused but kept)
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -73,6 +74,7 @@ extranonce2 = "00000000"
 extranonce2_size = 4
 sock = None
 target = None
+pool_diff = 128  # default
 host = port = user = password = None
 
 # Global log lines for display
@@ -140,14 +142,15 @@ def submit_share(nonce):
 
 # ======================  MINING PROCESS (optimized, LV06 logs, nonce shuffling, max load) ======================
 def bitcoin_miner_process(process_id):
-    global nbits, version, prevhash, ntime, target, extranonce2
+    global nbits, version, prevhash, ntime, target, extranonce2, pool_diff
 
     last_job_id = None
 
     hashes_done = 0
     last_report = time.time()
 
-    # Initialize nonce to avoid UnboundLocalError
+    # Initialize variables to avoid UnboundLocalError
+    header_bytes = b''
     nonce = 0
 
     while not fShutdown.is_set():
@@ -171,8 +174,8 @@ def bitcoin_miner_process(process_id):
             # Network (block) target
             network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-            # Use pool difficulty for share target (fluctuates)
-            share_target = target if target else diff_to_target(128)
+            # Use pool difficulty for share target
+            share_target = target if target else diff_to_target(pool_diff)
 
         # Larger batch for higher hashrate
         for _ in range(1000000):
