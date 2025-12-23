@@ -76,14 +76,13 @@ extranonce1 = manager.Value('c', "00000000")
 extranonce2 = manager.Value('c', "00000000")
 extranonce2_size = manager.Value('i', 4)
 target = manager.Value('c', None)
-pool_diff = manager.Value('i', 1)  # low for maximum submits
+pool_diff = manager.Value('i', 512)  # higher local target to reduce submits (fix broken pipe)
 
 # Global log lines for display
 log_lines = manager.list()
 max_log = 40
 
-# Connection status & error time (shared)
-connected = manager.Value('b', False)
+# Last error time (shared)
 last_error_time = manager.Value('d', 0)
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
@@ -116,10 +115,11 @@ def calculate_merkle_root():
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE (skip if disconnected, rate limited errors) ======================
+# ======================  SUBMIT SHARE (LV06 style logs, rate limited errors) ======================
 def submit_share(nonce):
-    if not connected.value:
-        return  # skip completely if disconnected
+    current_time = time.time()
+    if current_time - last_error_time.value < 0.1:
+        return  # skip if too fast
 
     payload = {
         "id": 1,
@@ -144,7 +144,6 @@ def submit_share(nonce):
             rejected.value += 1
             rejected_timestamps.append(time.time())
     except BrokenPipeError:
-        connected.value = False
         current_time = time.time()
         if current_time - last_error_time.value > 10:
             logg("[!] Broken pipe – connection lost")
@@ -187,8 +186,8 @@ def bitcoin_miner_process(process_id):
             # Network target
             network_target = (nbits.value[2:] + '00' * (int(nbits.value[:2],16) - 3)).zfill(64)
 
-            # Very low local target for maximum submits
-            share_target = diff_to_target(1)
+            # Higher local target to reduce submits (fix broken pipe)
+            share_target = diff_to_target(512)
 
         # Very large batch for max hashrate
         for _ in range(2000000):
@@ -201,7 +200,7 @@ def bitcoin_miner_process(process_id):
             if h_hex < share_target:
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 1.")
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 512.")
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -231,7 +230,7 @@ def bitcoin_miner_process(process_id):
 # ======================  STRATUM (LV06 style logs, reconnection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
-    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
+    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff
 
     while not fShutdown.is_set():
         try:
@@ -239,8 +238,6 @@ def stratum_worker():
             s.settimeout(30)
             s.connect((host, port))
             sock = s
-            connected.value = True
-            logg(f"Connected to {host}:{port}")
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":[]}\n')
 
@@ -251,7 +248,6 @@ def stratum_worker():
             while not fShutdown.is_set():
                 data = s.recv(4096)
                 if not data:
-                    connected.value = False
                     logg("[!] Connection lost – reconnecting...")
                     break
                 buf += data
@@ -280,10 +276,8 @@ def stratum_worker():
                         target.value = diff_to_target(pool_diff.value)
                         logg(f"[*] Difficulty set to {pool_diff.value}")
         except socket.timeout:
-            connected.value = False
             logg("[!] Timeout – reconnecting...")
         except Exception as e:
-            connected.value = False
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
 
@@ -329,15 +323,11 @@ def display_worker():
             stdscr.addstr(8, 0, f"Shares       : {accepted.value} accepted / {rejected.value} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
-            # Connection status
-            status = "Connected" if connected.value else "Disconnected"
-            stdscr.addstr(10, 0, f"Status       : {status}", curses.color_pair(1 if connected.value else 2))
-
             # Yellow line
-            stdscr.addstr(12, 0, "─" * (screen_width - 1), curses.color_pair(3))
+            stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
             # Scrolling log area (stable)
-            start_y = 13
+            start_y = 12
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
                     break
