@@ -82,10 +82,8 @@ pool_diff = manager.Value('i', 1)  # low for maximum submits
 log_lines = manager.list()
 max_log = 40
 
-# Connection status (shared)
+# Connection status & error time (shared)
 connected = manager.Value('b', False)
-
-# Last error time
 last_error_time = manager.Value('d', 0)
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
@@ -118,7 +116,7 @@ def calculate_merkle_root():
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE (LV06 style logs, skip if disconnected) ======================
+# ======================  SUBMIT SHARE (skip if disconnected, rate limited errors) ======================
 def submit_share(nonce):
     if not connected.value:
         return  # skip completely if disconnected
