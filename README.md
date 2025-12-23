@@ -82,6 +82,9 @@ pool_diff = manager.Value('i', 128)
 log_lines = manager.list()
 max_log = 40
 
+# Last error time
+last_error_time = manager.Value('d', 0)
+
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
 def logg(msg):
     timestamp = int(time.time() * 100000)
@@ -95,7 +98,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_processes = num_cores * 2  # heavy load for high hashrate
+num_processes = num_cores * 2  # heavy load for high hashrate / ~45 load average
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -112,7 +115,7 @@ def calculate_merkle_root():
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE (LV06 style logs) ======================
+# ======================  SUBMIT SHARE (LV06 style logs, rate limited errors) ======================
 def submit_share(nonce):
     payload = {
         "id": 1,
@@ -137,9 +140,15 @@ def submit_share(nonce):
             rejected.value += 1
             rejected_timestamps.append(time.time())
     except BrokenPipeError:
-        logg("[!] Broken pipe – connection lost")
+        current_time = time.time()
+        if current_time - last_error_time.value > 10:
+            logg("[!] Broken pipe – connection lost")
+            last_error_time.value = current_time
     except Exception as e:
-        logg(f"[!] Submit failed: {e}")
+        current_time = time.time()
+        if current_time - last_error_time.value > 10:
+            logg(f"[!] Submit failed: {e}")
+            last_error_time.value = current_time
 
 # ======================  MINING PROCESS (optimized for high hashrate) ======================
 def bitcoin_miner_process(process_id):
