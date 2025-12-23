@@ -23,6 +23,7 @@ def diff_to_target(diff):
 
 # ======================  CPU TEMPERATURE (accurate for HiveOS/AMD) ======================
 def get_cpu_temp():
+    # HiveOS/AMD: use 'sensors' for Tctl/Tdie
     try:
         result = subprocess.check_output(["sensors"], text=True)
         temps = []
@@ -38,6 +39,7 @@ def get_cpu_temp():
     except:
         pass
 
+    # Fallback thermal zones
     temps = []
     for zone in range(20):
         path = f"/sys/class/thermal/thermal_zone{zone}/temp"
@@ -76,13 +78,13 @@ extranonce1 = manager.Value('c', "00000000")
 extranonce2 = manager.Value('c', "00000000")
 extranonce2_size = manager.Value('i', 4)
 target = manager.Value('c', None)
-pool_diff = manager.Value('i', 128)
+pool_diff = manager.Value('i', 1)  # set to 1 for maximum submits (your change)
 
 # Global log lines for display
 log_lines = manager.list()
 max_log = 40
 
-# Last error time (shared)
+# Last error time
 last_error_time = manager.Value('d', 0)
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
