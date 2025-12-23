@@ -118,8 +118,8 @@ def calculate_merkle_root():
 # ======================  SUBMIT SHARE (LV06 style logs, rate limited errors) ======================
 def submit_share(nonce):
     current_time = time.time()
-    if current_time - last_error_time.value < 0.1:
-        return  # skip if too fast
+    if current_time - last_error_time.value < 0.5:  # increased rate limit to avoid overload
+        return
 
     payload = {
         "id": 1,
@@ -186,7 +186,7 @@ def bitcoin_miner_process(process_id):
             # Network target
             network_target = (nbits.value[2:] + '00' * (int(nbits.value[:2],16) - 3)).zfill(64)
 
-            # Higher local target to reduce submits (fix broken pipe)
+            # Higher local target to reduce submits
             share_target = diff_to_target(512)
 
         # Very large batch for max hashrate
