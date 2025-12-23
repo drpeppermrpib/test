@@ -82,7 +82,7 @@ pool_diff = manager.Value('i', 128)
 log_lines = manager.list()
 max_log = 40
 
-# Last error time
+# Last error time (shared)
 last_error_time = manager.Value('d', 0)
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
@@ -142,7 +142,7 @@ def submit_share(nonce):
     except BrokenPipeError:
         current_time = time.time()
         if current_time - last_error_time.value > 10:
-            logg("[!] Broken pipe – connection lost")
+            logg("[!] Broken pipe – connection lost (skipping share)")
             last_error_time.value = current_time
     except Exception as e:
         current_time = time.time()
