@@ -76,7 +76,7 @@ extranonce1 = manager.Value('c', "00000000")
 extranonce2 = manager.Value('c', "00000000")
 extranonce2_size = manager.Value('i', 4)
 target = manager.Value('c', None)
-pool_diff = manager.Value('i', 128)
+pool_diff = manager.Value('i', 1)  # set to 1 for maximum submits
 
 # Global log lines for display
 log_lines = manager.list()
