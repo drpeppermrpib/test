@@ -76,13 +76,13 @@ extranonce1 = manager.Value('c', "00000000")
 extranonce2 = manager.Value('c', "00000000")
 extranonce2_size = manager.Value('i', 4)
 target = manager.Value('c', None)
-pool_diff = manager.Value('i', 512)  # higher local target to reduce submits (fix broken pipe)
+pool_diff = manager.Value('i', 512)  # higher to reduce submits and avoid broken pipe
 
 # Global log lines for display
 log_lines = manager.list()
 max_log = 40
 
-# Last error time (shared)
+# Last error time
 last_error_time = manager.Value('d', 0)
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
