@@ -76,11 +76,14 @@ extranonce1 = manager.Value('c', "00000000")
 extranonce2 = manager.Value('c', "00000000")
 extranonce2_size = manager.Value('i', 4)
 target = manager.Value('c', None)
-pool_diff = manager.Value('i', 1)  # set to 1 for maximum submits
+pool_diff = manager.Value('i', 128)
 
 # Global log lines for display
 log_lines = manager.list()
 max_log = 40
+
+# Last error time (shared)
+last_error_time = manager.Value('d', 0)
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
 def logg(msg):
@@ -112,8 +115,12 @@ def calculate_merkle_root():
         h = hashlib.sha256(hashlib.sha256(h + binascii.unhexlify(b)).digest()).digest()
     return binascii.hexlify(h).decode()[::-1]
 
-# ======================  SUBMIT SHARE (LV06 style logs) ======================
+# ======================  SUBMIT SHARE (LV06 style logs, rate limited errors) ======================
 def submit_share(nonce):
+    current_time = time.time()
+    if current_time - last_error_time.value < 0.1:  # rate limit submits to avoid overload
+        return  # skip if too fast
+
     payload = {
         "id": 1,
         "method": "mining.submit",
@@ -137,9 +144,15 @@ def submit_share(nonce):
             rejected.value += 1
             rejected_timestamps.append(time.time())
     except BrokenPipeError:
-        logg("[!] Broken pipe – connection lost")
+        current_time = time.time()
+        if current_time - last_error_time.value > 10:
+            logg("[!] Broken pipe – connection lost")
+            last_error_time.value = current_time
     except Exception as e:
-        logg(f"[!] Submit failed: {e}")
+        current_time = time.time()
+        if current_time - last_error_time.value > 10:
+            logg(f"[!] Submit failed: {e}")
+            last_error_time.value = current_time
 
 # ======================  MINING PROCESS (optimized for high hashrate) ======================
 def bitcoin_miner_process(process_id):
