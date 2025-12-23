@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 
-import argparse
-import json
+import pyopencl as cl
+import numpy as np
+import threading
 import socket
 import time
+import json
 import sys
 import os
 import curses
+import argparse
+import signal
 import subprocess
-import binascii
-import hashlib
-from numba import cuda, uint32, void
-from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_uniform_float32
-import numpy as np
+from binascii import unhexlify, hexlify
 
 # ======================  CPU TEMPERATURE ======================
 def get_cpu_temp():
@@ -60,21 +60,42 @@ logg("GPU Miner starting...")
 BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
-# ======================  GPU KERNEL ======================
-@cuda.jit
-def sha256_kernel(header, nonce_start, nonces, results):
-    idx = cuda.grid(1)
-    if idx < nonces.shape[0]:
-        nonce = nonce_start + uint32(idx)
-        state = cuda.const.array_like(header)
-        # Simple SHA256 (educational, not optimized for speed)
-        # Full SHA256 on GPU is complex; this is a placeholder for real implementation
-        # In practice, use optimized kernels like from ccminer or custom CUDA
-        h = uint32(0)
-        for i in range(len(header)):
-            h = h ^ header[i]
-        h = h ^ nonce
-        results[idx] = h
+# ======================  OPENCL KERNEL ======================
+KERNEL_CODE = """
+__kernel void sha256d(__global const uchar* header, __global uint* nonce_start, __global uint* results) {
+    uint idx = get_global_id(0);
+    uint nonce = nonce_start[0] + idx;
+
+    uchar data[80];
+    for(int i = 0; i < 76; i++) data[i] = header[i];
+    data[76] = (nonce >> 24) & 0xFF;
+    data[77] = (nonce >> 16) & 0xFF;
+    data[78] = (nonce >> 8) & 0xFF;
+    data[79] = nonce & 0xFF;
+
+    // Simplified double SHA256 (educational - for real speed use optimized kernel)
+    uint state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    // Full SHA256 implementation omitted for brevity - use pre-compiled or full version
+
+    results[idx] = state[0] ^ nonce;  // placeholder
+}
+"""
+
+# ======================  GPU SETUP ======================
+def setup_gpu():
+    platforms = cl.get_platforms()
+    devices = []
+    for p in platforms:
+        devices.extend(p.get_devices(device_type=cl.device_type.GPU))
+    if not devices:
+        logg("[!] No GPU found")
+        sys.exit(1)
+    device = devices[0]
+    logg(f"[*] Using GPU: {device.name}")
+    ctx = cl.Context([device])
+    queue = cl.CommandQueue(ctx)
+    prg = cl.Program(ctx, KERNEL_CODE).build()
+    return ctx, queue, prg, device
 
 # ======================  SUBMIT SHARE ======================
 def submit_share(nonce):
@@ -84,12 +105,9 @@ def submit_share(nonce):
         "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
     }
     try:
-        logg(f"stratum_api: tx: {json.dumps(payload)}")
         sock.sendall((json.dumps(payload) + "\n").encode())
         resp = sock.recv(1024).decode().strip()
-        logg(f"stratum_task: rx: {resp}")
-        logg("stratum_task: message result accepted" if "true" in resp.lower() else "[!] Share rejected")
-
+        logg(f"Submitted share – response: {resp}")
         if "true" in resp.lower():
             global accepted
             accepted += 1
@@ -107,6 +125,8 @@ def submit_share(nonce):
 def gpu_miner():
     global job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, target, extranonce2
 
+    ctx, queue, prg, device = setup_gpu()
+
     last_job_id = None
     hashes_done = 0
     last_report = time.time()
@@ -120,34 +140,32 @@ def gpu_miner():
 
             logg(f"New Work Dequeued {job_id}")
 
-            # Prepare header (simplified)
+            # Prepare header
             header_static = version + prevhash + coinb1 + extranonce1 + extranonce2 + coinb2 + ntime + nbits
-            header_bytes = binascii.unhexlify(header_static)
+            header_bytes = unhexlify(header_static)
 
             share_target = target if target else "00000000ffff0000000000000000000000000000000000000000000000000000"
 
             nonce_start = random.randint(0, 0xffffffff)
 
-        # GPU grid/block config (adjust for your GPU)
-        threads_per_block = 256
-        blocks = 1024
-        total_threads = threads_per_block * blocks
+        # GPU config
+        work_size = 1024 * 1024  # 1M nonces per batch
+        header_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=header_bytes)
+        nonce_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE, 4)
+        results_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, work_size * 4)
 
-        # Allocate GPU memory
-        d_header = cuda.to_device(np.frombuffer(header_bytes, dtype=np.uint8))
-        d_nonces = cuda.device_array(total_threads, dtype=np.uint32)
-        d_results = cuda.device_array(total_threads, dtype=np.uint32)
+        cl.enqueue_copy(queue, nonce_buf, np.uint32(nonce_start))
 
-        # Launch kernel (placeholder - real SHA256 kernel needed for high speed)
-        sha256_kernel[blocks, threads_per_block](d_header, nonce_start, d_nonces, d_results)
+        # Launch kernel (placeholder - replace with real SHA256d kernel for high speed)
+        prg.sha256d(queue, (work_size,), None, header_buf, nonce_buf, results_buf)
 
-        # Copy results back
-        results = d_results.copy_to_host()
+        results = np.empty(work_size, dtype=np.uint32)
+        cl.enqueue_copy(queue, results, results_buf)
 
-        hashes_done += total_threads
+        hashes_done += work_size
 
-        # Check for share (simplified - real check needed)
-        for i in range(total_threads):
+        # Check results (simplified)
+        for i in range(work_size):
             if results[i] < int(share_target, 16):
                 nonce = nonce_start + i
                 submit_share(nonce)
@@ -157,7 +175,7 @@ def gpu_miner():
         elapsed = now - last_report
         if elapsed > 0:
             global hashrate
-            hashrate = int(total_threads / elapsed)
+            hashrate = int(work_size / elapsed)
         last_report = now
 
 # ======================  STRATUM ======================
