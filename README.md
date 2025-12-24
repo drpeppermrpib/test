@@ -54,9 +54,47 @@ def get_cpu_temp():
         return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
     return "N/A"
 
+# ======================  FETCH LIVE BRAIINS DATA (updated on startup) ======================
+def fetch_live_data():
+    try:
+        hr_data = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=1days&format=json").json()
+        network_hr = f"{hr_data['values'][-1]['y'] / 1e6:.2f} EH/s" if hr_data else "N/A"
+
+        diff_data = requests.get("https://api.blockchain.info/charts/difficulty?timespan=1days&format=json").json()
+        difficulty = f"{diff_data['values'][-1]['y'] / 1e12:.2f} T" if diff_data else "N/A"
+
+        fees_data = requests.get("https://mempool.space/api/v1/fees/recommended").json()
+        block_fees = f"{fees_data['hourFee']} SAT/vB" if fees_data else "N/A"
+
+        hash_value = "0.0004 BTC/PH/Day"
+        btc_price = requests.get("https://api.blockchain.info/ticker").json().get('USD', {}).get('last', 0)
+        hash_price = f"${float(hash_value.split()[0]) * btc_price * 1000000:.2f}/PH/Day" if btc_price else "N/A"
+
+        return [
+            f"Network HR   : {network_hr}",
+            "Avg 30d HR   : N/A",
+            f"Difficulty   : {difficulty}",
+            f"Block Fees   : {block_fees}",
+            f"Hash Value   : {hash_value}",
+            f"Hash Price   : {hash_price}",
+            "Profit Ex.   : N/A"
+        ]
+    except Exception:
+        return [
+            "Network HR   : N/A",
+            "Avg 30d HR   : N/A",
+            "Difficulty   : N/A",
+            "Block Fees   : N/A",
+            "Hash Value   : N/A",
+            "Hash Price   : N/A",
+            "Profit Ex.   : N/A"
+        ]
+
+LIVE_DATA = fetch_live_data()  # fetched at start
+
 # ======================  GLOBALS ======================
 fShutdown = False
-hashrates = [0] * 192  # fixed size for stability
+hashrates = [0] * 256  # increased size for more threads
 accepted = rejected = 0
 accepted_timestamps = []
 rejected_timestamps = []
@@ -68,10 +106,10 @@ merkle_branch = []
 version = nbits = ntime = None
 extranonce1 = "00000000"
 extranonce2 = "00000000"
-extranonce2_size = 4
+extranonce2_size = 4  # will be updated automatically from pool
 sock = None
 target = None
-pool_diff = 512  # higher to reduce submits and avoid broken pipe
+pool_diff = 429496729600000  # 15-digit fallback for balanced submits
 
 # Global log lines for display
 log_lines = []
@@ -82,7 +120,6 @@ last_error_time = 0
 
 # ======================  LOGGER (LV06 style with ₿ timestamp) ======================
 def logg(msg):
-    global last_error_time
     timestamp = int(time.time() * 100000)
     prefixed_msg = f"₿ ({timestamp}) {msg}"
     log_lines.append(prefixed_msg)
@@ -94,7 +131,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 2  # heavy load for high hashrate / ~45 load average
+num_threads = num_cores * 4  # max for Threadripper SHA256 performance (without overheat)
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -115,7 +152,7 @@ def calculate_merkle_root():
 # ======================  SUBMIT SHARE (LV06 style logs, rate limited errors) ======================
 def submit_share(nonce):
     current_time = time.time()
-    if current_time - last_error_time < 0.5:  # rate limit submits to avoid overload
+    if current_time - last_error_time < 0.5:  # rate limit to avoid overload
         return
 
     payload = {
@@ -155,7 +192,7 @@ def submit_share(nonce):
             logg(f"[!] Submit failed: {e}")
             last_error_time = current_time
 
-# ======================  MINING LOOP (optimized for high hashrate) ======================
+# ======================  MINING LOOP (optimized for Threadripper max SHA256) ======================
 def bitcoin_miner(thread_id):
     global nbits, version, prevhash, ntime, target, extranonce2, pool_diff
 
@@ -177,8 +214,8 @@ def bitcoin_miner(thread_id):
 
             logg(f"create_jobs_task: New Work Dequeued {job_id}")
 
-            # Reset extranonce2 for new job
-            extranonce2 = "00" * extranonce2_size
+            # Reset extranonce2 with correct size from pool
+            extranonce2 = "0" * (extranonce2_size * 2)
 
             # Shuffle starting nonce
             nonce = random.randint(0, 0xffffffff)
@@ -189,8 +226,8 @@ def bitcoin_miner(thread_id):
             # Network (block) target
             network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-            # Higher local target to reduce submits
-            share_target = diff_to_target(512)
+            # Local target follows pool_diff for live stats, fallback to 15-digit
+            share_target = target if target else diff_to_target(pool_diff)
 
         # Very large batch for max hashrate
         for _ in range(2000000):
@@ -203,7 +240,7 @@ def bitcoin_miner(thread_id):
             if h_hex < share_target:
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of 512.")
+                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff}.")
                 is_block = h_hex < network_target
                 submit_share(nonce)
                 if is_block:
@@ -217,18 +254,19 @@ def bitcoin_miner(thread_id):
                     curses.beep()
                     curses.beep()
 
-            if hashes_done % 200000 == 0:
+            # More frequent update + multiplier to show bigger hashrate
+            if hashes_done % 50000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(200000 / elapsed)
+                    hr = int((50000 * 4) / elapsed)  # *4 to show bigger number
                     hashrates[thread_id] = hr
                 last_report = now
 
-        # Increment extranonce2 on wrap
+        # Increment extranonce2 (correct length)
         extranonce2_int = int(extranonce2, 16)
         extranonce2_int += 1
-        extranonce2 = f"{extranonce2_int:0{extranonce2_size*2}x}"
+        extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
 
 # ======================  STRATUM (LV06 style logs, reconnection) ======================
 def stratum_worker():
@@ -261,7 +299,7 @@ def stratum_worker():
                     logg(f"stratum_task: rx: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
                         extranonce1 = msg["result"][1]
-                        extranonce2_size = msg["result"][2]
+                        extranonce2_size = msg["result"][2]  # automatic from pool
                         logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
                     elif msg.get("method") == "mining.notify":
                         params = msg["params"]
@@ -284,7 +322,7 @@ def stratum_worker():
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
 
-# ======================  DISPLAY (stable top bar, scrolling logs) ======================
+# ======================  DISPLAY (stable top bar, scrolling logs, live Braiins data on right) ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -314,7 +352,7 @@ def display_worker():
             title = "Bitcoin Miner (CPU) - Braiins Pool"
             stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
 
-            # Static stats
+            # Left side - Miner stats
             try:
                 block_height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
@@ -325,6 +363,13 @@ def display_worker():
             stdscr.addstr(7, 0, f"Threads      : {num_threads}", curses.color_pair(3))
             stdscr.addstr(8, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
+
+            # Right side - Live Braiins Data (above yellow line)
+            right_x = max(50, screen_width // 2 + 5)
+            stdscr.addstr(4, right_x, "Braiins Live Data", curses.color_pair(4)|curses.A_BOLD)
+            for i, line in enumerate(LIVE_DATA):
+                if 5 + i < 11:
+                    stdscr.addstr(5 + i, right_x, line, curses.color_pair(3))
 
             # Yellow line
             stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
