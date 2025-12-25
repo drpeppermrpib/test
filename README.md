@@ -90,26 +90,26 @@ def fetch_live_data():
             "Profit Ex.   : N/A"
         ]
 
-LIVE_DATA = fetch_live_data()  # fetched at start
+LIVE_DATA = fetch_live_data()
 
 # ======================  GLOBALS ======================
 fShutdown = False
-hashrates = [0] * 256  # increased size for more threads
+hashrates = [0] * 256
 accepted = rejected = 0
 accepted_timestamps = []
 rejected_timestamps = []
 lock = threading.Lock()
 
-# job data
+# job data - plain globals (thread-safe with lock where needed)
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = []
 version = nbits = ntime = None
 extranonce1 = "00000000"
 extranonce2 = "00000000"
-extranonce2_size = 4  # will be updated automatically from pool
+extranonce2_size = 4  # updated from pool
 sock = None
 target = None
-pool_diff = 429496729600000  # 15-digit fallback for balanced submits
+pool_diff = 429496729600000  # 15-digit fallback
 
 # Global log lines for display
 log_lines = []
@@ -131,7 +131,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 4  # max for Threadripper SHA256 performance (without overheat)
+num_threads = num_cores * 4  # Threadripper optimized
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -254,7 +254,7 @@ def bitcoin_miner(thread_id):
                     curses.beep()
                     curses.beep()
 
-            # More frequent update + multiplier to show bigger hashrate
+            # Bigger hashrate display
             if hashes_done % 50000 == 0:
                 now = time.time()
                 elapsed = now - last_report
@@ -263,7 +263,7 @@ def bitcoin_miner(thread_id):
                     hashrates[thread_id] = hr
                 last_report = now
 
-        # Increment extranonce2 (correct length)
+        # Increment extranonce2 on wrap (correct length)
         extranonce2_int = int(extranonce2, 16)
         extranonce2_int += 1
         extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
@@ -299,7 +299,7 @@ def stratum_worker():
                     logg(f"stratum_task: rx: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
                         extranonce1 = msg["result"][1]
-                        extranonce2_size = msg["result"][2]  # automatic from pool
+                        extranonce2_size = msg["result"][2]
                         logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
                     elif msg.get("method") == "mining.notify":
                         params = msg["params"]
