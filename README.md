@@ -15,14 +15,6 @@ import argparse
 import signal
 import subprocess  # for accurate temp
 
-# ====================== FPPS Specification (from Braiins Academy) ======================
-# In Braiins Pool, FPPS (Full Pay Per Share) guarantees rewards for every share.
-# Total Reward (TR) = CRC (Coinbase Reward Cut) + TFC (Transaction Fees Cut) - Pool Fee (2.5%).
-# CRC = C * (S / D) where C = block reward, S = shares, D = difficulty.
-# TFC = AF * (S / D) where AF = average mining fee.
-# Rewards normalized to 144 blocks/day for stability.
-# Payouts daily at 9:00 UTC, on-chain or Lightning, customizable threshold.
-
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
     diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
@@ -98,11 +90,11 @@ def fetch_live_data():
             "Profit Ex.   : N/A"
         ]
 
-LIVE_DATA = fetch_live_data()  # fetched at start
+LIVE_DATA = fetch_live_data()
 
 # ======================  GLOBALS ======================
 fShutdown = False
-hashrates = [0] * 256  # increased size for more threads
+hashrates = [0] * 256
 accepted = rejected = 0
 accepted_timestamps = []
 rejected_timestamps = []
@@ -114,11 +106,10 @@ merkle_branch = []
 version = nbits = ntime = None
 extranonce1 = "00000000"
 extranonce2 = "00000000"
-extranonce2_size = 4  # will be updated automatically from pool
+extranonce2_size = 4  # automatic from pool
 sock = None
 target = None
 pool_diff = 429496729600000  # 15-digit fallback
-version_mask = 0  # for version-rolling, from mining.configure
 
 # Global log lines for display
 log_lines = []
@@ -136,8 +127,17 @@ def logg(msg):
 logg("Miner starting...")
 
 # ======================  CONFIG ======================
-BRAIINS_HOST = 'stratum.braiins.com'
-BRAIINS_PORT = 3333
+# Regional servers for better connection stability
+POOL_URLS = [
+    "stratum.braiins.com:3333",      # Global/Main
+    "eu.stratum.braiins.com:3333",   # Europe
+    "us.stratum.braiins.com:3333",   # USA
+    "asia.stratum.braiins.com:3333", # Asia
+    "jp.stratum.braiins.com:3333"    # Japan
+]
+
+current_pool_index = 0
+host, port = POOL_URLS[current_pool_index].split(":")
 
 num_cores = os.cpu_count()
 num_threads = num_cores * 4  # Threadripper optimized
@@ -159,15 +159,15 @@ def calculate_merkle_root():
     return binascii.hexlify(h).decode()[::-1]
 
 # ======================  SUBMIT SHARE (LV06 style logs, rate limited errors) ======================
-def submit_share(nonce, version_rolled):
+def submit_share(nonce):
     current_time = time.time()
-    if current_time - last_error_time < 0.5:  # rate limit to avoid overload
+    if current_time - last_error_time < 0.5:
         return
 
     payload = {
         "id": 1,
         "method": "mining.submit",
-        "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}", f"{version_rolled:08x}"]  # 6 params for version-rolling
+        "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
     }
     try:
         logg(f"stratum_api: tx: {json.dumps(payload)}")
@@ -203,7 +203,7 @@ def submit_share(nonce, version_rolled):
 
 # ======================  MINING LOOP (optimized for Threadripper max SHA256) ======================
 def bitcoin_miner(thread_id):
-    global nbits, version, ntime, target, extranonce2, pool_diff, version_mask
+    global nbits, version, prevhash, ntime, target, extranonce2, pool_diff
 
     last_job_id = None
 
@@ -229,19 +229,18 @@ def bitcoin_miner(thread_id):
             # Shuffle starting nonce
             nonce = random.randint(0, 0xffffffff)
 
+            header_static = version + prevhash + coinb1 + extranonce1 + extranonce2 + coinb2 + ntime + nbits
+            header_bytes = binascii.unhexlify(header_static)
+
+            # Network (block) target
+            network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
+
             # Local target follows pool_diff for live stats, fallback to 15-digit
             share_target = target if target else diff_to_target(pool_diff)
 
         # Very large batch for max hashrate
         for _ in range(2000000):
             nonce = (nonce - 1) & 0xffffffff
-
-            # Roll version if mask set (for ASICBoost/LV06 style)
-            version_rolled = int(version, 16) ^ (random.randint(0, 0xffffffff) & version_mask)
-
-            header_static = f"{version_rolled:08x}" + prevhash + calculate_merkle_root() + ntime + nbits
-            header_bytes = binascii.unhexlify(header_static)
-
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
 
@@ -252,7 +251,7 @@ def bitcoin_miner(thread_id):
                 share_diff = diff1 / int(h_hex, 16)
                 logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff}.")
                 is_block = h_hex < network_target
-                submit_share(nonce, version_rolled)
+                submit_share(nonce)
                 if is_block:
                     log_lines.append("*** BLOCK SOLVED!!! ***")
                     log_lines.append(f"Nonce: {nonce:08x}")
@@ -278,52 +277,31 @@ def bitcoin_miner(thread_id):
         extranonce2_int += 1
         extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
 
-# ======================  STRATUM (LV06 style logs, reconnection) ======================
+# ======================  STRATUM (LV06 style logs, reconnection with failover) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
-    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, version_mask
-
-    next_id = 1
+    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff
+    global host, port, current_pool_index
 
     while not fShutdown:
         try:
             s = socket.socket()
             s.settimeout(30)
-            s.connect((host, port))
+            s.connect((host, int(port)))
             sock = s
 
-            # Send mining.configure for version-rolling
-            configure_msg = {
-                "id": next_id,
-                "method": "mining.configure",
-                "params": [["version-rolling"]]
-            }
-            next_id += 1
-            s.sendall((json.dumps(configure_msg) + "\n").encode())
-
             # Subscribe with user agent
-            subscribe_msg = {
-                "id": next_id,
-                "method": "mining.subscribe",
-                "params": ["minerAlfa.py/1.0"]
-            }
-            next_id += 1
-            s.sendall((json.dumps(subscribe_msg) + "\n").encode())
+            s.sendall(b'{"id":1,"method":"mining.subscribe","params":["minerAlfa.py/1.0"]}\n')
 
             # Authorize
-            authorize_msg = {
-                "id": next_id,
-                "method": "mining.authorize",
-                "params": [user, password]
-            }
-            next_id += 1
-            s.sendall((json.dumps(authorize_msg) + "\n").encode())
+            auth = {"id":2,"method":"mining.authorize","params":[user,password]}
+            s.sendall((json.dumps(auth)+"\n").encode())
 
             buf = b""
             while not fShutdown:
                 data = s.recv(4096)
                 if not data:
-                    logg("[!] Connection lost – reconnecting...")
+                    logg("[!] Connection lost – trying next server...")
                     break
                 buf += data
                 while b'\n' in buf:
@@ -331,17 +309,10 @@ def stratum_worker():
                     if not line.strip(): continue
                     msg = json.loads(line)
                     logg(f"stratum_task: rx: {json.dumps(msg)}")
-                    if "result" in msg and msg["id"] == 1:  # configure response
-                        if "version-rolling" in msg["result"]:
-                            version_mask = int(msg["result"]["version-rolling"]["mask"], 16)
-                            logg(f"Version rolling enabled with mask: {msg['result']['version-rolling']['mask']}")
-                    elif "result" in msg and msg["id"] == 2:
+                    if "result" in msg and msg["id"] == 1:
                         extranonce1 = msg["result"][1]
                         extranonce2_size = msg["result"][2]
                         logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
-                    elif "result" in msg and msg["id"] == 3:
-                        if msg["result"]:
-                            logg("[*] Authorized successfully")
                     elif msg.get("method") == "mining.notify":
                         params = msg["params"]
                         job_id = params[0]
@@ -357,18 +328,20 @@ def stratum_worker():
                         pool_diff = msg["params"][0]
                         target = diff_to_target(pool_diff)
                         logg(f"[*] Difficulty set to {pool_diff}")
-        except socket.timeout:
-            logg("[!] Timeout – reconnecting...")
         except Exception as e:
-            logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
-            time.sleep(10)
+            logg(f"[!] Connection failed ({host}:{port}): {e} – trying next server...")
+            # Failover to next pool
+            current_pool_index = (current_pool_index + 1) % len(POOL_URLS)
+            host, port = POOL_URLS[current_pool_index].split(":")
+            time.sleep(5)
 
-# ======================  DISPLAY ======================
+# ======================  DISPLAY (stable top bar, scrolling logs, live Braiins data on right) ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_RED,    curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
@@ -385,10 +358,14 @@ def display_worker():
 
             cpu_temp = get_cpu_temp()
 
+            # Top right: Ctrl+C to quit
             stdscr.addstr(0, max(0, screen_width - 20), "Ctrl+C to quit", curses.color_pair(3))
+
+            # Title
             title = "Bitcoin Miner (CPU) - Braiins Pool"
             stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
 
+            # Left side - Miner stats
             try:
                 block_height = requests.get('https://blockchain.info/q/getblockcount',timeout=3).text
             except:
@@ -400,14 +377,17 @@ def display_worker():
             stdscr.addstr(8, 0, f"Shares       : {accepted} accepted / {rejected} rejected")
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej")
 
+            # Right side - Live Braiins Data (above yellow line)
             right_x = max(50, screen_width // 2 + 5)
             stdscr.addstr(4, right_x, "Braiins Live Data", curses.color_pair(4)|curses.A_BOLD)
             for i, line in enumerate(LIVE_DATA):
                 if 5 + i < 11:
                     stdscr.addstr(5 + i, right_x, line, curses.color_pair(3))
 
+            # Yellow line
             stdscr.addstr(11, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
+            # Scrolling log area (stable)
             start_y = 12
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
@@ -426,8 +406,6 @@ if __name__ == "__main__":
     parser.add_argument("--worker", type=str, default="cpu002", help="Worker name")
     args = parser.parse_args()
 
-    host = BRAIINS_HOST
-    port = BRAIINS_PORT
     user = f"{args.username}.{args.worker}"
     password = "x"
 
