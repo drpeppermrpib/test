@@ -14,7 +14,7 @@ import curses
 import argparse
 import signal
 import subprocess
-import struct  # <-- Fixed: added missing import
+import struct
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -22,7 +22,7 @@ def diff_to_target(diff):
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
 
-# ======================  CPU TEMPERATURE (HiveOS/AMD Threadripper) ======================
+# ======================  CPU TEMPERATURE ======================
 def get_cpu_temp():
     try:
         result = subprocess.check_output(["sensors"], text=True)
@@ -52,7 +52,7 @@ def get_cpu_temp():
 
     return "N/A"
 
-# ======================  GLOBALS ======================
+# ======================  GLOBALS (now includes user & password) ======================
 fShutdown = False
 hashrates = [0] * 512
 accepted = rejected = 0
@@ -60,7 +60,7 @@ accepted_timestamps = []
 rejected_timestamps = []
 lock = threading.Lock()
 
-# job data - plain variables (no Manager proxies)
+# job data
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = []
 version = nbits = ntime = None
@@ -69,30 +69,29 @@ extranonce2 = "00000000"
 extranonce2_size = 4
 sock = None
 target = None
-pool_diff = 429496729600000  # 15-digit fallback
+pool_diff = 429496729600000
 
-# log lines
 log_lines = []
 max_log = 40
 
-# connection status
 connected = False
+
+# User credentials - now global so stratum_worker can access
+user = ""
+password = "x"
 
 # ======================  LOGGER ======================
 def logg(msg):
     timestamp = time.strftime("%H:%M:%S")
     prefixed_msg = f"[{timestamp}] {msg}"
     log_lines.append(prefixed_msg)
-    print(prefixed_msg)  # show immediately in terminal
-
-logg("alfa5.py starting...")
 
 # ======================  CONFIG ======================
 BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-num_threads = num_cores * 8  # maximum for Threadripper
+max_threads = num_cores * 8
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -114,10 +113,6 @@ def calculate_merkle_root(extranonce2_local):
 
 # ======================  SUBMIT SHARE ======================
 def submit_share(nonce):
-    current_time = time.time()
-    if current_time - last_error_time < 0.5:
-        return
-
     payload = {
         "id": None,
         "method": "mining.submit",
@@ -142,13 +137,9 @@ def submit_share(nonce):
             rejected_timestamps.append(time.time())
             logg("[!] Share rejected")
     except Exception as e:
-        global last_error_time
-        current_time = time.time()
-        if current_time - last_error_time > 10:
-            logg(f"[!] Submit error: {e}")
-            last_error_time = current_time
+        logg(f"[!] Submit error: {e}")
 
-# ======================  MINING LOOP (Threadripper optimized) ======================
+# ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -166,11 +157,9 @@ def bitcoin_miner(thread_id):
             last_job_id = job_id
             logg(f"Thread {thread_id}: New job {job_id}")
 
-            # Unique extranonce2 per thread
             extranonce2_int = (thread_id << 24) | (int(time.time() * 1000) & 0xFFFFFF)
             extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
 
-        # Build header prefix
         header_prefix = (
             binascii.unhexlify(version)[::-1] +
             binascii.unhexlify(prevhash)[::-1] +
@@ -182,11 +171,11 @@ def bitcoin_miner(thread_id):
         share_target_int = int(target if target else diff_to_target(pool_diff), 16)
 
         nonce = random.randint(0, 0xFFFFFFFF)
-        for _ in range(8000000):  # huge batch for max hashrate
+        for _ in range(8000000):
             if fShutdown or job_id != last_job_id:
                 break
 
-            nonce_bytes = struct.pack("<I", nonce)  # <-- Fixed: struct now imported
+            nonce_bytes = struct.pack("<I", nonce)
             full_header = header_prefix + nonce_bytes
 
             hash_result = hashlib.sha256(hashlib.sha256(full_header).digest()).digest()
@@ -206,11 +195,11 @@ def bitcoin_miner(thread_id):
                 elapsed = now - last_report
                 if elapsed > 0:
                     real_hr = 50000 / elapsed
-                    display_hr = int(real_hr * 1000000)  # 13-digit display
+                    display_hr = int(real_hr * 1000000)
                     hashrates[thread_id] = display_hr
                 last_report = now
 
-# ======================  STRATUM (Braiins compatible) ======================
+# ======================  STRATUM ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -265,7 +254,7 @@ def stratum_worker():
                             logg(f"New job {job_id} (clean: {clean})")
         except Exception as e:
             connected = False
-            logg(f"[!] Connection error: {e} – retrying in 10s...")
+            logg(f"[!] Connection error: {e} – retrying...")
             time.sleep(10)
 
 # ======================  GRADUAL THREAD RAMP-UP ======================
@@ -352,10 +341,11 @@ if __name__ == "__main__":
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
 
+    # Set global user (was the cause of the error)
+    global user
     user = f"{args.username}.{args.worker}"
-    password = "x"
 
-    hashrates = [0] * num_threads
+    hashrates = [0] * max_threads
 
     # Booting messages
     boot_msgs = [
