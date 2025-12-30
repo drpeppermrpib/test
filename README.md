@@ -116,7 +116,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = 48  # Fixed to 48 threads as requested (Threadripper optimal)
+max_threads = 48  # fixed for Threadripper as requested
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -224,7 +224,7 @@ def bitcoin_miner(thread_id):
                     hashrates[thread_id] = display_hr
                 last_report = now
 
-# ======================  STRATUM (more stable connection) ======================
+# ======================  STRATUM (more stable + keep-alive) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -232,7 +232,7 @@ def stratum_worker():
     while not fShutdown:
         try:
             s = socket.socket()
-            s.settimeout(20)  # balanced timeout
+            s.settimeout(20)
             s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
             connected = True
@@ -243,17 +243,34 @@ def stratum_worker():
             auth = {"id":2,"method":"mining.authorize","params":[user,password]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
+            # Simple keep-alive: send empty line every 30s to prevent idle timeout
+            last_keepalive = time.time()
+
             buf = b""
             while not fShutdown:
-                data = s.recv(4096)
+                current_time = time.time()
+                if current_time - last_keepalive > 30:
+                    try:
+                        s.sendall(b'\n')  # empty line as keep-alive
+                        last_keepalive = current_time
+                    except:
+                        pass
+
+                try:
+                    data = s.recv(4096)
+                except socket.timeout:
+                    continue  # no data, loop again
+
                 if not data:
                     connected = False
                     logg("[!] Connection lost – reconnecting...")
                     break
+
                 buf += data
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
-                    if not line.strip(): continue
+                    if not line.strip():
+                        continue
                     msg = json.loads(line)
                     logg(f"RX: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
@@ -289,7 +306,7 @@ def stratum_worker():
 # ======================  GRADUAL THREAD RAMP-UP ======================
 def ramp_up_threads():
     global current_threads
-    step = 8  # add 8 threads at a time
+    step = 8
     for target in range(step, max_threads + 1, step):
         if fShutdown:
             break
@@ -352,15 +369,15 @@ def display_worker():
 
             stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
 
-            # Faster scrolling white logs
             start_y = 12
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= h:
                     break
+                color = 1 if "accepted" in line.lower() else (2 if "rejected" in line.lower() or "error" in line.lower() else 3)
                 stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(6))
 
             stdscr.refresh()
-            time.sleep(0.4)  # faster refresh for quicker scrolling
+            time.sleep(0.4)
 
     finally:
         curses.endwin()
