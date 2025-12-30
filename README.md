@@ -121,7 +121,7 @@ def submit_share(nonce):
         return
 
     payload = {
-        "id": None,  # safe for submits (pools ignore id on submit)
+        "id": None,
         "method": "mining.submit",
         "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
     }
@@ -208,7 +208,7 @@ def bitcoin_miner(thread_id):
         extranonce2_int += 1
         extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
 
-# ======================  STRATUM (fixed handshake & IDs) ======================
+# ======================  STRATUM ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff
@@ -217,26 +217,13 @@ def stratum_worker():
         try:
             s = socket.socket()
             s.settimeout(30)
-            s.connect((host, port))
+            s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
 
-            # Subscribe - use dynamic ID and user agent
-            subscribe_msg = {
-                "id": 1,
-                "method": "mining.subscribe",
-                "params": ["minerAlfa2.py/1.0"]
-            }
-            s.sendall((json.dumps(subscribe_msg) + "\n").encode())
-            logg(f"Sent: {json.dumps(subscribe_msg)}")
+            s.sendall(b'{"id":1,"method":"mining.subscribe","params":["minerAlfa2.py/1.0"]}\n')
 
-            # Authorize - use next ID
-            authorize_msg = {
-                "id": 2,
-                "method": "mining.authorize",
-                "params": [user, password]
-            }
-            s.sendall((json.dumps(authorize_msg) + "\n").encode())
-            logg(f"Sent: {json.dumps(authorize_msg)}")
+            auth = {"id":2,"method":"mining.authorize","params":[user,password]}
+            s.sendall((json.dumps(auth)+"\n").encode())
 
             buf = b""
             while not fShutdown:
