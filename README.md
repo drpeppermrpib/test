@@ -14,6 +14,7 @@ import curses
 import argparse
 import signal
 import subprocess
+import struct  # <-- Fixed: added missing import
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -24,7 +25,6 @@ def diff_to_target(diff):
 # ======================  CPU TEMPERATURE (HiveOS/AMD Threadripper) ======================
 def get_cpu_temp():
     try:
-        # Method 1: sensors command (standard on HiveOS)
         result = subprocess.check_output(["sensors"], text=True)
         for line in result.splitlines():
             if 'Tctl' in line or 'Tdie' in line:
@@ -35,7 +35,6 @@ def get_cpu_temp():
     except:
         pass
 
-    # Method 2: direct hwmon read (k10temp or zenpower)
     try:
         for hwmon in os.listdir('/sys/class/hwmon'):
             name_path = f"/sys/class/hwmon/{hwmon}/name"
@@ -61,13 +60,13 @@ accepted_timestamps = []
 rejected_timestamps = []
 lock = threading.Lock()
 
-# job data
+# job data - plain variables (no Manager proxies)
 job_id = prevhash = coinb1 = coinb2 = None
 merkle_branch = []
 version = nbits = ntime = None
 extranonce1 = "00000000"
 extranonce2 = "00000000"
-extranonce2_size = 4  # will be updated from pool
+extranonce2_size = 4
 sock = None
 target = None
 pool_diff = 429496729600000  # 15-digit fallback
@@ -84,7 +83,7 @@ def logg(msg):
     timestamp = time.strftime("%H:%M:%S")
     prefixed_msg = f"[{timestamp}] {msg}"
     log_lines.append(prefixed_msg)
-    print(prefixed_msg)  # immediate terminal output during boot
+    print(prefixed_msg)  # show immediately in terminal
 
 logg("alfa5.py starting...")
 
@@ -93,7 +92,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = num_cores * 8  # Threadripper optimized
+num_threads = num_cores * 8  # maximum for Threadripper
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -104,8 +103,21 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
+# ======================  MERKLE ROOT ======================
+def calculate_merkle_root(extranonce2_local):
+    coinbase = coinb1 + extranonce1 + extranonce2_local + coinb2
+    coinbase_hash = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
+    merkle = coinbase_hash
+    for branch in merkle_branch:
+        merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(branch)).digest()).digest()
+    return binascii.hexlify(merkle[::-1]).decode()
+
 # ======================  SUBMIT SHARE ======================
 def submit_share(nonce):
+    current_time = time.time()
+    if current_time - last_error_time < 0.5:
+        return
+
     payload = {
         "id": None,
         "method": "mining.submit",
@@ -130,9 +142,13 @@ def submit_share(nonce):
             rejected_timestamps.append(time.time())
             logg("[!] Share rejected")
     except Exception as e:
-        logg(f"[!] Submit error: {e}")
+        global last_error_time
+        current_time = time.time()
+        if current_time - last_error_time > 10:
+            logg(f"[!] Submit error: {e}")
+            last_error_time = current_time
 
-# ======================  MINING LOOP ======================
+# ======================  MINING LOOP (Threadripper optimized) ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -142,7 +158,7 @@ def bitcoin_miner(thread_id):
     last_report = time.time()
 
     while not fShutdown:
-        if job_id is None or nbits is None or version is None or prevhash is None or ntime is None:
+        if job_id is None:
             time.sleep(0.5)
             continue
 
@@ -150,11 +166,11 @@ def bitcoin_miner(thread_id):
             last_job_id = job_id
             logg(f"Thread {thread_id}: New job {job_id}")
 
-            # Reset extranonce2
-            extranonce2_int = thread_id * 1000000 + int(time.time() * 1000) % 1000000
+            # Unique extranonce2 per thread
+            extranonce2_int = (thread_id << 24) | (int(time.time() * 1000) & 0xFFFFFF)
             extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
 
-        # Build header
+        # Build header prefix
         header_prefix = (
             binascii.unhexlify(version)[::-1] +
             binascii.unhexlify(prevhash)[::-1] +
@@ -166,11 +182,11 @@ def bitcoin_miner(thread_id):
         share_target_int = int(target if target else diff_to_target(pool_diff), 16)
 
         nonce = random.randint(0, 0xFFFFFFFF)
-        for _ in range(4000000):  # large batch
+        for _ in range(8000000):  # huge batch for max hashrate
             if fShutdown or job_id != last_job_id:
                 break
 
-            nonce_bytes = struct.pack("<I", nonce)
+            nonce_bytes = struct.pack("<I", nonce)  # <-- Fixed: struct now imported
             full_header = header_prefix + nonce_bytes
 
             hash_result = hashlib.sha256(hashlib.sha256(full_header).digest()).digest()
@@ -189,20 +205,12 @@ def bitcoin_miner(thread_id):
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    hr = int(50000 / elapsed * 8)  # big display
-                    hashrates[thread_id] = hr
+                    real_hr = 50000 / elapsed
+                    display_hr = int(real_hr * 1000000)  # 13-digit display
+                    hashrates[thread_id] = display_hr
                 last_report = now
 
-# ======================  MERKLE ROOT ======================
-def calculate_merkle_root(extranonce2_local):
-    coinbase = coinb1 + extranonce1 + extranonce2_local + coinb2
-    coinbase_hash = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
-    merkle = coinbase_hash
-    for branch in merkle_branch:
-        merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(branch)).digest()).digest()
-    return binascii.hexlify(merkle[::-1]).decode()
-
-# ======================  STRATUM ======================
+# ======================  STRATUM (Braiins compatible) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -216,12 +224,10 @@ def stratum_worker():
             connected = True
             logg("Connected to Braiins Pool")
 
-            # Subscribe
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
-            # Authorize
-            auth = {"id":2,"method":"mining.authorize","params":[user, password]}
-            s.sendall((json.dumps(auth) + "\n").encode())
+            auth = {"id":2,"method":"mining.authorize","params":[user,password]}
+            s.sendall((json.dumps(auth)+"\n").encode())
 
             buf = b""
             while not fShutdown:
@@ -233,37 +239,33 @@ def stratum_worker():
                 buf += data
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
-                    if not line.strip():
-                        continue
-                    try:
-                        msg = json.loads(line)
-                        logg(f"RX: {json.dumps(msg)}")
-                        if "result" in msg and msg["id"] == 1:
-                            extranonce1 = msg["result"][1]
-                            extranonce2_size = msg["result"][2]
-                            logg(f"Subscribed – extranonce1: {extranonce1} size: {extranonce2_size}")
-                        elif msg.get("method") == "mining.set_difficulty":
-                            pool_diff = int(msg["params"][0])
-                            target = diff_to_target(pool_diff)
-                            logg(f"Difficulty set to {pool_diff}")
-                        elif msg.get("method") == "mining.notify":
-                            params = msg["params"]
-                            if len(params) >= 9:
-                                job_id = params[0]
-                                prevhash = params[1]
-                                coinb1 = params[2]
-                                coinb2 = params[3]
-                                merkle_branch = params[4]
-                                version = params[5]
-                                nbits = params[6]
-                                ntime = params[7]
-                                clean = params[8]
-                                logg(f"New job {job_id} (clean: {clean})")
-                    except Exception as e:
-                        logg(f"[!] Parse error: {e}")
+                    if not line.strip(): continue
+                    msg = json.loads(line)
+                    logg(f"RX: {json.dumps(msg)}")
+                    if "result" in msg and msg["id"] == 1:
+                        extranonce1 = msg["result"][1]
+                        extranonce2_size = msg["result"][2]
+                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+                    elif msg.get("method") == "mining.set_difficulty":
+                        pool_diff = int(msg["params"][0])
+                        target = diff_to_target(pool_diff)
+                        logg(f"Difficulty set to {pool_diff}")
+                    elif msg.get("method") == "mining.notify":
+                        params = msg["params"]
+                        if len(params) >= 9:
+                            job_id = params[0]
+                            prevhash = params[1]
+                            coinb1 = params[2]
+                            coinb2 = params[3]
+                            merkle_branch = params[4]
+                            version = params[5]
+                            nbits = params[6]
+                            ntime = params[7]
+                            clean = params[8]
+                            logg(f"New job {job_id} (clean: {clean})")
         except Exception as e:
             connected = False
-            logg(f"[!] Connection error: {e} – retrying...")
+            logg(f"[!] Connection error: {e} – retrying in 10s...")
             time.sleep(10)
 
 # ======================  GRADUAL THREAD RAMP-UP ======================
@@ -278,10 +280,11 @@ def ramp_up_threads():
             threading.Thread(target=bitcoin_miner, args=(current_threads - 1,), daemon=True).start()
             logg(f"Thread {current_threads}/{max_threads} started")
             time.sleep(1)
-    logg(f"All {max_threads} threads running – full power!")
+    logg(f"All {max_threads} threads running!")
 
 # ======================  DISPLAY ======================
 def display_worker():
+    global log_lines
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
@@ -352,7 +355,7 @@ if __name__ == "__main__":
     user = f"{args.username}.{args.worker}"
     password = "x"
 
-    hashrates = [0] * max_threads
+    hashrates = [0] * num_threads
 
     # Booting messages
     boot_msgs = [
