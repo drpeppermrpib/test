@@ -116,7 +116,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = num_cores * 8
+max_threads = 48  # Fixed to 48 threads as requested (Threadripper optimal)
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -224,7 +224,7 @@ def bitcoin_miner(thread_id):
                     hashrates[thread_id] = display_hr
                 last_report = now
 
-# ======================  STRATUM (more robust connection) ======================
+# ======================  STRATUM (more stable connection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -232,7 +232,7 @@ def stratum_worker():
     while not fShutdown:
         try:
             s = socket.socket()
-            s.settimeout(15)  # reduced timeout for faster reconnect
+            s.settimeout(20)  # balanced timeout
             s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
             connected = True
@@ -289,7 +289,7 @@ def stratum_worker():
 # ======================  GRADUAL THREAD RAMP-UP ======================
 def ramp_up_threads():
     global current_threads
-    step = max(1, max_threads // 4)
+    step = 8  # add 8 threads at a time
     for target in range(step, max_threads + 1, step):
         if fShutdown:
             break
@@ -297,10 +297,10 @@ def ramp_up_threads():
             current_threads += 1
             threading.Thread(target=bitcoin_miner, args=(current_threads - 1,), daemon=True).start()
             logg(f"Thread {current_threads}/{max_threads} started")
-            time.sleep(1)
+            time.sleep(0.5)
     logg(f"All {max_threads} threads running!")
 
-# ======================  DISPLAY (faster scroll, smaller white text for logs) ======================
+# ======================  DISPLAY (faster scroll, white logs) ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -310,7 +310,7 @@ def display_worker():
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
-    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)  # white text for logs
+    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)  # white logs
     curses.noecho()
     curses.cbreak()
     stdscr.keypad(True)
@@ -352,7 +352,7 @@ def display_worker():
 
             stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
 
-            # Faster scrolling logs with smaller white text
+            # Faster scrolling white logs
             start_y = 12
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= h:
@@ -360,7 +360,7 @@ def display_worker():
                 stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(6))
 
             stdscr.refresh()
-            time.sleep(0.5)  # faster refresh for quicker scrolling feel
+            time.sleep(0.4)  # faster refresh for quicker scrolling
 
     finally:
         curses.endwin()
@@ -381,7 +381,7 @@ if __name__ == "__main__":
         "alfa5.py - Advanced Braiins Pool CPU Miner",
         "Initializing system...",
         f"CPU cores detected: {num_cores}",
-        f"Target threads: {max_threads} (cores ×8)",
+        f"Target threads: {max_threads} (Threadripper 48)",
         "Connecting to Braiins Pool...",
         "Starting stratum worker...",
         "Ramping up threads gradually..."
