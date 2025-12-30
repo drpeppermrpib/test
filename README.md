@@ -52,6 +52,32 @@ def get_cpu_temp():
 
     return "N/A"
 
+# ======================  FETCH LIVE BRAIINS DATA ======================
+def fetch_live_data():
+    try:
+        hr_data = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=1days&format=json", timeout=5).json()
+        network_hr = f"{hr_data['values'][-1]['y'] / 1e6:.2f} EH/s" if hr_data else "N/A"
+
+        diff_data = requests.get("https://api.blockchain.info/charts/difficulty?timespan=1days&format=json", timeout=5).json()
+        difficulty = f"{diff_data['values'][-1]['y'] / 1e12:.2f} T" if diff_data else "N/A"
+
+        fees_data = requests.get("https://mempool.space/api/v1/fees/recommended", timeout=5).json()
+        block_fees = f"{fees_data['hourFee']} SAT/vB" if fees_data else "N/A"
+
+        return [
+            f"Network HR   : {network_hr}",
+            "Avg 30d HR   : N/A",
+            f"Difficulty   : {difficulty}",
+            f"Block Fees   : {block_fees}",
+            "Hash Value   : ~0.0004 BTC/PH/Day",
+            "Hash Price   : ~$37/PH/Day",
+            "Profit Ex.   : N/A"
+        ]
+    except Exception:
+        return ["Live Data: Offline"] * 7
+
+LIVE_DATA = fetch_live_data()
+
 # ======================  GLOBALS ======================
 fShutdown = False
 hashrates = [0] * 512
@@ -76,7 +102,7 @@ max_log = 40
 
 connected = False
 
-# User credentials - defined globally BEFORE any function uses them
+# User credentials - defined early
 user = ""
 password = "x"
 
@@ -113,6 +139,10 @@ def calculate_merkle_root(extranonce2_local):
 
 # ======================  SUBMIT SHARE ======================
 def submit_share(nonce):
+    current_time = time.time()
+    if current_time - last_error_time < 0.5:
+        return
+
     payload = {
         "id": None,
         "method": "mining.submit",
@@ -137,7 +167,11 @@ def submit_share(nonce):
             rejected_timestamps.append(time.time())
             logg("[!] Share rejected")
     except Exception as e:
-        logg(f"[!] Submit error: {e}")
+        global last_error_time
+        current_time = time.time()
+        if current_time - last_error_time > 10:
+            logg(f"[!] Submit error: {e}")
+            last_error_time = current_time
 
 # ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
@@ -341,8 +375,7 @@ if __name__ == "__main__":
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
 
-    # Set global user BEFORE any thread starts
-    global user
+    # Set user globally (fix for NameError)
     user = f"{args.username}.{args.worker}"
 
     hashrates = [0] * max_threads
