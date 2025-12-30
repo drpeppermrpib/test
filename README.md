@@ -52,7 +52,7 @@ def get_cpu_temp():
 
     return "N/A"
 
-# ======================  GLOBALS (now includes user & password) ======================
+# ======================  GLOBALS ======================
 fShutdown = False
 hashrates = [0] * 512
 accepted = rejected = 0
@@ -76,7 +76,7 @@ max_log = 40
 
 connected = False
 
-# User credentials - now global so stratum_worker can access
+# User credentials - defined globally BEFORE any function uses them
 user = ""
 password = "x"
 
@@ -341,7 +341,7 @@ if __name__ == "__main__":
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
 
-    # Set global user (was the cause of the error)
+    # Set global user BEFORE any thread starts
     global user
     user = f"{args.username}.{args.worker}"
 
