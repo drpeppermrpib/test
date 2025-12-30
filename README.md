@@ -95,7 +95,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = num_cores * 2  # Threadripper: 2 threads per core is optimal
+max_threads = num_cores * 2
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -132,7 +132,7 @@ def submit_share(nonce_hex, extranonce2_used, ntime_used):
         resp = sock.recv(4096).decode().strip()
         logg(f"Response: {resp}")
         
-        if '"result":true' in resp or '"result": true' in resp:
+        if '"result":true' in resp.lower() or '"result": true' in resp:
             with lock:
                 accepted += 1
                 accepted_timestamps.append(time.time())
@@ -141,7 +141,7 @@ def submit_share(nonce_hex, extranonce2_used, ntime_used):
             with lock:
                 rejected += 1
                 rejected_timestamps.append(time.time())
-            logg(f"[!] Share rejected: {resp}")
+            logg("[!] Share rejected")
     except Exception as e:
         logg(f"[!] Submit error: {e}")
 
@@ -293,7 +293,6 @@ def stratum_worker():
                         # Submit response
                         elif "result" in msg and msg.get("id") != 1 and msg.get("id") != 2:
                             pass  # Already handled in submit_share
-                            
                     except json.JSONDecodeError as e:
                         logg(f"JSON error: {e}")
                     except Exception as e:
@@ -381,4 +380,73 @@ def display_worker():
             cpu_temp = get_cpu_temp()
             stdscr.addstr(6, 2, f"CPU Temp  : {cpu_temp}", curses.color_pair(3))
 
-            a_min =
+            a_min = sum(1 for t in accepted_timestamps if time.time() - t < 60)
+            r_min = sum(1 for t in rejected_timestamps if time.time() - t < 60)
+            stdscr.addstr(7, 2, f"Shares/min: {a_min} accepted / {r_min} rejected", curses.color_pair(1 if a_min > 0 else 3))
+
+            stdscr.addstr(8, 2, f"Total     : {accepted} accepted / {rejected} rejected", curses.color_pair(3))
+
+            stdscr.addstr(9, 2, f"Pool Diff : {pool_diff if pool_diff > 0 else 'Waiting...'}", curses.color_pair(4))
+
+            stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
+
+            start_y = 12
+            with lock:
+                display_logs = log_lines[-max_log:]
+            
+            for i, line in enumerate(display_logs):
+                if start_y + i >= h - 1:
+                    break
+                color = 1 if "accepted" in line.lower() else (2 if "rejected" in line.lower() or "error" in line.lower() else 3)
+                stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(color))
+
+            stdscr.refresh()
+            time.sleep(1)
+    finally:
+        curses.endwin()
+
+# ======================  MAIN ======================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="alfa5.py - Braiins Pool CPU Miner")
+    parser.add_argument("--username", type=str, required=True)
+    parser.add_argument("--worker", type=str, default="cpu002")
+    args = parser.parse_args()
+
+    user = f"{args.username}.{args.worker}"
+    password = "x"
+
+    # Startup boot messages
+    boot_msgs = [
+        "alfa5.py - Advanced Braiins Pool CPU Miner",
+        "Initializing system...",
+        f"CPU cores detected: {num_cores}",
+        f"Target threads: {max_threads} (cores ×2)",
+        "Connecting to Braiins Pool...",
+        "Starting stratum worker...",
+        "Ramping up threads gradually..."
+    ]
+    for msg in boot_msgs:
+        print(msg)
+        time.sleep(0.7)
+
+    # Start stratum
+    threading.Thread(target=stratum_worker, daemon=True).start()
+    time.sleep(4)
+
+    # Start display
+    threading.Thread(target=display_worker, daemon=True).start()
+
+    # Gradual thread ramp-up
+    threading.Thread(target=ramp_up_threads, daemon=True).start()
+
+    logg("[*] alfa5.py fully active – mining started!")
+
+    try:
+        while not fShutdown:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+
+    fShutdown = True
+    time.sleep(2)
+    logg("[*] Shutdown complete")
