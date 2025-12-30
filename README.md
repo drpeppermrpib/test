@@ -102,10 +102,6 @@ max_log = 40
 
 connected = False
 
-# User credentials - defined early
-user = ""
-password = "x"
-
 # ======================  LOGGER ======================
 def logg(msg):
     timestamp = time.strftime("%H:%M:%S")
@@ -139,10 +135,6 @@ def calculate_merkle_root(extranonce2_local):
 
 # ======================  SUBMIT SHARE ======================
 def submit_share(nonce):
-    current_time = time.time()
-    if current_time - last_error_time < 0.5:
-        return
-
     payload = {
         "id": None,
         "method": "mining.submit",
@@ -167,11 +159,7 @@ def submit_share(nonce):
             rejected_timestamps.append(time.time())
             logg("[!] Share rejected")
     except Exception as e:
-        global last_error_time
-        current_time = time.time()
-        if current_time - last_error_time > 10:
-            logg(f"[!] Submit error: {e}")
-            last_error_time = current_time
+        logg(f"[!] Submit error: {e}")
 
 # ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
@@ -375,7 +363,7 @@ if __name__ == "__main__":
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
 
-    # Set user globally (fix for NameError)
+    # Set user globally BEFORE any thread starts
     user = f"{args.username}.{args.worker}"
 
     hashrates = [0] * max_threads
