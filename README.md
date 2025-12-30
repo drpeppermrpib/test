@@ -13,7 +13,7 @@ import os
 import curses
 import argparse
 import signal
-import subprocess  # for accurate temp
+import subprocess
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -39,7 +39,7 @@ def get_cpu_temp():
         pass
     return "N/A"
 
-# ======================  FETCH LIVE BRAIINS DATA ======================
+# ======================  LIVE BRAIINS DATA ======================
 def fetch_live_data():
     try:
         hr_data = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=1days&format=json", timeout=5).json()
@@ -84,49 +84,30 @@ sock = None
 target = None
 pool_diff = 429496729600000  # 15-digit fallback
 
-# Global log lines for display
 log_lines = []
 max_log = 40
 
-# Last error time
 last_error_time = 0
 
-# ======================  LOGGER (only to log_lines – no terminal print) ======================
+# ======================  IMMEDIATE PRINT FOR BOOT ======================
+def print_boot(msg):
+    print(msg)
+    sys.stdout.flush()
+
+# ======================  LOGGER (only to log_lines) ======================
 def logg(msg):
     timestamp = int(time.time() * 100000)
     prefixed_msg = f"₿ ({timestamp}) {msg}"
     log_lines.append(prefixed_msg)
 
-# ======================  BOOTING SEQUENCE (prints directly to terminal) ======================
-def print_boot_message(msg):
-    print(msg)
-    sys.stdout.flush()  # immediate output
-
-def booting_sequence():
-    messages = [
-        "Initializing minerAlfa2...",
-        "Loading configuration...",
-        f"Detected {os.cpu_count()} CPU cores",
-        f"Launching {num_threads} mining threads (cores ×8)",
-        "Preparing SHA-256 engine...",
-        "Connecting to Braiins Pool (stratum.braiins.com:3333)...",
-        "Sending subscription request...",
-        "Sending authorization...",
-        "Waiting for work from pool...",
-        "minerAlfa2 fully booted – mining active!"
-    ]
-    for msg in messages:
-        print_boot_message(msg)
-        time.sleep(0.6)
-
-logg("minerAlfa2 starting...")  # first log entry
+logg("minerAlfa2 starting...")
 
 # ======================  CONFIG ======================
 BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 8  # maximum Threadripper
+num_threads = num_cores * 8  # maximum for Threadripper
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -223,7 +204,7 @@ def bitcoin_miner(thread_id):
                 elapsed = now - last_report
                 if elapsed > 0:
                     real_hr = 25000 / elapsed
-                    display_hr = int(real_hr * 1000000)  # 12-13 digit display
+                    display_hr = int(real_hr * 1000000)
                     hashrates[thread_id] = display_hr
                 last_report = now
 
@@ -231,7 +212,7 @@ def bitcoin_miner(thread_id):
         extranonce2_int += 1
         extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
 
-# ======================  STRATUM ======================
+# ======================  STRATUM (FULL BRAIINS COMPATIBILITY) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff
@@ -243,10 +224,12 @@ def stratum_worker():
             s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
 
+            # Subscribe
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["minerAlfa2.py/1.0"]}\n')
 
-            auth = {"id":2,"method":"mining.authorize","params":[user,password]}
-            s.sendall((json.dumps(auth)+"\n").encode())
+            # Authorize
+            auth = {"id":2,"method":"mining.authorize","params":[user, password]}
+            s.sendall((json.dumps(auth) + "\n").encode())
 
             buf = b""
             while not fShutdown:
@@ -257,33 +240,47 @@ def stratum_worker():
                 buf += data
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
-                    if not line.strip(): continue
-                    msg = json.loads(line)
-                    logg(f"stratum_task: rx: {json.dumps(msg)}")
-                    if "result" in msg and msg["id"] == 1:
-                        extranonce1 = msg["result"][1]
-                        extranonce2_size = msg["result"][2]
-                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
-                    elif msg.get("method") == "mining.notify":
-                        params = msg["params"]
-                        job_id = params[0]
-                        prevhash = params[1]
-                        coinb1 = params[2]
-                        coinb2 = params[3]
-                        merkle_branch = params[4]
-                        version = params[5]
-                        nbits = params[6]
-                        ntime = params[7]
-                        logg(f"create_jobs_task: New Work Dequeued {job_id}")
-                    elif msg.get("method") == "mining.set_difficulty":
-                        pool_diff = msg["params"][0]
-                        target = diff_to_target(pool_diff)
-                        logg(f"[*] Difficulty set to {pool_diff}")
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line)
+                        logg(f"stratum_task: rx: {json.dumps(msg)}")
+
+                        # Subscribe response
+                        if "id" in msg and msg["id"] == 1 and "result" in msg:
+                            extranonce1 = msg["result"][1]
+                            extranonce2_size = msg["result"][2]
+                            logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+
+                        # mining.notify - Braiins sends 9 params
+                        if msg.get("method") == "mining.notify":
+                            params = msg["params"]
+                            if len(params) >= 9:
+                                job_id = params[0]
+                                prevhash = params[1]
+                                coinb1 = params[2]
+                                coinb2 = params[3]
+                                merkle_branch = params[4]
+                                version = params[5]
+                                nbits = params[6]
+                                ntime = params[7]
+                                clean_jobs = params[8]  # usually false
+                                logg(f"New Work Dequeued {job_id} (clean: {clean_jobs})")
+
+                        # set_difficulty
+                        if msg.get("method") == "mining.set_difficulty":
+                            pool_diff = int(msg["params"][0])
+                            target = diff_to_target(pool_diff)
+                            logg(f"[*] Pool difficulty set to {pool_diff}")
+
+                    except json.JSONDecodeError:
+                        logg(f"[!] Invalid JSON: {line.decode(errors='ignore')}")
+
         except Exception as e:
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
 
-# ======================  DISPLAY (clean, logs only below yellow line) ======================
+# ======================  DISPLAY ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -330,7 +327,6 @@ def display_worker():
 
             stdscr.addstr(12, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
-            # All logg() output ONLY below yellow line
             start_y = 13
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
@@ -345,8 +341,8 @@ def display_worker():
 # ======================  MAIN ======================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Braiins Pool SHA-256 CPU Miner - minerAlfa2")
-    parser.add_argument("--username", type=str, required=True, help="Braiins username")
-    parser.add_argument("--worker", type=str, default="cpu002", help="Worker name")
+    parser.add_argument("--username", type=str, required=True)
+    parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
 
     user = f"{args.username}.{args.worker}"
@@ -354,10 +350,21 @@ if __name__ == "__main__":
 
     hashrates = [0] * num_threads
 
-    # Booting messages printed directly to terminal
-    booting_sequence()
+    # Booting messages to terminal
+    boot_msgs = [
+        "Initializing minerAlfa2...",
+        "Loading configuration...",
+        f"Detected {num_cores} cores → {num_threads} threads",
+        "Preparing SHA-256 engine...",
+        "Connecting to Braiins Pool...",
+        "Sending subscription & auth...",
+        "Waiting for work...",
+        "minerAlfa2 ready – starting mining!"
+    ]
+    for msg in boot_msgs:
+        print_boot(msg)
+        time.sleep(0.6)
 
-    # Start everything
     threading.Thread(target=stratum_worker, daemon=True).start()
     time.sleep(3)
 
@@ -366,7 +373,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=display_worker, daemon=True).start()
 
-    logg("[*] minerAlfa2 fully booted – mining active!")
+    logg("[*] minerAlfa2 fully active – happy mining!")
     try:
         while not fShutdown:
             time.sleep(1)
