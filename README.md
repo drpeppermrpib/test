@@ -91,14 +91,35 @@ max_log = 40
 # Last error time
 last_error_time = 0
 
-# ======================  LOGGER ======================
+# ======================  LOGGER (only to log_lines – no terminal print) ======================
 def logg(msg):
     timestamp = int(time.time() * 100000)
     prefixed_msg = f"₿ ({timestamp}) {msg}"
     log_lines.append(prefixed_msg)
-    print(prefixed_msg)  # immediate output to terminal during boot
 
-logg("minerAlfa2 starting...")
+# ======================  BOOTING SEQUENCE (prints directly to terminal) ======================
+def print_boot_message(msg):
+    print(msg)
+    sys.stdout.flush()  # immediate output
+
+def booting_sequence():
+    messages = [
+        "Initializing minerAlfa2...",
+        "Loading configuration...",
+        f"Detected {os.cpu_count()} CPU cores",
+        f"Launching {num_threads} mining threads (cores ×8)",
+        "Preparing SHA-256 engine...",
+        "Connecting to Braiins Pool (stratum.braiins.com:3333)...",
+        "Sending subscription request...",
+        "Sending authorization...",
+        "Waiting for work from pool...",
+        "minerAlfa2 fully booted – mining active!"
+    ]
+    for msg in messages:
+        print_boot_message(msg)
+        time.sleep(0.6)
+
+logg("minerAlfa2 starting...")  # first log entry
 
 # ======================  CONFIG ======================
 BRAIINS_HOST = 'stratum.braiins.com'
@@ -153,7 +174,7 @@ def submit_share(nonce):
             logg(f"[!] Submit error: {e}")
             last_error_time = current_time
 
-# ======================  MINING LOOP (MAXIMIZED) ======================
+# ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -262,7 +283,7 @@ def stratum_worker():
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
 
-# ======================  DISPLAY ======================
+# ======================  DISPLAY (clean, logs only below yellow line) ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -309,6 +330,7 @@ def display_worker():
 
             stdscr.addstr(12, 0, "─" * (screen_width - 1), curses.color_pair(3))
 
+            # All logg() output ONLY below yellow line
             start_y = 13
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= screen_height:
@@ -332,25 +354,11 @@ if __name__ == "__main__":
 
     hashrates = [0] * num_threads
 
-    # Immediate boot messages with real-time print
-    boot_messages = [
-        "Initializing minerAlfa2...",
-        "Loading configuration...",
-        "Detecting CPU cores...",
-        f"Found {num_cores} cores – launching {num_threads} threads",
-        "Preparing SHA-256 engine...",
-        "Connecting to Braiins Pool...",
-        "Sending subscription & authorization...",
-        "Waiting for work..."
-    ]
-    for msg in boot_messages:
-        logg(msg)
-        time.sleep(0.6)  # faster feedback
+    # Booting messages printed directly to terminal
+    booting_sequence()
 
     # Start everything
     threading.Thread(target=stratum_worker, daemon=True).start()
-
-    # Small delay for connection
     time.sleep(3)
 
     for i in range(num_threads):
