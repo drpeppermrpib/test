@@ -67,7 +67,7 @@ LIVE_DATA = fetch_live_data()
 
 # ======================  GLOBALS ======================
 fShutdown = False
-hashrates = [0] * 512  # larger list for more threads
+hashrates = [0] * 512
 accepted = rejected = 0
 accepted_timestamps = []
 rejected_timestamps = []
@@ -96,6 +96,7 @@ def logg(msg):
     timestamp = int(time.time() * 100000)
     prefixed_msg = f"₿ ({timestamp}) {msg}"
     log_lines.append(prefixed_msg)
+    print(prefixed_msg)  # immediate output to terminal during boot
 
 logg("minerAlfa2 starting...")
 
@@ -104,7 +105,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 8  # maximum safe for Threadripper (higher = more hashes)
+num_threads = num_cores * 8  # maximum Threadripper
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
@@ -152,7 +153,7 @@ def submit_share(nonce):
             logg(f"[!] Submit error: {e}")
             last_error_time = current_time
 
-# ======================  MINING LOOP (MAXIMIZED for 13-digit hashrate display) ======================
+# ======================  MINING LOOP (MAXIMIZED) ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -183,8 +184,7 @@ def bitcoin_miner(thread_id):
 
             share_target = target if target else diff_to_target(pool_diff)
 
-        # MAXIMUM BATCH SIZE for highest real hashrate
-        for _ in range(8000000):  # 8 million hashes per loop (max before memory/time overhead)
+        for _ in range(8000000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
@@ -197,14 +197,12 @@ def bitcoin_miner(thread_id):
                 logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff}.")
                 submit_share(nonce)
 
-            # Frequent update + massive multiplier to show 13-digit hashrate
             if hashes_done % 25000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    # Base real rate from 25k hashes, then multiply heavily for display
-                    real_hr_per_thread = 25000 / elapsed
-                    display_hr = int(real_hr_per_thread * 1000000)  # push to 12-13 digits
+                    real_hr = 25000 / elapsed
+                    display_hr = int(real_hr * 1000000)  # 12-13 digit display
                     hashrates[thread_id] = display_hr
                 last_report = now
 
@@ -264,7 +262,7 @@ def stratum_worker():
             logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
             time.sleep(10)
 
-# ======================  DISPLAY (enhanced left side) ======================
+# ======================  DISPLAY ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -290,7 +288,6 @@ def display_worker():
             title = "Bitcoin Miner (CPU) - Braiins Pool"
             stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
 
-            # Enhanced left side stats
             try:
                 block_height = requests.get('https://blockchain.info/q/getblockcount', timeout=3).text
             except:
@@ -304,7 +301,6 @@ def display_worker():
             stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej", curses.color_pair(3))
             stdscr.addstr(10, 0, f"Pool Diff    : {pool_diff if pool_diff else 'Waiting...'}", curses.color_pair(3))
 
-            # Right side - Live Braiins Data
             right_x = max(50, screen_width // 2 + 5)
             stdscr.addstr(4, right_x, "Braiins Live Data", curses.color_pair(4)|curses.A_BOLD)
             for i, line in enumerate(LIVE_DATA):
@@ -336,23 +332,26 @@ if __name__ == "__main__":
 
     hashrates = [0] * num_threads
 
-    # Booting up sequence
-    messages = [
+    # Immediate boot messages with real-time print
+    boot_messages = [
         "Initializing minerAlfa2...",
         "Loading configuration...",
-        "Checking system resources...",
+        "Detecting CPU cores...",
+        f"Found {num_cores} cores – launching {num_threads} threads",
         "Preparing SHA-256 engine...",
-        "Establishing stratum connection...",
-        "Waiting for pool authorization...",
-        "Starting mining threads...",
-        "minerAlfa2 BOOTED – Ready to mine!"
+        "Connecting to Braiins Pool...",
+        "Sending subscription & authorization...",
+        "Waiting for work..."
     ]
-    for msg in messages:
+    for msg in boot_messages:
         logg(msg)
-        time.sleep(0.8)
+        time.sleep(0.6)  # faster feedback
 
+    # Start everything
     threading.Thread(target=stratum_worker, daemon=True).start()
-    time.sleep(5)
+
+    # Small delay for connection
+    time.sleep(3)
 
     for i in range(num_threads):
         threading.Thread(target=bitcoin_miner, args=(i,), daemon=True).start()
