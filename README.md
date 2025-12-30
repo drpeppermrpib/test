@@ -91,13 +91,27 @@ max_log = 40
 # Last error time
 last_error_time = 0
 
+# ======================  BOOTING UP TEXT ======================
+def booting_sequence():
+    messages = [
+        "Initializing minerAlfa2...",
+        "Loading configuration...",
+        "Checking system resources...",
+        "Preparing SHA-256 engine...",
+        "Establishing stratum connection...",
+        "Waiting for pool authorization...",
+        "Starting mining threads...",
+        "minerAlfa2 BOOTED – Ready to mine!"
+    ]
+    for msg in messages:
+        logg(msg)
+        time.sleep(0.8)  # dramatic pause
+
 # ======================  LOGGER ======================
 def logg(msg):
     timestamp = int(time.time() * 100000)
     prefixed_msg = f"₿ ({timestamp}) {msg}"
     log_lines.append(prefixed_msg)
-
-logg("minerAlfa2 starting...")
 
 # ======================  CONFIG ======================
 BRAIINS_HOST = 'stratum.braiins.com'
@@ -328,15 +342,21 @@ if __name__ == "__main__":
 
     hashrates = [0] * num_threads
 
+    # Booting up sequence
+    booting_sequence()
+
+    # Start stratum
     threading.Thread(target=stratum_worker, daemon=True).start()
     time.sleep(5)
 
+    # Start mining threads
     for i in range(num_threads):
         threading.Thread(target=bitcoin_miner, args=(i,), daemon=True).start()
 
+    # Display
     threading.Thread(target=display_worker, daemon=True).start()
 
-    logg("[*] minerAlfa2 running – press Ctrl+C to stop")
+    logg("[*] minerAlfa2 fully booted – mining active!")
     try:
         while not fShutdown:
             time.sleep(1)
