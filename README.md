@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 
+# alfa5.py - Braiins Pool CPU Miner (Inspired by Pymmdrza/SoloMinerV2 style)
+# Clean, colorful curses UI with live stats, connection status, and gradual thread ramp-up
+# Submits correctly to Braiins Pool (Stratum V1)
+# Automatic extranonce2_size, live pool_diff, stable connection
+# Gradual startup: 1 core → full (cores * 8) over 30 seconds
+
 import threading
 import requests
 import binascii
@@ -21,49 +27,32 @@ def diff_to_target(diff):
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
 
-# ======================  CPU TEMPERATURE ======================
+# ======================  CPU TEMPERATURE (fixed for HiveOS/AMD) ======================
 def get_cpu_temp():
     try:
+        # Primary: sensors command (HiveOS standard)
         result = subprocess.check_output(["sensors"], text=True)
-        temps = []
         for line in result.splitlines():
-            if 'Tctl' in line or 'Tdie' in line or 'edge' in line or 'junction' in line:
-                match = re.search(r'[\+\-]?[\d\.]+°C', line)
-                if match:
-                    temps.append(float(match.group(0).replace('°C', '').strip()))
-        if temps:
-            avg = sum(temps) / len(temps)
-            max_temp = max(temps)
-            return f"{avg:.1f}°C (avg) / {max_temp:.1f}°C (max)"
+            if 'Tdie' in line or 'Tctl' in line:
+                temp = line.split(':')[1].strip().split(' ')[0]
+                return f"{temp} (Tdie/Tctl)"
+    except:
+        pass
+
+    # Fallback: thermal zones
+    try:
+        for zone in range(20):
+            path = f"/sys/class/thermal/thermal_zone{zone}/type"
+            if os.path.exists(path):
+                with open(path) as f:
+                    zone_type = f.read().strip()
+                if 'cpu' in zone_type.lower() or 'core' in zone_type.lower():
+                    with open(f"/sys/class/thermal/thermal_zone{zone}/temp") as f:
+                        temp = int(f.read().strip()) / 1000
+                        return f"{temp:.1f}°C ({zone_type})"
     except:
         pass
     return "N/A"
-
-# ======================  LIVE BRAIINS DATA ======================
-def fetch_live_data():
-    try:
-        hr_data = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=1days&format=json", timeout=5).json()
-        network_hr = f"{hr_data['values'][-1]['y'] / 1e6:.2f} EH/s" if hr_data else "N/A"
-
-        diff_data = requests.get("https://api.blockchain.info/charts/difficulty?timespan=1days&format=json", timeout=5).json()
-        difficulty = f"{diff_data['values'][-1]['y'] / 1e12:.2f} T" if diff_data else "N/A"
-
-        fees_data = requests.get("https://mempool.space/api/v1/fees/recommended", timeout=5).json()
-        block_fees = f"{fees_data['hourFee']} SAT/vB" if fees_data else "N/A"
-
-        return [
-            f"Network HR   : {network_hr}",
-            "Avg 30d HR   : N/A",
-            f"Difficulty   : {difficulty}",
-            f"Block Fees   : {block_fees}",
-            "Hash Value   : ~0.0004 BTC/PH/Day",
-            "Hash Price   : ~$37/PH/Day",
-            "Profit Ex.   : N/A"
-        ]
-    except Exception:
-        return ["Live Data: Offline"] * 7
-
-LIVE_DATA = fetch_live_data()
 
 # ======================  GLOBALS ======================
 fShutdown = False
@@ -79,81 +68,66 @@ merkle_branch = []
 version = nbits = ntime = None
 extranonce1 = "00000000"
 extranonce2 = "00000000"
-extranonce2_size = 4  # automatic from pool
+extranonce2_size = 4
 sock = None
 target = None
-pool_diff = 429496729600000  # 15-digit fallback
+pool_diff = 0  # will be set by pool
 
+# log lines
 log_lines = []
 max_log = 40
 
-last_error_time = 0
+# connection status
+connected = False
 
-# ======================  IMMEDIATE PRINT FOR BOOT ======================
-def print_boot(msg):
-    print(msg)
-    sys.stdout.flush()
-
-# ======================  LOGGER (only to log_lines) ======================
+# ======================  LOGGER ======================
 def logg(msg):
-    timestamp = int(time.time() * 100000)
-    prefixed_msg = f"₿ ({timestamp}) {msg}"
+    timestamp = time.strftime("%H:%M:%S")
+    prefixed_msg = f"[{timestamp}] {msg}"
     log_lines.append(prefixed_msg)
 
-logg("minerAlfa2 starting...")
+logg("alfa5.py starting...")
 
 # ======================  CONFIG ======================
 BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count()
-num_threads = num_cores * 8  # maximum for Threadripper
+max_threads = num_cores * 8  # final target for Threadripper
+current_threads = 0
 
 # ======================  SIGNAL ======================
 def signal_handler(sig, frame):
     global fShutdown
     fShutdown = True
-    logg("\n[!] Shutting down...")
+    logg("Shutting down...")
 
 signal.signal(signal.SIGINT, signal_handler)
 
 # ======================  SUBMIT SHARE ======================
 def submit_share(nonce):
-    current_time = time.time()
-    if current_time - last_error_time < 0.5:
-        return
-
     payload = {
         "id": None,
         "method": "mining.submit",
         "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
     }
     try:
-        logg(f"stratum_api: tx: {json.dumps(payload)}")
         sock.sendall((json.dumps(payload) + "\n").encode())
         resp = sock.recv(1024).decode().strip()
-        logg(f"stratum_task: rx: {resp}")
+        logg(f"Submitted share → {resp}")
         if "true" in resp.lower():
-            logg("stratum_task: message result accepted")
             global accepted
             with lock:
                 accepted += 1
             accepted_timestamps.append(time.time())
-            log_lines.append("*** SHARE ACCEPTED ***")
-            log_lines.append(f"Nonce: {nonce:08x}")
-            log_lines.append(f"Time : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            curses.beep()
+            logg("*** SHARE ACCEPTED ***")
         else:
-            logg("[!] Share rejected")
             global rejected
             with lock:
                 rejected += 1
-            rejected_timestamps.append(time.time())
+            logg("[!] Share rejected")
     except Exception as e:
-        current_time = time.time()
-        if current_time - last_error_time > 10:
-            logg(f"[!] Submit error: {e}")
-            last_error_time = current_time
+        logg(f"[!] Submit error: {e}")
 
 # ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
@@ -174,7 +148,7 @@ def bitcoin_miner(thread_id):
                 time.sleep(0.5)
                 continue
 
-            logg(f"create_jobs_task: New Work Dequeued {job_id}")
+            logg(f"New job: {job_id}")
 
             extranonce2 = "0" * (extranonce2_size * 2)
             nonce = random.randint(0, 0xffffffff)
@@ -184,9 +158,9 @@ def bitcoin_miner(thread_id):
 
             network_target = (nbits[2:] + '00' * (int(nbits[:2],16) - 3)).zfill(64)
 
-            share_target = target if target else diff_to_target(pool_diff)
+            share_target = target if target else diff_to_target(max(pool_diff, 1))
 
-        for _ in range(8000000):
+        for _ in range(4000000):
             nonce = (nonce - 1) & 0xffffffff
             h = hashlib.sha256(hashlib.sha256(header_bytes + nonce.to_bytes(4,'little')).digest()).digest()
             h_hex = binascii.hexlify(h[::-1]).decode()
@@ -196,26 +170,25 @@ def bitcoin_miner(thread_id):
             if h_hex < share_target:
                 diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
                 share_diff = diff1 / int(h_hex, 16)
-                logg(f"asic_result: Nonce difficulty {share_diff:.2f} of {pool_diff}.")
+                logg(f"Found share: diff {share_diff:.2f}")
                 submit_share(nonce)
 
-            if hashes_done % 25000 == 0:
+            if hashes_done % 100000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    real_hr = 25000 / elapsed
-                    display_hr = int(real_hr * 1000000)
-                    hashrates[thread_id] = display_hr
+                    hr = int(100000 / elapsed)
+                    hashrates[thread_id] = hr
                 last_report = now
 
         extranonce2_int = int(extranonce2, 16)
         extranonce2_int += 1
         extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
 
-# ======================  STRATUM (FULL BRAIINS COMPATIBILITY) ======================
+# ======================  STRATUM ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
-    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff
+    global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
 
     while not fShutdown:
         try:
@@ -223,11 +196,11 @@ def stratum_worker():
             s.settimeout(30)
             s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
+            connected = True
+            logg(f"Connected to {BRAIINS_HOST}:{BRAIINS_PORT}")
 
-            # Subscribe
-            s.sendall(b'{"id":1,"method":"mining.subscribe","params":["minerAlfa2.py/1.0"]}\n')
+            s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
-            # Authorize
             auth = {"id":2,"method":"mining.authorize","params":[user, password]}
             s.sendall((json.dumps(auth) + "\n").encode())
 
@@ -235,103 +208,112 @@ def stratum_worker():
             while not fShutdown:
                 data = s.recv(4096)
                 if not data:
+                    connected = False
                     logg("[!] Connection lost – reconnecting...")
                     break
                 buf += data
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
-                    if not line.strip():
-                        continue
-                    try:
-                        msg = json.loads(line)
-                        logg(f"stratum_task: rx: {json.dumps(msg)}")
-
-                        # Subscribe response
-                        if "id" in msg and msg["id"] == 1 and "result" in msg:
-                            extranonce1 = msg["result"][1]
-                            extranonce2_size = msg["result"][2]
-                            logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
-
-                        # mining.notify - Braiins sends 9 params
-                        if msg.get("method") == "mining.notify":
-                            params = msg["params"]
-                            if len(params) >= 9:
-                                job_id = params[0]
-                                prevhash = params[1]
-                                coinb1 = params[2]
-                                coinb2 = params[3]
-                                merkle_branch = params[4]
-                                version = params[5]
-                                nbits = params[6]
-                                ntime = params[7]
-                                clean_jobs = params[8]  # usually false
-                                logg(f"New Work Dequeued {job_id} (clean: {clean_jobs})")
-
-                        # set_difficulty
-                        if msg.get("method") == "mining.set_difficulty":
-                            pool_diff = int(msg["params"][0])
-                            target = diff_to_target(pool_diff)
-                            logg(f"[*] Pool difficulty set to {pool_diff}")
-
-                    except json.JSONDecodeError:
-                        logg(f"[!] Invalid JSON: {line.decode(errors='ignore')}")
-
+                    if not line.strip(): continue
+                    msg = json.loads(line)
+                    logg(f"stratum_task: rx: {json.dumps(msg)}")
+                    if "result" in msg and msg["id"] == 1:
+                        extranonce1 = msg["result"][1]
+                        extranonce2_size = msg["result"][2]
+                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+                    elif msg.get("method") == "mining.notify":
+                        params = msg["params"]
+                        job_id = params[0]
+                        prevhash = params[1]
+                        coinb1 = params[2]
+                        coinb2 = params[3]
+                        merkle_branch = params[4]
+                        version = params[5]
+                        nbits = params[6]
+                        ntime = params[7]
+                        logg(f"New Work: {job_id}")
+                    elif msg.get("method") == "mining.set_difficulty":
+                        pool_diff = int(msg["params"][0])
+                        target = diff_to_target(pool_diff)
+                        logg(f"Pool difficulty: {pool_diff}")
         except Exception as e:
-            logg(f"[!] Stratum error: {e} – reconnecting in 10s...")
+            connected = False
+            logg(f"[!] Connection error: {e} – retrying...")
             time.sleep(10)
 
-# ======================  DISPLAY ======================
+# ======================  GRADUAL THREAD RAMP-UP ======================
+def ramp_up_threads():
+    global current_threads
+    step = max(1, num_cores)  # at least 1 core per step
+    for target in range(step, max_threads + 1, step):
+        if fShutdown:
+            break
+        new_threads = min(target, max_threads)
+        while current_threads < new_threads:
+            current_threads += 1
+            threading.Thread(target=bitcoin_miner, args=(current_threads - 1,), daemon=True).start()
+            logg(f"Thread {current_threads}/{max_threads} started")
+            time.sleep(2)  # gradual ramp
+    logg(f"All {max_threads} threads active – full power!")
+
+# ======================  DISPLAY (Pymmdrza style - clean & colorful) ======================
 def display_worker():
-    global log_lines
     stdscr = curses.initscr()
     curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN,  curses.COLOR_BLACK)
+    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-    curses.init_pair(4, curses.COLOR_CYAN,   curses.COLOR_BLACK)
-    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
-    curses.noecho(); curses.cbreak(); stdscr.keypad(True)
+    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.noecho()
+    curses.cbreak()
+    stdscr.keypad(True)
+    stdscr.nodelay(True)
 
     try:
         while not fShutdown:
             stdscr.clear()
-            screen_height, screen_width = stdscr.getmaxyx()
+            h, w = stdscr.getmaxyx()
 
-            now = time.time()
-            a_min = sum(1 for t in accepted_timestamps if now-t<60)
-            r_min = sum(1 for t in rejected_timestamps if now-t<60)
+            title = " alfa5.py - Braiins Pool CPU Miner "
+            stdscr.addstr(0, 0, title.center(w), curses.color_pair(5) | curses.A_BOLD)
 
-            cpu_temp = get_cpu_temp()
-
-            stdscr.addstr(0, max(0, screen_width - 20), "Ctrl+C to quit", curses.color_pair(3))
-            title = "Bitcoin Miner (CPU) - Braiins Pool"
-            stdscr.addstr(2, 0, title, curses.color_pair(4)|curses.A_BOLD)
+            status = "ONLINE" if connected else "OFFLINE"
+            color = 1 if connected else 2
+            stdscr.addstr(2, 2, f"Status    : {status}", curses.color_pair(color) | curses.A_BOLD)
 
             try:
-                block_height = requests.get('https://blockchain.info/q/getblockcount', timeout=3).text
+                block_height = requests.get('https://mempool.space/api/blocks/tip/height', timeout=3).text
             except:
                 block_height = "???"
+            stdscr.addstr(3, 2, f"Block     : {block_height}", curses.color_pair(3))
+
             total_hr = sum(hashrates)
-            stdscr.addstr(4, 0, f"Block height : ~{block_height}", curses.color_pair(3))
-            stdscr.addstr(5, 0, f"Hashrate     : {total_hr:,} H/s", curses.color_pair(1))
-            stdscr.addstr(6, 0, f"CPU Temp     : {cpu_temp}", curses.color_pair(3))
-            stdscr.addstr(7, 0, f"Threads      : {num_threads} (cores×8)", curses.color_pair(3))
-            stdscr.addstr(8, 0, f"Total Shares : {accepted + rejected} (A:{accepted} R:{rejected})", curses.color_pair(3))
-            stdscr.addstr(9, 0, f"Last minute  : {a_min} acc / {r_min} rej", curses.color_pair(3))
-            stdscr.addstr(10, 0, f"Pool Diff    : {pool_diff if pool_diff else 'Waiting...'}", curses.color_pair(3))
+            stdscr.addstr(4, 2, f"Hashrate  : {total_hr:,} H/s", curses.color_pair(1) | curses.A_BOLD)
 
-            right_x = max(50, screen_width // 2 + 5)
-            stdscr.addstr(4, right_x, "Braiins Live Data", curses.color_pair(4)|curses.A_BOLD)
-            for i, line in enumerate(LIVE_DATA):
-                if 5 + i < 11:
-                    stdscr.addstr(5 + i, right_x, line, curses.color_pair(3))
+            stdscr.addstr(5, 2, f"Threads   : {current_threads}/{max_threads}", curses.color_pair(4))
 
-            stdscr.addstr(12, 0, "─" * (screen_width - 1), curses.color_pair(3))
+            cpu_temp = get_cpu_temp()
+            stdscr.addstr(6, 2, f"Temp      : {cpu_temp}", curses.color_pair(3))
 
-            start_y = 13
+            a_min = sum(1 for t in accepted_timestamps if time.time() - t < 60)
+            r_min = sum(1 for t in rejected_timestamps if time.time() - t < 60)
+            stdscr.addstr(7, 2, f"Shares/min: {a_min} accepted / {r_min} rejected", curses.color_pair(1 if a_min > 0 else 3))
+
+            stdscr.addstr(8, 2, f"Total     : {accepted} accepted / {rejected} rejected", curses.color_pair(3))
+
+            stdscr.addstr(9, 2, f"Pool Diff : {pool_diff if pool_diff > 0 else 'Waiting...'}", curses.color_pair(4))
+
+            # Horizontal line
+            stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
+
+            # Logs
+            start_y = 12
             for i, line in enumerate(log_lines[-max_log:]):
-                if start_y + i >= screen_height:
+                if start_y + i >= h:
                     break
-                stdscr.addstr(start_y + i, 0, line[:screen_width-1], curses.color_pair(5))
+                color = 1 if "accepted" in line.lower() else (2 if "rejected" in line.lower() or "error" in line.lower() else 3)
+                stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(color))
 
             stdscr.refresh()
             time.sleep(1)
@@ -340,7 +322,7 @@ def display_worker():
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Braiins Pool SHA-256 CPU Miner - minerAlfa2")
+    parser = argparse.ArgumentParser(description="alfa5.py - Braiins Pool CPU Miner")
     parser.add_argument("--username", type=str, required=True)
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
@@ -348,32 +330,32 @@ if __name__ == "__main__":
     user = f"{args.username}.{args.worker}"
     password = "x"
 
-    hashrates = [0] * num_threads
-
-    # Booting messages to terminal
+    # Startup boot messages
     boot_msgs = [
-        "Initializing minerAlfa2...",
-        "Loading configuration...",
-        f"Detected {num_cores} cores → {num_threads} threads",
-        "Preparing SHA-256 engine...",
+        "alfa5.py - Advanced Braiins Pool CPU Miner",
+        "Initializing system...",
+        f"CPU cores detected: {num_cores}",
+        f"Target threads: {max_threads} (cores ×8)",
         "Connecting to Braiins Pool...",
-        "Sending subscription & auth...",
-        "Waiting for work...",
-        "minerAlfa2 ready – starting mining!"
+        "Starting stratum worker...",
+        "Ramping up threads gradually..."
     ]
     for msg in boot_msgs:
-        print_boot(msg)
-        time.sleep(0.6)
+        print(msg)
+        time.sleep(0.7)
 
+    # Start stratum
     threading.Thread(target=stratum_worker, daemon=True).start()
-    time.sleep(3)
+    time.sleep(4)
 
-    for i in range(num_threads):
-        threading.Thread(target=bitcoin_miner, args=(i,), daemon=True).start()
-
+    # Start display
     threading.Thread(target=display_worker, daemon=True).start()
 
-    logg("[*] minerAlfa2 fully active – happy mining!")
+    # Gradual thread ramp-up
+    threading.Thread(target=ramp_up_threads, daemon=True).start()
+
+    logg("[*] alfa5.py fully active – mining started!")
+
     try:
         while not fShutdown:
             time.sleep(1)
