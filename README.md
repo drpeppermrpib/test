@@ -102,6 +102,10 @@ max_log = 40
 
 connected = False
 
+# User credentials - defined early
+user = ""
+password = "x"
+
 # ======================  LOGGER ======================
 def logg(msg):
     timestamp = time.strftime("%H:%M:%S")
@@ -363,8 +367,9 @@ if __name__ == "__main__":
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
 
-    # Set user globally BEFORE any thread starts
+    # Set user and password globally BEFORE any thread starts
     user = f"{args.username}.{args.worker}"
+    password = "x"
 
     hashrates = [0] * max_threads
 
