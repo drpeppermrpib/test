@@ -116,7 +116,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = 48  # fixed for Threadripper as requested
+max_threads = 48  # Threadripper
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -224,7 +224,7 @@ def bitcoin_miner(thread_id):
                     hashrates[thread_id] = display_hr
                 last_report = now
 
-# ======================  STRATUM (more stable + keep-alive) ======================
+# ======================  STRATUM (super stable with keep-alive & fast reconnect) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -243,15 +243,14 @@ def stratum_worker():
             auth = {"id":2,"method":"mining.authorize","params":[user,password]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
-            # Simple keep-alive: send empty line every 30s to prevent idle timeout
             last_keepalive = time.time()
 
             buf = b""
             while not fShutdown:
                 current_time = time.time()
-                if current_time - last_keepalive > 30:
+                if current_time - last_keepalive > 25:  # keep-alive every 25s
                     try:
-                        s.sendall(b'\n')  # empty line as keep-alive
+                        s.sendall(b'\n')
                         last_keepalive = current_time
                     except:
                         pass
@@ -259,7 +258,7 @@ def stratum_worker():
                 try:
                     data = s.recv(4096)
                 except socket.timeout:
-                    continue  # no data, loop again
+                    continue
 
                 if not data:
                     connected = False
@@ -269,8 +268,7 @@ def stratum_worker():
                 buf += data
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
-                    if not line.strip():
-                        continue
+                    if not line.strip(): continue
                     msg = json.loads(line)
                     logg(f"RX: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
@@ -294,13 +292,9 @@ def stratum_worker():
                             ntime = params[7]
                             clean = params[8]
                             logg(f"New job {job_id} (clean: {clean})")
-        except socket.timeout:
-            connected = False
-            logg("[!] Connection timeout – reconnecting...")
-            time.sleep(5)
         except Exception as e:
             connected = False
-            logg(f"[!] Connection error: {e} – retrying...")
+            logg(f"[!] Connection error: {e} – retrying in 5s...")
             time.sleep(5)
 
 # ======================  GRADUAL THREAD RAMP-UP ======================
@@ -317,7 +311,7 @@ def ramp_up_threads():
             time.sleep(0.5)
     logg(f"All {max_threads} threads running!")
 
-# ======================  DISPLAY (faster scroll, white logs) ======================
+# ======================  DISPLAY ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -327,7 +321,7 @@ def display_worker():
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
-    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)  # white logs
+    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)
     curses.noecho()
     curses.cbreak()
     stdscr.keypad(True)
@@ -393,7 +387,6 @@ if __name__ == "__main__":
 
     hashrates = [0] * max_threads
 
-    # Booting messages
     boot_msgs = [
         "alfa5.py - Advanced Braiins Pool CPU Miner",
         "Initializing system...",
