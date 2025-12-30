@@ -102,7 +102,6 @@ max_log = 40
 
 connected = False
 
-# User credentials - defined early
 user = ""
 password = "x"
 
@@ -225,7 +224,7 @@ def bitcoin_miner(thread_id):
                     hashrates[thread_id] = display_hr
                 last_report = now
 
-# ======================  STRATUM ======================
+# ======================  STRATUM (more robust connection) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -233,7 +232,7 @@ def stratum_worker():
     while not fShutdown:
         try:
             s = socket.socket()
-            s.settimeout(30)
+            s.settimeout(15)  # reduced timeout for faster reconnect
             s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
             connected = True
@@ -278,10 +277,14 @@ def stratum_worker():
                             ntime = params[7]
                             clean = params[8]
                             logg(f"New job {job_id} (clean: {clean})")
+        except socket.timeout:
+            connected = False
+            logg("[!] Connection timeout – reconnecting...")
+            time.sleep(5)
         except Exception as e:
             connected = False
             logg(f"[!] Connection error: {e} – retrying...")
-            time.sleep(10)
+            time.sleep(5)
 
 # ======================  GRADUAL THREAD RAMP-UP ======================
 def ramp_up_threads():
@@ -297,7 +300,7 @@ def ramp_up_threads():
             time.sleep(1)
     logg(f"All {max_threads} threads running!")
 
-# ======================  DISPLAY ======================
+# ======================  DISPLAY (faster scroll, smaller white text for logs) ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -307,6 +310,7 @@ def display_worker():
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
     curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)  # white text for logs
     curses.noecho()
     curses.cbreak()
     stdscr.keypad(True)
@@ -348,15 +352,16 @@ def display_worker():
 
             stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
 
+            # Faster scrolling logs with smaller white text
             start_y = 12
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= h:
                     break
-                color = 1 if "accepted" in line.lower() else (2 if "rejected" in line.lower() or "error" in line.lower() else 3)
-                stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(color))
+                stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(6))
 
             stdscr.refresh()
-            time.sleep(1)
+            time.sleep(0.5)  # faster refresh for quicker scrolling feel
+
     finally:
         curses.endwin()
 
@@ -367,9 +372,7 @@ if __name__ == "__main__":
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
 
-    # Set user and password globally BEFORE any thread starts
     user = f"{args.username}.{args.worker}"
-    password = "x"
 
     hashrates = [0] * max_threads
 
