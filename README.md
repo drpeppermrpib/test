@@ -22,7 +22,7 @@ def diff_to_target(diff):
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
 
-# ======================  CPU TEMPERATURE ======================
+# ======================  CPU TEMPERATURE (HiveOS/AMD Threadripper) ======================
 def get_cpu_temp():
     try:
         result = subprocess.check_output(["sensors"], text=True)
@@ -248,7 +248,7 @@ def stratum_worker():
             buf = b""
             while not fShutdown:
                 current_time = time.time()
-                if current_time - last_keepalive > 25:  # keep-alive every 25s
+                if current_time - last_keepalive > 25:
                     try:
                         s.sendall(b'\n')
                         last_keepalive = current_time
@@ -268,7 +268,8 @@ def stratum_worker():
                 buf += data
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
-                    if not line.strip(): continue
+                    if not line.strip():
+                        continue
                     msg = json.loads(line)
                     logg(f"RX: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
@@ -294,7 +295,7 @@ def stratum_worker():
                             logg(f"New job {job_id} (clean: {clean})")
         except Exception as e:
             connected = False
-            logg(f"[!] Connection error: {e} – retrying in 5s...")
+            logg(f"[!] Connection error: {e} – retrying...")
             time.sleep(5)
 
 # ======================  GRADUAL THREAD RAMP-UP ======================
@@ -387,6 +388,7 @@ if __name__ == "__main__":
 
     hashrates = [0] * max_threads
 
+    # Booting messages
     boot_msgs = [
         "alfa5.py - Advanced Braiins Pool CPU Miner",
         "Initializing system...",
