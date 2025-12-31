@@ -15,7 +15,7 @@ import argparse
 import signal
 import subprocess
 import struct
-from multiprocessing import Process, Queue, Value, Array, Manager
+from multiprocessing import Process, Queue, Value as mpValue, Lock as mpLock
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -80,21 +80,26 @@ def fetch_live_data():
 LIVE_DATA = fetch_live_data()
 
 # ======================  MINING WORKER PROCESS ======================
-def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_shared):
+def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_array, log_queue):
+    last_job = None
+    hashes_done = 0
+    last_report = time.time()
+
     while not shutdown_flag.value:
         try:
-            # Get latest job
-            current_job = job_queue.get(timeout=1)
+            job = job_queue.get(timeout=1)
         except:
             continue
 
-        job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, pool_diff = current_job
+        job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, pool_diff = job
 
-        # Local extranonce2
-        extranonce2_int = (thread_id << 24) | (int(time.time() * 1000) & 0xFFFFFF)
-        extranonce2 = f"{extranonce2_int:08x}"
+        if job_id != last_job:
+            last_job = job_id
+            log_queue.put(f"Process {thread_id}: New job {job_id}")
 
-        # Build header prefix
+            extranonce2_int = (thread_id << 24) | (int(time.time() * 1000) & 0xFFFFFF)
+            extranonce2 = f"{extranonce2_int:08x}"
+
         header_prefix = (
             binascii.unhexlify(version)[::-1] +
             binascii.unhexlify(prevhash)[::-1] +
@@ -105,11 +110,8 @@ def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_sh
 
         share_target_int = int(diff_to_target(pool_diff), 16)
 
-        hashes_done = 0
-        last_report = time.time()
         nonce = random.randint(0, 0xFFFFFFFF)
-
-        for _ in range(8000000):
+        for _ in range(16000000):
             if shutdown_flag.value:
                 return
 
@@ -122,6 +124,8 @@ def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_sh
             hashes_done += 1
 
             if hash_int < share_target_int:
+                nonce_hex = f"{nonce:08x}"
+                log_queue.put(f"*** FOUND SHARE! Process {thread_id} nonce {nonce_hex} ***")
                 result_queue.put(("share", nonce, extranonce2, ntime))
 
             nonce = (nonce + 1) & 0xFFFFFFFF
@@ -131,37 +135,48 @@ def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_sh
                 elapsed = now - last_report
                 if elapsed > 0:
                     hr = int(50000 / elapsed)
-                    hashrate_shared[thread_id] = hr
+                    hashrate_array[thread_id] = hr
                 last_report = now
 
 # ======================  MERKLE ROOT ======================
 def calculate_merkle_root(coinb1, coinb2, extranonce2_local, merkle_branch):
-    coinbase = coinb1 + "00000000" + extranonce2_local + coinb2  # extranonce1 is 0 for simplicity
+    coinbase = coinb1 + "00000000" + extranonce2_local + coinb2
     coinbase_hash = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
     merkle = coinbase_hash
     for branch in merkle_branch:
         merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(branch)).digest()).digest()
     return binascii.hexlify(merkle[::-1]).decode()
 
-# ======================  STRATUM ======================
-def stratum_worker(job_queue, result_queue, shutdown_flag):
+# ======================  STRATUM WORKER ======================
+def stratum_worker(job_queue, shutdown_flag, log_queue):
     global sock, connected
 
     while not shutdown_flag.value:
         try:
             s = socket.socket()
             s.settimeout(120)
-            s.connect((BRAIINS_HOST, BRAIINS_PORT))
+            s.connect(('stratum.braiins.com', 3333))
             sock = s
             connected = True
+            log_queue.put("Connected to Braiins Pool")
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
             auth = {"id":2,"method":"mining.authorize","params":[user,password]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
+            last_keepalive = time.time()
+
             buf = b""
             while not shutdown_flag.value:
+                current_time = time.time()
+                if current_time - last_keepalive > 25:
+                    try:
+                        s.sendall(b'\n')
+                        last_keepalive = current_time
+                    except:
+                        pass
+
                 try:
                     data = s.recv(4096)
                 except socket.timeout:
@@ -169,6 +184,7 @@ def stratum_worker(job_queue, result_queue, shutdown_flag):
 
                 if not data:
                     connected = False
+                    log_queue.put("[!] Connection lost – reconnecting...")
                     break
 
                 buf += data
@@ -177,6 +193,7 @@ def stratum_worker(job_queue, result_queue, shutdown_flag):
                     if not line.strip():
                         continue
                     msg = json.loads(line)
+                    log_queue.put(f"RX: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
                         extranonce1 = msg["result"][1]
                         extranonce2_size = msg["result"][2]
@@ -191,6 +208,7 @@ def stratum_worker(job_queue, result_queue, shutdown_flag):
                             ))
         except Exception as e:
             connected = False
+            log_queue.put(f"[!] Connection error: {e} – retrying...")
             time.sleep(5)
 
 # ======================  MAIN ======================
@@ -203,26 +221,30 @@ if __name__ == "__main__":
     user = f"{args.username}.{args.worker}"
 
     num_cores = os.cpu_count() or 24
-    max_threads = num_cores * 2  # optimal for CPU
+    max_threads = 48
 
-    manager = Manager()
-    job_queue = manager.Queue()
-    result_queue = manager.Queue()
-    shutdown_flag = manager.Value('b', False)
-    hashrates = manager.Array('i', [0] * max_threads)
+    # Multiprocessing setup
+    mp.set_start_method('spawn')
+    job_queue = mp.Queue()
+    result_queue = mp.Queue()
+    log_queue = mp.Queue()
+    shutdown_flag = mpValue('b', False)
+    hashrate_array = mp.Array('i', [0] * max_threads)
 
     # Start stratum worker
-    p_stratum = Process(target=stratum_worker, args=(job_queue, result_queue, shutdown_flag))
+    p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue))
+    p_stratum.daemon = True
     p_stratum.start()
 
     # Start mining workers
     miners = []
     for i in range(max_threads):
-        p = Process(target=mining_worker, args=(i, job_queue, result_queue, shutdown_flag, hashrates))
+        p = Process(target=mining_worker, args=(i, job_queue, result_queue, shutdown_flag, hashrate_array, log_queue))
+        p.daemon = True
         p.start()
         miners.append(p)
 
-    # Display loop (main process)
+    # Display in main process
     stdscr = curses.initscr()
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
@@ -254,14 +276,25 @@ if __name__ == "__main__":
                 block_height = "???"
             stdscr.addstr(3, 2, f"Block     : {block_height}", curses.color_pair(3))
 
-            total_hr = sum(hashrates)
+            total_hr = sum(hashrate_array)
             mh_s = total_hr / 1_000_000
             stdscr.addstr(4, 2, f"Real Hashrate: {mh_s:.2f} MH/s ({total_hr:,} H/s)", curses.color_pair(1) | curses.A_BOLD)
 
-            stdscr.addstr(5, 2, f"Threads   : {max_threads} (processes)", curses.color_pair(4))
+            stdscr.addstr(5, 2, f"Processes : {max_threads}", curses.color_pair(4))
 
             cpu_temp = get_cpu_temp()
             stdscr.addstr(6, 2, f"Temp      : {cpu_temp}", curses.color_pair(3))
+
+            # Handle results (share submission in main process)
+            while not result_queue.empty():
+                result = result_queue.get()
+                if result[0] == "share":
+                    submit_share(result[1])
+
+            # Handle logs
+            while not log_queue.empty():
+                log_msg = log_queue.get()
+                log_lines.append(log_msg)
 
             a_min = sum(1 for t in accepted_timestamps if time.time() - t < 60)
             r_min = sum(1 for t in rejected_timestamps if time.time() - t < 60)
@@ -281,13 +314,7 @@ if __name__ == "__main__":
                 stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(6))
 
             stdscr.refresh()
-            time.sleep(0.5)
-
-            # Handle results from workers
-            while not result_queue.empty():
-                result = result_queue.get()
-                if result[0] == "share":
-                    submit_share(result[1])
+            time.sleep(0.4)
 
     except KeyboardInterrupt:
         pass
