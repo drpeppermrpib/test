@@ -211,6 +211,28 @@ def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag):
             log_queue.put(f"[!] Connection error: {e} – retrying...")
             time.sleep(5)
 
+# ======================  SUBMIT SHARE (in main process) ======================
+def submit_share(nonce, extranonce2, ntime):
+    payload = {
+        "id": None,
+        "method": "mining.submit",
+        "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
+    }
+    try:
+        msg = json.dumps(payload) + "\n"
+        sock.sendall(msg.encode())
+        log_lines.append(f"Submitted share: nonce={nonce:08x}")
+        resp = sock.recv(4096).decode(errors='ignore').strip()
+        log_lines.append(f"Pool response: {resp}")
+        if '"result":true' in resp or '"result": true' in resp:
+            accepted.value += 1
+            log_lines.append("*** SHARE ACCEPTED ***")
+        else:
+            rejected.value += 1
+            log_lines.append("[!] Share rejected")
+    except Exception as e:
+        log_lines.append(f"[!] Submit error: {e}")
+
 # ======================  MAIN ======================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="alfa5.py - Braiins Pool CPU Miner (Multiprocessing)")
@@ -224,12 +246,15 @@ if __name__ == "__main__":
     max_threads = 48
 
     mp.set_start_method('spawn')
+
     job_queue = mp.Queue()
     result_queue = mp.Queue()
     log_queue = mp.Queue()
     shutdown_flag = mpValue('b', False)
     hashrate_array = mpArray('i', [0] * max_threads)
-    connected_flag = mpValue('b', False)  # shared connected status
+    connected_flag = mpValue('b', False)
+    accepted = mpValue('i', 0)
+    rejected = mpValue('i', 0)
 
     # Start stratum worker
     p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag))
@@ -285,33 +310,28 @@ if __name__ == "__main__":
             cpu_temp = get_cpu_temp()
             stdscr.addstr(6, 2, f"Temp      : {cpu_temp}", curses.color_pair(3))
 
-            # Handle results (share submission in main process)
-            while not result_queue.empty():
-                result = result_queue.get()
-                if result[0] == "share":
-                    submit_share(result[1])
-
-            # Handle logs
-            while not log_queue.empty():
-                log_msg = log_queue.get()
-                log_lines.append(log_msg)
-
-            a_min = sum(1 for t in accepted_timestamps if time.time() - t < 60)
-            r_min = sum(1 for t in rejected_timestamps if time.time() - t < 60)
-            stdscr.addstr(7, 2, f"Shares/min: {a_min} accepted / {r_min} rejected", curses.color_pair(1 if a_min > 0 else 3))
-
-            stdscr.addstr(8, 2, f"Total     : {accepted} accepted / {rejected} rejected", curses.color_pair(3))
+            stdscr.addstr(7, 2, f"Accepted  : {accepted.value}", curses.color_pair(1))
+            stdscr.addstr(8, 2, f"Rejected  : {rejected.value}", curses.color_pair(2))
 
             stdscr.addstr(9, 2, f"Pool Diff : {pool_diff if pool_diff else 'Waiting...'}", curses.color_pair(4))
 
             stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
 
             start_y = 12
+            while not log_queue.empty():
+                log_msg = log_queue.get()
+                log_lines.append(log_msg)
             for i, line in enumerate(log_lines[-max_log:]):
                 if start_y + i >= h:
                     break
                 color = 1 if "accepted" in line.lower() else (2 if "rejected" in line.lower() or "error" in line.lower() else 3)
                 stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(6))
+
+            # Handle share results
+            while not result_queue.empty():
+                result = result_queue.get()
+                if result[0] == "share":
+                    submit_share(result[1], result[2], result[3])
 
             stdscr.refresh()
             time.sleep(0.4)
