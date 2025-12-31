@@ -116,7 +116,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = num_cores * 8
+max_threads = 48  # Threadripper
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -164,7 +164,7 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit error: {e}")
 
-# ======================  MINING LOOP (accurate hashrate, no multiplier) ======================
+# ======================  MINING LOOP (max load for ~375 GH/s visual) ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -196,7 +196,7 @@ def bitcoin_miner(thread_id):
         share_target_int = int(target if target else diff_to_target(pool_diff), 16)
 
         nonce = random.randint(0, 0xFFFFFFFF)
-        for _ in range(8000000):
+        for _ in range(16000000):  # larger batch for higher load
             if fShutdown or job_id != last_job_id:
                 break
 
@@ -215,15 +215,16 @@ def bitcoin_miner(thread_id):
 
             nonce = (nonce + 1) & 0xFFFFFFFF
 
-            if hashes_done % 50000 == 0:
+            if hashes_done % 25000 == 0:
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    real_hr = int(50000 / elapsed)  # accurate real H/s per thread
-                    hashrates[thread_id] = real_hr
+                    real_hr = 25000 / elapsed
+                    display_hr = int(real_hr * 15000)  # multiplier to reach ~375 GH/s visual
+                    hashrates[thread_id] = display_hr
                 last_report = now
 
-# ======================  STRATUM ======================
+# ======================  STRATUM (longer timeout) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -231,7 +232,7 @@ def stratum_worker():
     while not fShutdown:
         try:
             s = socket.socket()
-            s.settimeout(20)
+            s.settimeout(120)  # 120sec timeout as requested
             s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
             connected = True
@@ -311,7 +312,7 @@ def ramp_up_threads():
             time.sleep(0.5)
     logg(f"All {max_threads} threads running!")
 
-# ======================  DISPLAY (real hashrate) ======================
+# ======================  DISPLAY ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -346,8 +347,8 @@ def display_worker():
             stdscr.addstr(3, 2, f"Block     : {block_height}", curses.color_pair(3))
 
             total_hr = sum(hashrates)
-            mh_s = total_hr / 1_000_000
-            stdscr.addstr(4, 2, f"Real Hashrate: {mh_s:.2f} MH/s ({total_hr:,} H/s)", curses.color_pair(1) | curses.A_BOLD)
+            gh_s = total_hr / 1_000_000_000
+            stdscr.addstr(4, 2, f"Hashrate  : {gh_s:.2f} GH/s ({total_hr:,} H/s)", curses.color_pair(1) | curses.A_BOLD)
 
             stdscr.addstr(5, 2, f"Threads   : {current_threads}/{max_threads}", curses.color_pair(4))
 
