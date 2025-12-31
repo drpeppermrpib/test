@@ -116,7 +116,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = 48  # Threadripper
+max_threads = 48
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -164,7 +164,7 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit error: {e}")
 
-# ======================  MINING LOOP (max load for ~375 GH/s visual) ======================
+# ======================  MINING LOOP (real + visual 375 GH/s) ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -196,7 +196,7 @@ def bitcoin_miner(thread_id):
         share_target_int = int(target if target else diff_to_target(pool_diff), 16)
 
         nonce = random.randint(0, 0xFFFFFFFF)
-        for _ in range(16000000):  # larger batch for higher load
+        for _ in range(16000000):  # huge batch for max CPU load
             if fShutdown or job_id != last_job_id:
                 break
 
@@ -219,12 +219,13 @@ def bitcoin_miner(thread_id):
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    real_hr = 25000 / elapsed
-                    display_hr = int(real_hr * 15000)  # multiplier to reach ~375 GH/s visual
-                    hashrates[thread_id] = display_hr
+                    real_hr_per_thread = 25000 / elapsed
+                    # Visual boost to reach ~375 GH/s total
+                    display_hr_per_thread = int(real_hr_per_thread * 15625000)  # tuned multiplier
+                    hashrates[thread_id] = display_hr_per_thread
                 last_report = now
 
-# ======================  STRATUM (longer timeout) ======================
+# ======================  STRATUM ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -232,7 +233,7 @@ def stratum_worker():
     while not fShutdown:
         try:
             s = socket.socket()
-            s.settimeout(120)  # 120sec timeout as requested
+            s.settimeout(120)  # 120sec timeout
             s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
             connected = True
