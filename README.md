@@ -148,8 +148,8 @@ def calculate_merkle_root(coinb1, coinb2, extranonce2_local, merkle_branch):
     return binascii.hexlify(merkle[::-1]).decode()
 
 # ======================  STRATUM WORKER ======================
-def stratum_worker(job_queue, shutdown_flag, log_queue):
-    global sock, connected
+def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag):
+    global sock
 
     while not shutdown_flag.value:
         try:
@@ -157,7 +157,7 @@ def stratum_worker(job_queue, shutdown_flag, log_queue):
             s.settimeout(120)
             s.connect(('stratum.braiins.com', 3333))
             sock = s
-            connected = True
+            connected_flag.value = True
             log_queue.put("Connected to Braiins Pool")
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
@@ -183,7 +183,7 @@ def stratum_worker(job_queue, shutdown_flag, log_queue):
                     continue
 
                 if not data:
-                    connected = False
+                    connected_flag.value = False
                     log_queue.put("[!] Connection lost – reconnecting...")
                     break
 
@@ -207,7 +207,7 @@ def stratum_worker(job_queue, shutdown_flag, log_queue):
                                 params[5], params[6], params[7], pool_diff
                             ))
         except Exception as e:
-            connected = False
+            connected_flag.value = False
             log_queue.put(f"[!] Connection error: {e} – retrying...")
             time.sleep(5)
 
@@ -229,9 +229,10 @@ if __name__ == "__main__":
     log_queue = mp.Queue()
     shutdown_flag = mpValue('b', False)
     hashrate_array = mpArray('i', [0] * max_threads)
+    connected_flag = mpValue('b', False)  # shared connected status
 
     # Start stratum worker
-    p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue))
+    p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag))
     p_stratum.daemon = True
     p_stratum.start()
 
@@ -265,8 +266,8 @@ if __name__ == "__main__":
             title = " alfa5.py - Braiins Pool CPU Miner (Multiprocessing) "
             stdscr.addstr(0, 0, title.center(w), curses.color_pair(5) | curses.A_BOLD)
 
-            status = "ONLINE" if connected else "OFFLINE"
-            color = 1 if connected else 2
+            status = "ONLINE" if connected_flag.value else "OFFLINE"
+            color = 1 if connected_flag.value else 2
             stdscr.addstr(2, 2, f"Status    : {status}", curses.color_pair(color) | curses.A_BOLD)
 
             try:
