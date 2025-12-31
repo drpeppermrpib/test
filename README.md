@@ -80,7 +80,7 @@ def fetch_live_data():
 LIVE_DATA = fetch_live_data()
 
 # ======================  MINING WORKER PROCESS ======================
-def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_array, log_queue):
+def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_array, log_queue, pool_diff_shared):
     last_job = None
     hashes_done = 0
     last_report = time.time()
@@ -91,7 +91,7 @@ def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_ar
         except:
             continue
 
-        job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, pool_diff = job
+        job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime = job
 
         if job_id != last_job:
             last_job = job_id
@@ -108,7 +108,8 @@ def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_ar
             binascii.unhexlify(nbits)[::-1]
         )
 
-        share_target_int = int(diff_to_target(pool_diff), 16)
+        current_diff = pool_diff_shared.value
+        share_target_int = int(diff_to_target(current_diff if current_diff > 0 else 1), 16)
 
         nonce = random.randint(0, 0xFFFFFFFF)
         for _ in range(16000000):
@@ -148,7 +149,7 @@ def calculate_merkle_root(coinb1, coinb2, extranonce2_local, merkle_branch):
     return binascii.hexlify(merkle[::-1]).decode()
 
 # ======================  STRATUM WORKER ======================
-def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag):
+def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared):
     global sock
 
     while not shutdown_flag.value:
@@ -198,13 +199,15 @@ def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag):
                         extranonce1 = msg["result"][1]
                         extranonce2_size = msg["result"][2]
                     elif msg.get("method") == "mining.set_difficulty":
-                        pool_diff = int(msg["params"][0])
+                        new_diff = int(msg["params"][0])
+                        pool_diff_shared.value = new_diff
+                        log_queue.put(f"Difficulty set to {new_diff}")
                     elif msg.get("method") == "mining.notify":
                         params = msg["params"]
                         if len(params) >= 9:
                             job_queue.put((
                                 params[0], params[1], params[2], params[3], params[4],
-                                params[5], params[6], params[7], pool_diff
+                                params[5], params[6], params[7]
                             ))
         except Exception as e:
             connected_flag.value = False
@@ -253,18 +256,19 @@ if __name__ == "__main__":
     shutdown_flag = mpValue('b', False)
     hashrate_array = mpArray('i', [0] * max_threads)
     connected_flag = mpValue('b', False)
+    pool_diff_shared = mpValue('i', 1)  # shared pool difficulty
     accepted = mpValue('i', 0)
     rejected = mpValue('i', 0)
 
     # Start stratum worker
-    p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag))
+    p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared))
     p_stratum.daemon = True
     p_stratum.start()
 
     # Start mining workers
     miners = []
     for i in range(max_threads):
-        p = Process(target=mining_worker, args=(i, job_queue, result_queue, shutdown_flag, hashrate_array, log_queue))
+        p = Process(target=mining_worker, args=(i, job_queue, result_queue, shutdown_flag, hashrate_array, log_queue, pool_diff_shared))
         p.daemon = True
         p.start()
         miners.append(p)
@@ -313,7 +317,7 @@ if __name__ == "__main__":
             stdscr.addstr(7, 2, f"Accepted  : {accepted.value}", curses.color_pair(1))
             stdscr.addstr(8, 2, f"Rejected  : {rejected.value}", curses.color_pair(2))
 
-            stdscr.addstr(9, 2, f"Pool Diff : {pool_diff if pool_diff else 'Waiting...'}", curses.color_pair(4))
+            stdscr.addstr(9, 2, f"Pool Diff : {pool_diff_shared.value if pool_diff_shared.value > 0 else 'Waiting...'}", curses.color_pair(4))
 
             stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
 
