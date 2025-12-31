@@ -256,9 +256,13 @@ if __name__ == "__main__":
     shutdown_flag = mpValue('b', False)
     hashrate_array = mpArray('i', [0] * max_threads)
     connected_flag = mpValue('b', False)
-    pool_diff_shared = mpValue('i', 1)  # shared pool difficulty
+    pool_diff_shared = mpValue('i', 1)
     accepted = mpValue('i', 0)
     rejected = mpValue('i', 0)
+
+    # log_lines in main process
+    log_lines = []
+    max_log = 40
 
     # Start stratum worker
     p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared))
@@ -322,6 +326,7 @@ if __name__ == "__main__":
             stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
 
             start_y = 12
+            # Collect logs from queue
             while not log_queue.empty():
                 log_msg = log_queue.get()
                 log_lines.append(log_msg)
