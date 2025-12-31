@@ -52,7 +52,7 @@ def get_cpu_temp():
 
     return "N/A"
 
-# ======================  FETCH LIVE BRAIINS DATA ======================
+# ======================  FETCH LIVE DATA (generic, can change for AntPool if needed) ======================
 def fetch_live_data():
     try:
         hr_data = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=1days&format=json", timeout=5).json()
@@ -95,7 +95,7 @@ extranonce2 = "00000000"
 extranonce2_size = 4
 sock = None
 target = None
-pool_diff = 1  # low for more shares
+pool_diff = 429496729600000
 
 log_lines = []
 max_log = 40
@@ -105,15 +105,15 @@ connected = False
 user = ""
 password = "x"
 
-# ======================  LOGGER (more detailed) ======================
-def logg(msg, level="INFO"):
+# ======================  LOGGER ======================
+def logg(msg):
     timestamp = time.strftime("%H:%M:%S")
-    prefixed_msg = f"[{timestamp}] [{level}] {msg}"
+    prefixed_msg = f"[{timestamp}] {msg}"
     log_lines.append(prefixed_msg)
 
-# ======================  CONFIG ======================
-BRAIINS_HOST = 'stratum.braiins.com'
-BRAIINS_PORT = 3333
+# ======================  CONFIG (changed to AntPool) ======================
+ANTPOOL_HOST = 'stratum.antpool.com'
+ANTPOOL_PORT = 3333
 
 num_cores = os.cpu_count() or 24
 max_threads = 48  # Threadripper
@@ -123,7 +123,7 @@ current_threads = 0
 def signal_handler(sig, frame):
     global fShutdown
     fShutdown = True
-    logg("Shutting down...", "INFO")
+    logg("Shutting down...")
 
 signal.signal(signal.SIGINT, signal_handler)
 
@@ -136,10 +136,8 @@ def calculate_merkle_root(extranonce2_local):
         merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(branch)).digest()).digest()
     return binascii.hexlify(merkle[::-1]).decode()
 
-# ======================  SUBMIT SHARE (detailed logging) ======================
+# ======================  SUBMIT SHARE ======================
 def submit_share(nonce):
-    global accepted, rejected
-    
     payload = {
         "id": None,
         "method": "mining.submit",
@@ -148,28 +146,25 @@ def submit_share(nonce):
     try:
         msg = json.dumps(payload) + "\n"
         sock.sendall(msg.encode())
-        logg(f"stratum_api: tx: {json.dumps(payload)}", "DEBUG")
-
-        sock.settimeout(10)
+        logg(f"stratum_api: tx: {json.dumps(payload)}")
         resp = sock.recv(4096).decode(errors='ignore').strip()
-        sock.settimeout(None)
-
-        logg(f"stratum_task: rx: {resp}", "DEBUG")
-
-        if "result" in resp and "true" in resp.lower():
+        logg(f"stratum_task: rx: {resp}")
+        if '"result":true' in resp or '"result": true' in resp:
+            global accepted
             with lock:
                 accepted += 1
             accepted_timestamps.append(time.time())
-            logg("*** SHARE ACCEPTED ***", "INFO")
+            logg("*** SHARE ACCEPTED ***")
         else:
+            global rejected
             with lock:
                 rejected += 1
             rejected_timestamps.append(time.time())
-            logg(f"[!] Share rejected: {resp}", "WARNING")
+            logg("[!] Share rejected")
     except Exception as e:
-        logg(f"[!] Submit error: {e}", "ERROR")
+        logg(f"[!] Submit error: {e}")
 
-# ======================  MINING LOOP (revamped for better performance) ======================
+# ======================  MINING LOOP ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -185,12 +180,11 @@ def bitcoin_miner(thread_id):
 
         if job_id != last_job_id:
             last_job_id = job_id
-            logg(f"Thread {thread_id}: New job {job_id}", "INFO")
+            logg(f"Thread {thread_id}: New job {job_id}")
 
             extranonce2_int = (thread_id << 24) | (int(time.time() * 1000) & 0xFFFFFF)
             extranonce2 = f"{extranonce2_int:0{extranonce2_size * 2}x}"
 
-        # Build header prefix once per job
         header_prefix = (
             binascii.unhexlify(version)[::-1] +
             binascii.unhexlify(prevhash)[::-1] +
@@ -202,8 +196,7 @@ def bitcoin_miner(thread_id):
         share_target_int = int(target if target else diff_to_target(pool_diff), 16)
 
         nonce = random.randint(0, 0xFFFFFFFF)
-        batch_size = 8000000
-        for _ in range(batch_size):
+        for _ in range(8000000):
             if fShutdown or job_id != last_job_id:
                 break
 
@@ -217,7 +210,7 @@ def bitcoin_miner(thread_id):
 
             if hash_int < share_target_int:
                 nonce_hex = f"{nonce:08x}"
-                logg(f"*** FOUND SHARE! Thread {thread_id} nonce {nonce_hex} ***", "SUCCESS")
+                logg(f"*** FOUND SHARE! Thread {thread_id} nonce {nonce_hex} ***")
                 submit_share(nonce)
 
             nonce = (nonce + 1) & 0xFFFFFFFF
@@ -229,10 +222,9 @@ def bitcoin_miner(thread_id):
                     real_hr = 50000 / elapsed
                     display_hr = int(real_hr * 1000000)
                     hashrates[thread_id] = display_hr
-                    logg(f"Thread {thread_id}: {real_hr:.2f} real H/s", "DEBUG")
                 last_report = now
 
-# ======================  STRATUM (detailed logging) ======================
+# ======================  STRATUM (AntPool compatible) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -240,11 +232,11 @@ def stratum_worker():
     while not fShutdown:
         try:
             s = socket.socket()
-            s.settimeout(120)  # 120sec timeout as requested
-            s.connect((BRAIINS_HOST, BRAIINS_PORT))
+            s.settimeout(20)
+            s.connect((ANTPOOL_HOST, ANTPOOL_PORT))
             sock = s
             connected = True
-            logg("Connected to Braiins Pool", "INFO")
+            logg("Connected to AntPool")
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
@@ -260,7 +252,6 @@ def stratum_worker():
                     try:
                         s.sendall(b'\n')
                         last_keepalive = current_time
-                        logg("Sent keep-alive", "DEBUG")
                     except:
                         pass
 
@@ -271,7 +262,7 @@ def stratum_worker():
 
                 if not data:
                     connected = False
-                    logg("[!] Connection lost – reconnecting...", "WARNING")
+                    logg("[!] Connection lost – reconnecting...")
                     break
 
                 buf += data
@@ -280,15 +271,15 @@ def stratum_worker():
                     if not line.strip():
                         continue
                     msg = json.loads(line)
-                    logg(f"RX: {json.dumps(msg)}", "DEBUG")
+                    logg(f"RX: {json.dumps(msg)}")
                     if "result" in msg and msg["id"] == 1:
                         extranonce1 = msg["result"][1]
                         extranonce2_size = msg["result"][2]
-                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}", "INFO")
+                        logg(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
                     elif msg.get("method") == "mining.set_difficulty":
                         pool_diff = int(msg["params"][0])
                         target = diff_to_target(pool_diff)
-                        logg(f"Difficulty set to {pool_diff}", "INFO")
+                        logg(f"Difficulty set to {pool_diff}")
                     elif msg.get("method") == "mining.notify":
                         params = msg["params"]
                         if len(params) >= 9:
@@ -301,10 +292,10 @@ def stratum_worker():
                             nbits = params[6]
                             ntime = params[7]
                             clean = params[8]
-                            logg(f"New job {job_id} (clean: {clean})", "INFO")
+                            logg(f"New job {job_id} (clean: {clean})")
         except Exception as e:
             connected = False
-            logg(f"[!] Connection error: {e} – retrying...", "ERROR")
+            logg(f"[!] Connection error: {e} – retrying...")
             time.sleep(5)
 
 # ======================  GRADUAL THREAD RAMP-UP ======================
@@ -317,9 +308,9 @@ def ramp_up_threads():
         while current_threads < target:
             current_threads += 1
             threading.Thread(target=bitcoin_miner, args=(current_threads - 1,), daemon=True).start()
-            logg(f"Thread {current_threads}/{max_threads} started", "INFO")
+            logg(f"Thread {current_threads}/{max_threads} started")
             time.sleep(0.5)
-    logg(f"All {max_threads} threads running!", "INFO")
+    logg(f"All {max_threads} threads running!")
 
 # ======================  DISPLAY ======================
 def display_worker():
@@ -342,7 +333,7 @@ def display_worker():
             stdscr.clear()
             h, w = stdscr.getmaxyx()
 
-            title = " alfa5.py - Braiins Pool CPU Miner "
+            title = " alfa5.py - AntPool BTC Miner "
             stdscr.addstr(0, 0, title.center(w), curses.color_pair(5) | curses.A_BOLD)
 
             status = "ONLINE" if connected else "OFFLINE"
@@ -388,7 +379,7 @@ def display_worker():
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=" alfa5.py - Braiins Pool CPU Miner")
+    parser = argparse.ArgumentParser(description="alfa5.py - AntPool BTC SHA256d Miner")
     parser.add_argument("--username", type=str, required=True)
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
@@ -399,11 +390,11 @@ if __name__ == "__main__":
 
     # Booting messages
     boot_msgs = [
-        " alfa5.py - Advanced Braiins Pool CPU Miner",
+        "alfa5.py - AntPool BTC SHA256d Miner",
         "Initializing system...",
         f"CPU cores detected: {num_cores}",
         f"Target threads: {max_threads} (Threadripper 48)",
-        "Connecting to Braiins Pool...",
+        "Connecting to AntPool...",
         "Starting stratum worker...",
         "Ramping up threads gradually..."
     ]
