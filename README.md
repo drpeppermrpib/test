@@ -156,14 +156,14 @@ def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_dif
         try:
             s = socket.socket()
             s.settimeout(120)
-            s.connect(('stratum.braiins.com', 3333))
+            s.connect(('stratum.antpool.com', 3333))
             sock = s
             connected_flag.value = True
-            log_queue.put("Connected to Braiins Pool")
+            log_queue.put("Connected to AntPool")
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
-            auth = {"id":2,"method":"mining.authorize","params":[user_str, password_str]}
+            auth = {"id":2,"method":"mining.authorize","params":[user_str,password_str]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
             last_keepalive = time.time()
@@ -238,7 +238,7 @@ def submit_share(nonce, extranonce2, ntime):
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="alfa5.py - Braiins Pool CPU Miner (Multiprocessing)")
+    parser = argparse.ArgumentParser(description="alfa5.py - AntPool BTC Miner (Multiprocessing)")
     parser.add_argument("--username", type=str, required=True)
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
@@ -296,7 +296,7 @@ if __name__ == "__main__":
             stdscr.clear()
             h, w = stdscr.getmaxyx()
 
-            title = " alfa5.py - Braiins Pool CPU Miner (Multiprocessing) "
+            title = " alfa5.py - AntPool BTC Miner (Multiprocessing) "
             stdscr.addstr(0, 0, title.center(w), curses.color_pair(5) | curses.A_BOLD)
 
             status = "ONLINE" if connected_flag.value else "OFFLINE"
