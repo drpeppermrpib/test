@@ -22,7 +22,7 @@ def diff_to_target(diff):
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
 
-# ======================  CPU TEMPERATURE (HiveOS/AMD Threadripper) ======================
+# ======================  CPU TEMPERATURE ======================
 def get_cpu_temp():
     try:
         result = subprocess.check_output(["sensors"], text=True)
@@ -116,7 +116,7 @@ BRAIINS_HOST = 'stratum.braiins.com'
 BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = 48  # Threadripper
+max_threads = 48
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -136,7 +136,7 @@ def calculate_merkle_root(extranonce2_local):
         merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(branch)).digest()).digest()
     return binascii.hexlify(merkle[::-1]).decode()
 
-# ======================  SUBMIT SHARE ======================
+# ======================  SUBMIT SHARE (null id, correct params) ======================
 def submit_share(nonce):
     payload = {
         "id": None,
@@ -146,9 +146,9 @@ def submit_share(nonce):
     try:
         msg = json.dumps(payload) + "\n"
         sock.sendall(msg.encode())
-        logg(f"Submitted share: nonce={nonce:08x}")
+        logg(f"stratum_api: tx: {json.dumps(payload)}")
         resp = sock.recv(4096).decode(errors='ignore').strip()
-        logg(f"Pool response: {resp}")
+        logg(f"stratum_task: rx: {resp}")
         if '"result":true' in resp or '"result": true' in resp:
             global accepted
             with lock:
@@ -224,7 +224,7 @@ def bitcoin_miner(thread_id):
                     hashrates[thread_id] = display_hr
                 last_report = now
 
-# ======================  STRATUM (super stable with keep-alive & fast reconnect) ======================
+# ======================  STRATUM (id 1 & 2 + null for submit) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -238,8 +238,10 @@ def stratum_worker():
             connected = True
             logg("Connected to Braiins Pool")
 
+            # id 1: subscribe
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
+            # id 2: authorize
             auth = {"id":2,"method":"mining.authorize","params":[user,password]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
@@ -388,7 +390,6 @@ if __name__ == "__main__":
 
     hashrates = [0] * max_threads
 
-    # Booting messages
     boot_msgs = [
         "alfa5.py - Advanced Braiins Pool CPU Miner",
         "Initializing system...",
