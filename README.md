@@ -164,7 +164,7 @@ def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_dif
             # Subscribe with user agent
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
-            # Authorize with user as worker name
+            # Authorize with full user.worker as username
             auth = {"id":2,"method":"mining.authorize","params":[user_str, password_str]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
