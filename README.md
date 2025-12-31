@@ -148,7 +148,7 @@ def calculate_merkle_root(coinb1, coinb2, extranonce2_local, merkle_branch):
         merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(branch)).digest()).digest()
     return binascii.hexlify(merkle[::-1]).decode()
 
-# ======================  STRATUM WORKER ======================
+# ======================  STRATUM WORKER (fixed for AntPool) ======================
 def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared, user_str, password_str):
     global sock
 
@@ -161,9 +161,11 @@ def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_dif
             connected_flag.value = True
             log_queue.put("Connected to AntPool")
 
+            # Subscribe with user agent
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
-            auth = {"id":2,"method":"mining.authorize","params":[user_str,password_str]}
+            # Authorize with user as worker name
+            auth = {"id":2,"method":"mining.authorize","params":[user_str, password_str]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
             last_keepalive = time.time()
@@ -193,22 +195,27 @@ def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_dif
                     line, buf = buf.split(b'\n', 1)
                     if not line.strip():
                         continue
-                    msg = json.loads(line)
-                    log_queue.put(f"RX: {json.dumps(msg)}")
-                    if "result" in msg and msg["id"] == 1:
-                        extranonce1 = msg["result"][1]
-                        extranonce2_size = msg["result"][2]
-                    elif msg.get("method") == "mining.set_difficulty":
-                        new_diff = int(msg["params"][0])
-                        pool_diff_shared.value = new_diff
-                        log_queue.put(f"Difficulty set to {new_diff}")
-                    elif msg.get("method") == "mining.notify":
-                        params = msg["params"]
-                        if len(params) >= 9:
-                            job_queue.put((
-                                params[0], params[1], params[2], params[3], params[4],
-                                params[5], params[6], params[7]
-                            ))
+                    try:
+                        msg = json.loads(line)
+                        log_queue.put(f"RX: {json.dumps(msg)}")
+                        if "result" in msg and msg["id"] == 1:
+                            extranonce1 = msg["result"][1]
+                            extranonce2_size = msg["result"][2]
+                            log_queue.put(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
+                        elif msg.get("method") == "mining.set_difficulty":
+                            new_diff = int(msg["params"][0])
+                            pool_diff_shared.value = new_diff
+                            log_queue.put(f"Difficulty set to {new_diff}")
+                        elif msg.get("method") == "mining.notify":
+                            params = msg["params"]
+                            if len(params) >= 9:
+                                job_queue.put((
+                                    params[0], params[1], params[2], params[3], params[4],
+                                    params[5], params[6], params[7]
+                                ))
+                                log_queue.put(f"New job {params[0]}")
+                    except json.JSONDecodeError:
+                        log_queue.put(f"[!] Invalid JSON received")
         except Exception as e:
             connected_flag.value = False
             log_queue.put(f"[!] Connection error: {e} – retrying...")
@@ -264,7 +271,7 @@ if __name__ == "__main__":
     log_lines = []
     max_log = 40
 
-    # Start stratum worker (pass user and password as strings)
+    # Start stratum worker
     p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared, user, "x"))
     p_stratum.daemon = True
     p_stratum.start()
