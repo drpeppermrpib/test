@@ -15,7 +15,7 @@ import argparse
 import signal
 import subprocess
 import struct
-from multiprocessing import Process, Queue, Value as mpValue, Lock as mpLock
+from multiprocessing import Process, Queue, Value as mpValue, Array as mpArray
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -223,13 +223,12 @@ if __name__ == "__main__":
     num_cores = os.cpu_count() or 24
     max_threads = 48
 
-    # Multiprocessing setup
     mp.set_start_method('spawn')
     job_queue = mp.Queue()
     result_queue = mp.Queue()
     log_queue = mp.Queue()
     shutdown_flag = mpValue('b', False)
-    hashrate_array = mp.Array('i', [0] * max_threads)
+    hashrate_array = mpArray('i', [0] * max_threads)
 
     # Start stratum worker
     p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue))
