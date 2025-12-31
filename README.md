@@ -149,7 +149,7 @@ def calculate_merkle_root(coinb1, coinb2, extranonce2_local, merkle_branch):
     return binascii.hexlify(merkle[::-1]).decode()
 
 # ======================  STRATUM WORKER ======================
-def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared):
+def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared, user_str, password_str):
     global sock
 
     while not shutdown_flag.value:
@@ -163,7 +163,7 @@ def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_dif
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
-            auth = {"id":2,"method":"mining.authorize","params":[user,password]}
+            auth = {"id":2,"method":"mining.authorize","params":[user_str, password_str]}
             s.sendall((json.dumps(auth)+"\n").encode())
 
             last_keepalive = time.time()
@@ -264,8 +264,8 @@ if __name__ == "__main__":
     log_lines = []
     max_log = 40
 
-    # Start stratum worker
-    p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared))
+    # Start stratum worker (pass user and password as strings)
+    p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared, user, "x"))
     p_stratum.daemon = True
     p_stratum.start()
 
@@ -326,7 +326,6 @@ if __name__ == "__main__":
             stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
 
             start_y = 12
-            # Collect logs from queue
             while not log_queue.empty():
                 log_msg = log_queue.get()
                 log_lines.append(log_msg)
