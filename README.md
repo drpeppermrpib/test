@@ -52,7 +52,7 @@ def get_cpu_temp():
 
     return "N/A"
 
-# ======================  FETCH LIVE DATA (generic, can change for AntPool if needed) ======================
+# ======================  FETCH LIVE DATA ======================
 def fetch_live_data():
     try:
         hr_data = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=1days&format=json", timeout=5).json()
@@ -111,12 +111,12 @@ def logg(msg):
     prefixed_msg = f"[{timestamp}] {msg}"
     log_lines.append(prefixed_msg)
 
-# ======================  CONFIG (changed to AntPool) ======================
-ANTPOOL_HOST = 'stratum.antpool.com'
-ANTPOOL_PORT = 3333
+# ======================  CONFIG ======================
+BRAIINS_HOST = 'stratum.braiins.com'
+BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = 48  # Threadripper
+max_threads = num_cores * 8
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -146,9 +146,9 @@ def submit_share(nonce):
     try:
         msg = json.dumps(payload) + "\n"
         sock.sendall(msg.encode())
-        logg(f"stratum_api: tx: {json.dumps(payload)}")
+        logg(f"Submitted share: nonce={nonce:08x}")
         resp = sock.recv(4096).decode(errors='ignore').strip()
-        logg(f"stratum_task: rx: {resp}")
+        logg(f"Pool response: {resp}")
         if '"result":true' in resp or '"result": true' in resp:
             global accepted
             with lock:
@@ -164,7 +164,7 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit error: {e}")
 
-# ======================  MINING LOOP ======================
+# ======================  MINING LOOP (accurate hashrate, no multiplier) ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -219,12 +219,11 @@ def bitcoin_miner(thread_id):
                 now = time.time()
                 elapsed = now - last_report
                 if elapsed > 0:
-                    real_hr = 50000 / elapsed
-                    display_hr = int(real_hr * 1000000)
-                    hashrates[thread_id] = display_hr
+                    real_hr = int(50000 / elapsed)  # accurate real H/s per thread
+                    hashrates[thread_id] = real_hr
                 last_report = now
 
-# ======================  STRATUM (AntPool compatible) ======================
+# ======================  STRATUM ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -233,10 +232,10 @@ def stratum_worker():
         try:
             s = socket.socket()
             s.settimeout(20)
-            s.connect((ANTPOOL_HOST, ANTPOOL_PORT))
+            s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
             connected = True
-            logg("Connected to AntPool")
+            logg("Connected to Braiins Pool")
 
             s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
@@ -312,7 +311,7 @@ def ramp_up_threads():
             time.sleep(0.5)
     logg(f"All {max_threads} threads running!")
 
-# ======================  DISPLAY ======================
+# ======================  DISPLAY (real hashrate) ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -333,7 +332,7 @@ def display_worker():
             stdscr.clear()
             h, w = stdscr.getmaxyx()
 
-            title = " alfa5.py - AntPool BTC Miner "
+            title = " alfa5.py - Braiins Pool CPU Miner "
             stdscr.addstr(0, 0, title.center(w), curses.color_pair(5) | curses.A_BOLD)
 
             status = "ONLINE" if connected else "OFFLINE"
@@ -347,7 +346,8 @@ def display_worker():
             stdscr.addstr(3, 2, f"Block     : {block_height}", curses.color_pair(3))
 
             total_hr = sum(hashrates)
-            stdscr.addstr(4, 2, f"Hashrate  : {total_hr:,} H/s", curses.color_pair(1) | curses.A_BOLD)
+            mh_s = total_hr / 1_000_000
+            stdscr.addstr(4, 2, f"Real Hashrate: {mh_s:.2f} MH/s ({total_hr:,} H/s)", curses.color_pair(1) | curses.A_BOLD)
 
             stdscr.addstr(5, 2, f"Threads   : {current_threads}/{max_threads}", curses.color_pair(4))
 
@@ -379,7 +379,7 @@ def display_worker():
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="alfa5.py - AntPool BTC SHA256d Miner")
+    parser = argparse.ArgumentParser(description="alfa5.py - Braiins Pool CPU Miner")
     parser.add_argument("--username", type=str, required=True)
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
@@ -390,11 +390,11 @@ if __name__ == "__main__":
 
     # Booting messages
     boot_msgs = [
-        "alfa5.py - AntPool BTC SHA256d Miner",
+        " alfa5.py - Advanced Braiins Pool CPU Miner",
         "Initializing system...",
         f"CPU cores detected: {num_cores}",
         f"Target threads: {max_threads} (Threadripper 48)",
-        "Connecting to AntPool...",
+        "Connecting to Braiins Pool...",
         "Starting stratum worker...",
         "Ramping up threads gradually..."
     ]
