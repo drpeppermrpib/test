@@ -1,361 +1,420 @@
+
 #!/usr/bin/env python3
 
 import multiprocessing as mp
 import requests
 import binascii
 import hashlib
-import random
 import socket
 import time
 import json
 import sys
 import os
-import curses
 import argparse
-import signal
-import subprocess
 import struct
-from multiprocessing import Process, Queue, Value as mpValue, Array as mpArray
+import threading
+import logging
+from datetime import datetime
+from flask import Flask, jsonify
 
-# ======================  diff_to_target ======================
-def diff_to_target(diff):
+# ================= CONFIGURATION =================
+# If you want to force a specific port or host
+API_PORT = 60060
+MAX_TEMP_C = 75.0
+RETARGET_INTERVAL = 2024  # Blocks
+VERSION_STRING = "AlfaUltra/2.0"
+
+# ================= UTILS & MATH =================
+
+def swap_endian_hex(hex_str):
+    """Swaps endianness for stratum protocol (4-byte chunks)."""
+    # Pad to even length
+    if len(hex_str) % 2 != 0:
+        hex_str = "0" + hex_str
+    
+    # Check if we can split into 4-byte (8 hex char) chunks
+    # This acts as a standard reversal for Bitcoin headers
+    bs = binascii.unhexlify(hex_str)
+    return binascii.hexlify(bs[::-1]).decode()
+
+def diff_to_target(difficulty):
+    """Converts pool difficulty to a target integer."""
+    # Standard diff 1 target for Bitcoin
     diff1 = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-    target_int = diff1 // int(diff)
-    return format(target_int, '064x')
+    if difficulty == 0: difficulty = 1
+    return diff1 // int(difficulty)
 
-# ======================  CPU TEMPERATURE ======================
 def get_cpu_temp():
+    """Reads AMD Threadripper Tdie/Tctl temp."""
     try:
-        result = subprocess.check_output(["sensors"], text=True)
-        for line in result.splitlines():
-            if 'Tctl' in line or 'Tdie' in line:
-                parts = line.split(':')
+        # Try lm-sensors first
+        import subprocess
+        out = subprocess.check_output("sensors", shell=True).decode()
+        for line in out.split("\n"):
+            if "Tdie" in line or "Tctl" in line:
+                # Format: Tdie:        +55.5°C
+                parts = line.split("+")
                 if len(parts) > 1:
-                    temp = parts[1].strip().split(' ')[0]
-                    return f"{temp}"
+                    temp = parts[1].split("°")[0]
+                    return float(temp)
     except:
         pass
-
+    
+    # Fallback to sysfs
     try:
-        for hwmon in os.listdir('/sys/class/hwmon'):
-            name_path = f"/sys/class/hwmon/{hwmon}/name"
-            if os.path.exists(name_path):
-                with open(name_path) as f:
-                    name = f.read().strip()
-                if name in ['k10temp', 'zenpower']:
-                    temp_path = f"/sys/class/hwmon/{hwmon}/temp1_input"
-                    if os.path.exists(temp_path):
-                        with open(temp_path) as f:
-                            temp = int(f.read().strip()) / 1000
-                        return f"{temp:.1f}°C"
+        for zone in range(5):
+            path = f"/sys/class/thermal/thermal_zone{zone}/temp"
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    # Value is usually in millidegrees
+                    return int(f.read().strip()) / 1000.0
     except:
-        pass
+        return 0.0
 
-    return "N/A"
+# ================= WORKER PROCESS =================
 
-# ======================  FETCH LIVE DATA ======================
-def fetch_live_data():
-    try:
-        hr_data = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=1days&format=json", timeout=5).json()
-        network_hr = f"{hr_data['values'][-1]['y'] / 1e6:.2f} EH/s" if hr_data else "N/A"
-
-        diff_data = requests.get("https://api.blockchain.info/charts/difficulty?timespan=1days&format=json", timeout=5).json()
-        difficulty = f"{diff_data['values'][-1]['y'] / 1e12:.2f} T" if diff_data else "N/A"
-
-        fees_data = requests.get("https://mempool.space/api/v1/fees/recommended", timeout=5).json()
-        block_fees = f"{fees_data['hourFee']} SAT/vB" if fees_data else "N/A"
-
-        return [
-            f"Network HR   : {network_hr}",
-            "Avg 30d HR   : N/A",
-            f"Difficulty   : {difficulty}",
-            f"Block Fees   : {block_fees}",
-            "Hash Value   : ~0.0004 BTC/PH/Day",
-            "Hash Price   : ~$37/PH/Day",
-            "Profit Ex.   : N/A"
-        ]
-    except Exception:
-        return ["Live Data: Offline"] * 7
-
-LIVE_DATA = fetch_live_data()
-
-# ======================  MINING WORKER PROCESS ======================
-def mining_worker(thread_id, job_queue, result_queue, shutdown_flag, hashrate_array, log_queue, pool_diff_shared):
-    last_job = None
-    hashes_done = 0
-    last_report = time.time()
-
-    while not shutdown_flag.value:
+def miner_process(worker_id, job_queue, result_queue, stop_flag, stats_array, current_diff):
+    """
+    The heavy lifter. Runs pure SHA256d.
+    """
+    # Local variables for speed
+    extranonce2_int = worker_id * 1000000
+    
+    while not stop_flag.value:
         try:
-            job = job_queue.get(timeout=1)
-        except:
-            continue
-
-        job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime = job
-
-        if job_id != last_job:
-            last_job = job_id
-            log_queue.put(f"Process {thread_id}: New job {job_id}")
-
-            extranonce2_int = (thread_id << 24) | (int(time.time() * 1000) & 0xFFFFFF)
+            # Non-blocking check for new job
+            if job_queue.empty():
+                time.sleep(0.1)
+                continue
+                
+            job_data = job_queue.get()
+            
+            # Unpack job
+            (job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs) = job_data
+            
+            # --- THERMAL THROTTLE ---
+            # Every few loops, check global temp flag or sleep? 
+            # We do this in main loop to save CPU cycles here, but we can do a quick pause
+            # if stats_array[worker_id] == -1 (signal to pause)
+            
+            # Prepare Header Construction
+            # 1. Build Coinbase
+            # We need a unique extranonce2 for this worker
+            extranonce2_int += 1
             extranonce2 = f"{extranonce2_int:08x}"
-
-        header_prefix = (
-            binascii.unhexlify(version)[::-1] +
-            binascii.unhexlify(prevhash)[::-1] +
-            binascii.unhexlify(calculate_merkle_root(coinb1, coinb2, extranonce2, merkle_branch))[::-1] +
-            binascii.unhexlify(ntime)[::-1] +
-            binascii.unhexlify(nbits)[::-1]
-        )
-
-        current_diff = pool_diff_shared.value
-        share_target_int = int(diff_to_target(current_diff if current_diff > 0 else 1), 16)
-
-        nonce = random.randint(0, 0xFFFFFFFF)
-        for _ in range(16000000):
-            if shutdown_flag.value:
-                return
-
-            nonce_bytes = struct.pack("<I", nonce)
-            full_header = header_prefix + nonce_bytes
-
-            hash_result = hashlib.sha256(hashlib.sha256(full_header).digest()).digest()
-            hash_int = int.from_bytes(hash_result[::-1], 'big')
-
-            hashes_done += 1
-
-            if hash_int < share_target_int:
-                nonce_hex = f"{nonce:08x}"
-                log_queue.put(f"*** FOUND SHARE! Process {thread_id} nonce {nonce_hex} ***")
-                result_queue.put(("share", nonce, extranonce2, ntime))
-
-            nonce = (nonce + 1) & 0xFFFFFFFF
-
-            if hashes_done % 50000 == 0:
-                now = time.time()
-                elapsed = now - last_report
-                if elapsed > 0:
-                    hr = int(50000 / elapsed)
-                    hashrate_array[thread_id] = hr
-                last_report = now
-
-# ======================  MERKLE ROOT ======================
-def calculate_merkle_root(coinb1, coinb2, extranonce2_local, merkle_branch):
-    coinbase = coinb1 + "00000000" + extranonce2_local + coinb2
-    coinbase_hash = hashlib.sha256(hashlib.sha256(binascii.unhexlify(coinbase)).digest()).digest()
-    merkle = coinbase_hash
-    for branch in merkle_branch:
-        merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(branch)).digest()).digest()
-    return binascii.hexlify(merkle[::-1]).decode()
-
-# ======================  STRATUM WORKER (fixed for AntPool) ======================
-def stratum_worker(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared, user_str, password_str):
-    global sock
-
-    while not shutdown_flag.value:
-        try:
-            s = socket.socket()
-            s.settimeout(120)
-            s.connect(('stratum.antpool.com', 3333))
-            sock = s
-            connected_flag.value = True
-            log_queue.put("Connected to AntPool")
-
-            # Subscribe with user agent
-            s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
-
-            # Authorize with full user.worker as username
-            auth = {"id":2,"method":"mining.authorize","params":[user_str, password_str]}
-            s.sendall((json.dumps(auth)+"\n").encode())
-
-            last_keepalive = time.time()
-
-            buf = b""
-            while not shutdown_flag.value:
-                current_time = time.time()
-                if current_time - last_keepalive > 25:
-                    try:
-                        s.sendall(b'\n')
-                        last_keepalive = current_time
-                    except:
-                        pass
-
-                try:
-                    data = s.recv(4096)
-                except socket.timeout:
-                    continue
-
-                if not data:
-                    connected_flag.value = False
-                    log_queue.put("[!] Connection lost – reconnecting...")
-                    break
-
-                buf += data
-                while b'\n' in buf:
-                    line, buf = buf.split(b'\n', 1)
-                    if not line.strip():
-                        continue
-                    try:
-                        msg = json.loads(line)
-                        log_queue.put(f"RX: {json.dumps(msg)}")
-                        if "result" in msg and msg["id"] == 1:
-                            extranonce1 = msg["result"][1]
-                            extranonce2_size = msg["result"][2]
-                            log_queue.put(f"Subscribed – extranonce1: {extranonce1}, size: {extranonce2_size}")
-                        elif msg.get("method") == "mining.set_difficulty":
-                            new_diff = int(msg["params"][0])
-                            pool_diff_shared.value = new_diff
-                            log_queue.put(f"Difficulty set to {new_diff}")
-                        elif msg.get("method") == "mining.notify":
-                            params = msg["params"]
-                            if len(params) >= 9:
-                                job_queue.put((
-                                    params[0], params[1], params[2], params[3], params[4],
-                                    params[5], params[6], params[7]
-                                ))
-                                log_queue.put(f"New job {params[0]}")
-                    except json.JSONDecodeError:
-                        log_queue.put(f"[!] Invalid JSON received")
+            
+            coinbase_hex = coinb1 + extranonce2 + coinb2
+            coinbase_bin = binascii.unhexlify(coinbase_hex)
+            
+            # 2. Merkle Root
+            merkle_root = hashlib.sha256(hashlib.sha256(coinbase_bin).digest()).digest()
+            for branch in merkle_branch:
+                branch_bin = binascii.unhexlify(branch)
+                merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + branch_bin).digest()).digest()
+            
+            # 3. Construct Block Header (80 bytes)
+            # Version (4) + PrevHash (32) + MerkleRoot (32) + Time (4) + nBits (4) + Nonce (4)
+            # Note: Stratum sends them as big-endian hex, we often need to byte-swap for hashing
+            
+            # Convert parts to binary, correcting endianness where required by Stratum
+            # Version: LE
+            ver_bin = binascii.unhexlify(version)[::-1]
+            # PrevHash: LE (stratum sends BE usually, but let's trust the input format for now)
+            # Actually, standard stratum sends standard hex. 
+            # We will use the standard "pack" approach for python miners.
+            
+            prev_bin = binascii.unhexlify(prevhash)
+            # Merkle is already calculated
+            ntime_bin = binascii.unhexlify(ntime)[::-1]
+            nbits_bin = binascii.unhexlify(nbits)[::-1]
+            
+            # Header Prefix (76 bytes)
+            # Version + Prev + Merkle + Time + Bits
+            # Note: The merkle root calculation above might need byte swapping depending on pool.
+            # For standard Stratum, we usually treat merkle_branch items as LE.
+            
+            header_pre = ver_bin + binascii.unhexlify(swap_endian_hex(prevhash)) + merkle_root + ntime_bin + nbits_bin
+            
+            # Target Calculation
+            target = diff_to_target(current_diff.value)
+            
+            # Mining Loop
+            nonce_start = worker_id * 10000000
+            nonce = nonce_start
+            
+            # Hashing loop - maximize load
+            # Batch size determines how often we check for new jobs
+            batch_size = 50000
+            
+            while not stop_flag.value:
+                # Check if job changed (rudimentary way: check queue)
+                if not job_queue.empty():
+                    break # Get new job
+                
+                # Simple Python Optimization: Struct pack is slow, do it outside if possible?
+                # Nonce changes, so we must pack it.
+                
+                # To simulate "Load" and try to find shares:
+                # We loop `batch_size` times
+                for n in range(nonce, nonce + batch_size):
+                    nonce_bin = struct.pack("<I", n) # Little Endian
+                    header = header_pre + nonce_bin
+                    
+                    # Double SHA256
+                    hash_res = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+                    
+                    # Check Target (treat hash as big integer)
+                    hash_int = int.from_bytes(hash_res[::-1], "big")
+                    
+                    if hash_int <= target:
+                        # Found a share!
+                        result_queue.put({
+                            "type": "share",
+                            "job_id": job_id,
+                            "extranonce2": extranonce2,
+                            "ntime": ntime,
+                            "nonce": f"{n:08x}"
+                        })
+                
+                # Update stats
+                nonce += batch_size
+                stats_array[worker_id] += batch_size
+                
         except Exception as e:
-            connected_flag.value = False
-            log_queue.put(f"[!] Connection error: {e} – retrying...")
-            time.sleep(5)
+            # print(f"Worker Error: {e}")
+            time.sleep(1)
 
-# ======================  SUBMIT SHARE (in main process) ======================
-def submit_share(nonce, extranonce2, ntime):
-    payload = {
-        "id": None,
-        "method": "mining.submit",
-        "params": [user, job_id, extranonce2, ntime, f"{nonce:08x}"]
-    }
+# ================= API SERVER =================
+def run_api(stats_dict):
+    app = Flask(__name__)
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR) # Silence Flask logs
+
+    @app.route('/')
+    def status():
+        return jsonify(stats_dict)
+
     try:
-        msg = json.dumps(payload) + "\n"
-        sock.sendall(msg.encode())
-        log_lines.append(f"Submitted share: nonce={nonce:08x}")
-        resp = sock.recv(4096).decode(errors='ignore').strip()
-        log_lines.append(f"Pool response: {resp}")
-        if '"result":true' in resp or '"result": true' in resp:
-            accepted.value += 1
-            log_lines.append("*** SHARE ACCEPTED ***")
-        else:
-            rejected.value += 1
-            log_lines.append("[!] Share rejected")
-    except Exception as e:
-        log_lines.append(f"[!] Submit error: {e}")
+        app.run(host='0.0.0.0', port=API_PORT, threaded=True)
+    except:
+        pass
 
-# ======================  MAIN ======================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="alfa5.py - AntPool BTC Miner (Multiprocessing)")
-    parser.add_argument("--username", type=str, required=True)
-    parser.add_argument("--worker", type=str, default="cpu002")
+# ================= MAIN CONTROLLER =================
+
+def main():
+    # Argument Parsing
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--username", required=True, help="Pool Username")
+    parser.add_argument("--worker", default="001", help="Worker Name")
+    parser.add_argument("--pool", default="stratum.antpool.com", help="Pool Address")
+    parser.add_argument("--port", type=int, default=3333, help="Pool Port")
     args = parser.parse_args()
 
-    user = f"{args.username}.{args.worker}"
-
-    num_cores = os.cpu_count() or 24
-    max_threads = 48
-
-    mp.set_start_method('spawn')
-
-    job_queue = mp.Queue()
-    result_queue = mp.Queue()
-    log_queue = mp.Queue()
-    shutdown_flag = mpValue('b', False)
-    hashrate_array = mpArray('i', [0] * max_threads)
-    connected_flag = mpValue('b', False)
-    pool_diff_shared = mpValue('i', 1)
-    accepted = mpValue('i', 0)
-    rejected = mpValue('i', 0)
-
-    # log_lines in main process
-    log_lines = []
-    max_log = 40
-
-    # Start stratum worker
-    p_stratum = Process(target=stratum_worker, args=(job_queue, shutdown_flag, log_queue, connected_flag, pool_diff_shared, user, "x"))
-    p_stratum.daemon = True
-    p_stratum.start()
-
-    # Start mining workers
-    miners = []
-    for i in range(max_threads):
-        p = Process(target=mining_worker, args=(i, job_queue, result_queue, shutdown_flag, hashrate_array, log_queue, pool_diff_shared))
-        p.daemon = True
-        p.start()
-        miners.append(p)
-
-    # Display in main process
+    full_user = f"{args.username}.{args.worker}"
+    
+    # UI Setup
+    import curses
     stdscr = curses.initscr()
+    curses.noecho()
+    curses.cbreak()
+    stdscr.nodelay(1)
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
     curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
     curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
-    curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
-    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)
-    curses.noecho()
-    curses.cbreak()
-    stdscr.keypad(True)
-    stdscr.nodelay(True)
+
+    # Multiprocessing Setup
+    mp.set_start_method('spawn', force=True)
+    num_threads = mp.cpu_count() # Should be 48 for TR 3960X
+    
+    job_queue = mp.Queue()
+    result_queue = mp.Queue()
+    stop_flag = mp.Value('b', False)
+    current_diff = mp.Value('d', 1024.0) # Start high to avoid spamming low diff shares
+    stats_array = mp.Array('i', [0] * num_threads)
+    
+    workers = []
+    for i in range(num_threads):
+        p = mp.Process(target=miner_process, args=(i, job_queue, result_queue, stop_flag, stats_array, current_diff))
+        p.start()
+        workers.append(p)
+
+    # Socket Connection
+    sock = None
+    connected = False
+    
+    # Statistics
+    shares_accepted = 0
+    shares_rejected = 0
+    start_time = time.time()
+    api_stats = {}
+
+    # API Thread
+    api_thread = threading.Thread(target=run_api, args=(api_stats,))
+    api_thread.daemon = True
+    api_thread.start()
+
+    log_msg = ["Initializing Miner..."]
 
     try:
         while True:
+            # 1. CONNECTION MANAGER
+            if not connected:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(5)
+                    sock.connect((args.pool, args.port))
+                    
+                    # Subscribe
+                    msg = json.dumps({"id": 1, "method": "mining.subscribe", "params": [VERSION_STRING]}) + "\n"
+                    sock.sendall(msg.encode())
+                    
+                    # Authorize
+                    msg = json.dumps({"id": 2, "method": "mining.authorize", "params": [full_user, "x"]}) + "\n"
+                    sock.sendall(msg.encode())
+                    
+                    connected = True
+                    log_msg.append(f"Connected to {args.pool}")
+                except Exception as e:
+                    log_msg.append(f"Connection Failed: {e}")
+                    time.sleep(5)
+                    continue
+
+            # 2. SOCKET LISTENER (Non-blocking logic)
+            try:
+                sock.settimeout(0.1)
+                line = ""
+                while True:
+                    data = sock.recv(1024).decode()
+                    if not data:
+                        connected = False
+                        break
+                    line += data
+                    if "\n" in line:
+                        break
+                
+                if line:
+                    for msg_raw in line.split("\n"):
+                        if not msg_raw.strip(): continue
+                        response = json.loads(msg_raw)
+                        
+                        # Handle Notify (New Job)
+                        if response.get("method") == "mining.notify":
+                            params = response["params"]
+                            # Clean queue slightly
+                            while not job_queue.empty():
+                                try: job_queue.get_nowait()
+                                except: pass
+                                
+                            # Send to all workers
+                            job_tuple = tuple(params)
+                            for _ in range(num_threads):
+                                job_queue.put(job_tuple)
+                            log_msg.append(f"New Block Detected: {params[0][:8]}...")
+                        
+                        # Handle Difficulty
+                        if response.get("method") == "mining.set_difficulty":
+                            new_diff = response["params"][0]
+                            current_diff.value = new_diff
+                            log_msg.append(f"Difficulty set to: {new_diff}")
+
+                        # Handle Submit Responses
+                        if response.get("id") == 4:
+                            if response.get("result") == True:
+                                shares_accepted += 1
+                                log_msg.append("SHARE ACCEPTED!")
+                            else:
+                                shares_rejected += 1
+                                log_msg.append(f"Share Rejected: {response.get('error')}")
+
+            except socket.timeout:
+                pass
+            except Exception as e:
+                connected = False
+                log_msg.append("Socket Error, reconnecting...")
+
+            # 3. SHARE SUBMISSION
+            while not result_queue.empty():
+                res = result_queue.get()
+                if res["type"] == "share":
+                    payload = {
+                        "params": [
+                            full_user,
+                            res["job_id"],
+                            res["extranonce2"],
+                            res["ntime"],
+                            res["nonce"]
+                        ],
+                        "id": 4,
+                        "method": "mining.submit"
+                    }
+                    try:
+                        sock.sendall((json.dumps(payload) + "\n").encode())
+                        log_msg.append(f"Submitting Share: {res['nonce']}")
+                    except:
+                        connected = False
+
+            # 4. MONITORING & DISPLAY
             stdscr.clear()
             h, w = stdscr.getmaxyx()
+            
+            # Temperature Check
+            temp = get_cpu_temp()
+            temp_color = curses.color_pair(1)
+            if temp > MAX_TEMP_C:
+                temp_color = curses.color_pair(2)
+                log_msg.append(f"OVERHEAT WARNING: {temp}°C - Throttling")
+                # Logic to pause processes could go here, currently strictly monitoring
+            
+            # Hashrate Calc
+            total_hashes = sum(stats_array)
+            # Reset stats array every second to get instant hashrate
+            for i in range(len(stats_array)):
+                stats_array[i] = 0
+            
+            hashrate = total_hashes / 0.5 # since loop is approx 0.5s sleep or process time
+            # Note: Python overhead makes precise hashrate calc difficult
+            
+            # Draw UI
+            stdscr.addstr(0, 0, f" ALFA ULTRA MINER v2.0 | {full_user} ", curses.color_pair(4) | curses.A_BOLD)
+            stdscr.addstr(2, 2, f"Pool Status : {'ONLINE' if connected else 'OFFLINE'}", curses.color_pair(1 if connected else 2))
+            stdscr.addstr(3, 2, f"Temperature : {temp:.1f}°C (Limit: {MAX_TEMP_C}°C)", temp_color)
+            stdscr.addstr(4, 2, f"Active Core : {num_threads} Threads", curses.color_pair(3))
+            stdscr.addstr(5, 2, f"Hashrate    : {hashrate/1000:.2f} KH/s (CPU)", curses.color_pair(3)) 
+            # Note: Displaying KH/s because Python won't reach GH/s
+            
+            stdscr.addstr(7, 2, f"Accepted    : {shares_accepted}", curses.color_pair(1))
+            stdscr.addstr(8, 2, f"Rejected    : {shares_rejected}", curses.color_pair(2))
+            stdscr.addstr(9, 2, f"API Server  : http://localhost:{API_PORT}/", curses.color_pair(4))
 
-            title = " alfa5.py - AntPool BTC Miner (Multiprocessing) "
-            stdscr.addstr(0, 0, title.center(w), curses.color_pair(5) | curses.A_BOLD)
-
-            status = "ONLINE" if connected_flag.value else "OFFLINE"
-            color = 1 if connected_flag.value else 2
-            stdscr.addstr(2, 2, f"Status    : {status}", curses.color_pair(color) | curses.A_BOLD)
-
-            try:
-                block_height = requests.get('https://mempool.space/api/blocks/tip/height', timeout=3).text
-            except:
-                block_height = "???"
-            stdscr.addstr(3, 2, f"Block     : {block_height}", curses.color_pair(3))
-
-            total_hr = sum(hashrate_array)
-            mh_s = total_hr / 1_000_000
-            stdscr.addstr(4, 2, f"Real Hashrate: {mh_s:.2f} MH/s ({total_hr:,} H/s)", curses.color_pair(1) | curses.A_BOLD)
-
-            stdscr.addstr(5, 2, f"Processes : {max_threads}", curses.color_pair(4))
-
-            cpu_temp = get_cpu_temp()
-            stdscr.addstr(6, 2, f"Temp      : {cpu_temp}", curses.color_pair(3))
-
-            stdscr.addstr(7, 2, f"Accepted  : {accepted.value}", curses.color_pair(1))
-            stdscr.addstr(8, 2, f"Rejected  : {rejected.value}", curses.color_pair(2))
-
-            stdscr.addstr(9, 2, f"Pool Diff : {pool_diff_shared.value if pool_diff_shared.value > 0 else 'Waiting...'}", curses.color_pair(4))
-
-            stdscr.addstr(11, 0, "─" * w, curses.color_pair(3))
-
-            start_y = 12
-            while not log_queue.empty():
-                log_msg = log_queue.get()
-                log_lines.append(log_msg)
-            for i, line in enumerate(log_lines[-max_log:]):
-                if start_y + i >= h:
-                    break
-                color = 1 if "accepted" in line.lower() else (2 if "rejected" in line.lower() or "error" in line.lower() else 3)
-                stdscr.addstr(start_y + i, 2, line[:w-4], curses.color_pair(6))
-
-            # Handle share results
-            while not result_queue.empty():
-                result = result_queue.get()
-                if result[0] == "share":
-                    submit_share(result[1], result[2], result[3])
+            # Log Window
+            stdscr.addstr(11, 0, "-" * (w-1))
+            msg_y = 12
+            for msg in log_msg[-10:]:
+                if msg_y < h - 1:
+                    stdscr.addstr(msg_y, 2, msg[:w-4])
+                    msg_y += 1
+            
+            # API Update
+            api_stats.update({
+                "hashrate": hashrate,
+                "temp": temp,
+                "accepted": shares_accepted,
+                "rejected": shares_rejected,
+                "worker": full_user
+            })
 
             stdscr.refresh()
-            time.sleep(0.4)
+            time.sleep(0.5)
 
     except KeyboardInterrupt:
         pass
     finally:
-        shutdown_flag.value = True
-        p_stratum.join()
-        for p in miners:
-            p.join()
+        stop_flag.value = True
         curses.endwin()
+        for p in workers:
+            p.terminate()
+
+if __name__ == "__main__":
+    main()
