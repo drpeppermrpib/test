@@ -17,10 +17,7 @@ from flask import Flask, jsonify
 # ================= CONFIGURATION =================
 API_PORT = 60060
 MAX_TEMP_C = 79.0  
-# Port 443 or 25 are often used for low-diff/bypass on AntPool
-DEFAULT_POOL = "ss.antpool.com"
-DEFAULT_PORT = 443 
-VERSION_STRING = "AlfaUltra/5.1-LowDiff"
+VERSION_STRING = "AlfaUltra/5.2-Status-Fixed"
 
 # ================= UTILS & MATH =================
 def swap_endian_hex(hex_str):
@@ -60,20 +57,21 @@ def miner_process(worker_id, job_queue, result_queue, stop_flag, stats_array, cu
             extranonce2 = f"{extranonce2_int:08x}"
             coinbase_bin = binascii.unhexlify(coinb1 + extranonce2 + coinb2)
             
+            # Double SHA256 Merkle Root
             merkle_root = hashlib.sha256(hashlib.sha256(coinbase_bin).digest()).digest()
             for branch in merkle_branch:
                 merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + binascii.unhexlify(branch)).digest()).digest()
             
+            # Prepare Header
             header_pre = (binascii.unhexlify(version)[::-1] + 
                           binascii.unhexlify(swap_endian_hex(prevhash)) + 
                           merkle_root + 
                           binascii.unhexlify(ntime)[::-1] + 
                           binascii.unhexlify(nbits)[::-1])
             
-            # Use the atomic current_diff.value
             target = diff_to_target(current_diff.value)
             nonce = worker_id * 20000000
-            batch_size = 35000 
+            batch_size = 40000 
             
             while not stop_flag.value:
                 if not job_queue.empty(): break
@@ -106,7 +104,7 @@ def run_api(stats_dict):
     @app.route('/')
     def status():
         return jsonify({
-            "status": "Online",
+            "status": stats_dict.get("status", "Offline"),
             "miner": VERSION_STRING,
             "hashrate_khs": stats_dict.get("hashrate", 0) / 500,
             "temp_c": stats_dict.get("temp", 0),
@@ -121,8 +119,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--username", required=True)
     parser.add_argument("--worker", default="001")
-    parser.add_argument("--pool", default=DEFAULT_POOL)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--pool", default="ss.antpool.com")
+    parser.add_argument("--port", type=int, default=3333)
     args = parser.parse_args()
 
     clean_pool = args.pool.replace("stratum+tcp://", "").split(":")[0]
@@ -139,54 +137,55 @@ def main():
     
     num_threads = mp.cpu_count()
     job_queue = mp.Queue(); result_queue = mp.Queue()
-    stop_flag = mp.Value('b', False)
-    # Start with a very low diff (1) to help worker appear online faster
-    current_diff = mp.Value('d', 1.0) 
+    stop_flag = mp.Value('b', False); current_diff = mp.Value('d', 512.0)
     throttle_factor = mp.Value('d', 0.0)
     stats_array = mp.Array('i', [0] * num_threads)
     
     workers = [mp.Process(target=miner_process, args=(i, job_queue, result_queue, stop_flag, stats_array, current_diff, throttle_factor)) for i in range(num_threads)]
     for w in workers: w.start()
 
-    api_stats = {"accepted": 0, "hashrate": 0, "temp": 0, "diff": 1, "is_throttling": False}
+    # Initial API state
+    api_stats = {"status": "Starting", "accepted": 0, "hashrate": 0, "temp": 0, "diff": 512, "is_throttling": False}
     threading.Thread(target=run_api, args=(api_stats,), daemon=True).start()
 
     sock = None
     connected = False
     shares_accepted = 0
-    log_msg = ["Starting AlfaUltra v5.1..."]
+    log_msg = ["Initializing AlfaUltra v5.2..."]
     last_keepalive = time.time()
 
     try:
         while True:
             if not connected:
                 try:
+                    api_stats["status"] = "Connecting"
                     if sock: sock.close()
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.settimeout(10)
                     sock.connect((clean_pool, args.port))
                     
-                    # 1. Subscribe
+                    # Connection sequence
                     sock.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": [VERSION_STRING]}) + "\n").encode())
-                    # 2. Authorize
                     sock.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [full_user, "x"]}) + "\n").encode())
-                    # 3. Suggest difficulty (helps CPU miners stay online)
+                    
+                    # FORCE LOW DIFF: Tells AntPool to give the CPU easier work immediately
                     sock.sendall((json.dumps({"id": 3, "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
                     
                     connected = True
-                    log_msg.append(f"Connected: {clean_pool}:{args.port}")
+                    api_stats["status"] = "Online"
+                    log_msg.append(f"Connected to {clean_pool}")
                 except Exception as e:
-                    log_msg.append(f"Retry: {e}")
+                    api_stats["status"] = "Offline"
+                    log_msg.append(f"Connect Fail: {e}")
                     time.sleep(5); continue
 
-            # Keep-Alive
+            # Keep-Alive 
             if time.time() - last_keepalive > 60:
                 try:
                     sock.sendall(b'{"id":0,"method":"mining.noop","params":[]}\n')
                     last_keepalive = time.time()
                 except: connected = False
 
-            # Stratum traffic
             try:
                 sock.settimeout(0.3)
                 data = sock.recv(4096).decode()
@@ -198,7 +197,6 @@ def main():
                     if resp.get("method") == "mining.notify":
                         while not job_queue.empty(): job_queue.get_nowait()
                         for _ in range(num_threads): job_queue.put(tuple(resp["params"]))
-                        log_msg.append(f"Job: {resp['params'][0][:8]} (Low Diff Active)")
                     elif resp.get("method") == "mining.set_difficulty":
                         current_diff.value = float(resp["params"][0])
                         api_stats["diff"] = current_diff.value
@@ -206,7 +204,7 @@ def main():
                         if resp.get("result"): 
                             shares_accepted += 1
                             api_stats["accepted"] = shares_accepted
-                            log_msg.append("*** SHARE ACCEPTED (ONLINE) ***")
+                            log_msg.append("*** SHARE ACCEPTED ***")
             except: pass
 
             # Thermal Governor (79C)
@@ -232,10 +230,12 @@ def main():
             api_stats["hashrate"] = h
             for i in range(len(stats_array)): stats_array[i] = 0
             
-            stdscr.addstr(0, 0, f" ALFA ULTRA DASHBOARD | {full_user} ".center(stdscr.getmaxyx()[1]), curses.color_pair(5) | curses.A_BOLD)
-            stdscr.addstr(2, 2, f"Status    : {'ONLINE' if connected else 'OFFLINE'}", curses.color_pair(1 if connected else 2))
-            stdscr.addstr(3, 2, f"Temp      : {temp:.1f}°C (Governor: {MAX_TEMP_C}°C)", curses.color_pair(3 if temp > MAX_TEMP_C - 2 else 1))
-            stdscr.addstr(4, 2, f"Hashrate  : {h/500:.2f} KH/s", curses.color_pair(4))
+            title = f" ALFA ULTRA DASHBOARD | {full_user} | {clean_pool} "
+            stdscr.addstr(0, 0, title.center(stdscr.getmaxyx()[1]), curses.color_pair(5) | curses.A_BOLD)
+
+            stdscr.addstr(2, 2, f"Status    : {api_stats['status']}", curses.color_pair(1 if connected else 2))
+            stdscr.addstr(3, 2, f"Temp      : {temp:.1f}°C | Throttle: {MAX_TEMP_C}°C", curses.color_pair(3 if temp > MAX_TEMP_C - 2 else 1))
+            stdscr.addstr(4, 2, f"Hashrate  : {h/500:.2f} KH/s", curses.color_pair(1))
             stdscr.addstr(5, 2, f"Dashboard : http://localhost:{API_PORT}/", curses.color_pair(4))
 
             msg_y = 8
