@@ -73,7 +73,7 @@ def miner_process(worker_id, job_queue, result_queue, stop_flag, stats_array, cu
             
             target = diff_to_target(current_diff.value)
             nonce = worker_id * 10000000
-            batch_size = 100000  # High load
+            batch_size = 100000
             
             while not stop_flag.value:
                 if not job_queue.empty(): break
@@ -113,6 +113,10 @@ def main():
     curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
     curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLACK)
     
     num_threads = mp.cpu_count()
     job_queue = mp.Queue(); result_queue = mp.Queue()
@@ -136,7 +140,7 @@ def main():
                 try:
                     if sock: sock.close()
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(120)  # 120sec timeout
+                    sock.settimeout(120)
                     sock.connect((clean_pool, args.port))
                     sock.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": [VERSION_STRING]}) + "\n").encode())
                     sock.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [full_user, "x"]}) + "\n").encode())
@@ -183,15 +187,31 @@ def main():
             h = sum(stats_array)
             for i in range(len(stats_array)): stats_array[i] = 0
             
-            stdscr.addstr(0, 0, f" ALFA ULTRA | {full_user} | {clean_pool}:{args.port}", curses.A_BOLD)
-            stdscr.addstr(2, 2, f"Status: {'ONLINE' if connected else 'OFFLINE'}", curses.color_pair(1 if connected else 2))
-            stdscr.addstr(3, 2, f"Temp  : {temp:.1f}°C | Limit: {MAX_TEMP_C}°C")
-            stdscr.addstr(4, 2, f"Speed : {h/500:.2f} KH/s")
-            stdscr.addstr(5, 2, f"Shares: Acc {shares_accepted} / Rej {shares_rejected}")
-            
-            msg_y = 7
+            # Pretty print title
+            title = f" ALFA ULTRA | {full_user} | {clean_pool}:{args.port} "
+            stdscr.addstr(0, 0, title.center(stdscr.getmaxyx()[1]), curses.color_pair(5) | curses.A_BOLD)
+
+            # Pretty status
+            status_text = "ONLINE" if connected else "OFFLINE"
+            status_color = 1 if connected else 2
+            stdscr.addstr(2, 2, f"Status    : {status_text}", curses.color_pair(status_color) | curses.A_BOLD)
+
+            # Temp with pretty format
+            stdscr.addstr(3, 2, f"Temp      : {temp:.1f}°C | Limit: {MAX_TEMP_C}°C", curses.color_pair(3))
+
+            # Hashrate pretty
+            kh_s = h / 500
+            stdscr.addstr(4, 2, f"Speed     : {kh_s:.2f} KH/s", curses.color_pair(1) | curses.A_BOLD)
+
+            # Shares pretty
+            stdscr.addstr(5, 2, f"Shares    : Acc {shares_accepted} / Rej {shares_rejected}", curses.color_pair(1 if shares_accepted > shares_rejected else 2))
+
+            # Log section with pretty header
+            stdscr.addstr(7, 2, "Log:", curses.color_pair(4) | curses.A_UNDERLINE)
+            msg_y = 8
             for m in log_msg[-8:]:
-                stdscr.addstr(msg_y, 2, f"> {m}")
+                color = 1 if "ACCEPTED" in m else (2 if "rejected" in m.lower() or "error" in m.lower() else 3)
+                stdscr.addstr(msg_y, 2, f"> {m}", curses.color_pair(color))
                 msg_y += 1
             
             api_stats.update({"hashrate": h, "temp": temp, "accepted": shares_accepted, "rejected": shares_rejected})
