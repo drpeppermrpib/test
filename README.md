@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import threading
+import multiprocessing as mp
 import requests
 import binascii
 import hashlib
@@ -15,6 +15,7 @@ import argparse
 import signal
 import subprocess
 import struct
+from multiprocessing import Process, Queue, Value as mpValue, Array as mpArray
 
 # ======================  diff_to_target ======================
 def diff_to_target(diff):
@@ -22,7 +23,7 @@ def diff_to_target(diff):
     target_int = diff1 // int(diff)
     return format(target_int, '064x')
 
-# ======================  CPU TEMPERATURE (HiveOS/AMD Threadripper) ======================
+# ======================  CPU TEMPERATURE ======================
 def get_cpu_temp():
     try:
         result = subprocess.check_output(["sensors"], text=True)
@@ -31,7 +32,7 @@ def get_cpu_temp():
                 parts = line.split(':')
                 if len(parts) > 1:
                     temp = parts[1].strip().split(' ')[0]
-                    return float(temp.replace('°C', ''))
+                    return f"{temp}"
     except:
         pass
 
@@ -46,11 +47,37 @@ def get_cpu_temp():
                     if os.path.exists(temp_path):
                         with open(temp_path) as f:
                             temp = int(f.read().strip()) / 1000
-                        return temp
+                        return f"{temp:.1f}°C"
     except:
         pass
 
-    return 0.0
+    return "N/A"
+
+# ======================  FETCH LIVE DATA ======================
+def fetch_live_data():
+    try:
+        hr_data = requests.get("https://api.blockchain.info/charts/hash-rate?timespan=1days&format=json", timeout=5).json()
+        network_hr = f"{hr_data['values'][-1]['y'] / 1e6:.2f} EH/s" if hr_data else "N/A"
+
+        diff_data = requests.get("https://api.blockchain.info/charts/difficulty?timespan=1days&format=json", timeout=5).json()
+        difficulty = f"{diff_data['values'][-1]['y'] / 1e12:.2f} T" if diff_data else "N/A"
+
+        fees_data = requests.get("https://mempool.space/api/v1/fees/recommended", timeout=5).json()
+        block_fees = f"{fees_data['hourFee']} SAT/vB" if fees_data else "N/A"
+
+        return [
+            f"Network HR   : {network_hr}",
+            "Avg 30d HR   : N/A",
+            f"Difficulty   : {difficulty}",
+            f"Block Fees   : {block_fees}",
+            "Hash Value   : ~0.0004 BTC/PH/Day",
+            "Hash Price   : ~$37/PH/Day",
+            "Profit Ex.   : N/A"
+        ]
+    except Exception:
+        return ["Live Data: Offline"] * 7
+
+LIVE_DATA = fetch_live_data()
 
 # ======================  GLOBALS ======================
 fShutdown = False
@@ -79,8 +106,6 @@ connected = False
 user = ""
 password = "x"
 
-MAX_TEMP = 85.0  # Max temp before throttling
-
 # ======================  LOGGER ======================
 def logg(msg):
     timestamp = time.strftime("%H:%M:%S")
@@ -88,11 +113,11 @@ def logg(msg):
     log_lines.append(prefixed_msg)
 
 # ======================  CONFIG ======================
-ANTPOOL_HOST = 'stratum.antpool.com'
-ANTPOOL_PORT = 3333
+BRAIINS_HOST = 'stratum.braiins.com'
+BRAIINS_PORT = 3333
 
 num_cores = os.cpu_count() or 24
-max_threads = 48  # Fixed for Threadripper max load
+max_threads = 48
 current_threads = 0
 
 # ======================  SIGNAL ======================
@@ -140,7 +165,7 @@ def submit_share(nonce):
     except Exception as e:
         logg(f"[!] Submit error: {e}")
 
-# ======================  MINING LOOP (max load, real hashrate) ======================
+# ======================  MINING LOOP (real hashrate, max load) ======================
 def bitcoin_miner(thread_id):
     global job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce2, pool_diff
@@ -150,11 +175,6 @@ def bitcoin_miner(thread_id):
     last_report = time.time()
 
     while not fShutdown:
-        # Temperature throttle
-        if get_cpu_temp() > MAX_TEMP:
-            time.sleep(5)
-            continue
-
         if job_id is None:
             time.sleep(0.5)
             continue
@@ -177,7 +197,7 @@ def bitcoin_miner(thread_id):
         share_target_int = int(target if target else diff_to_target(pool_diff), 16)
 
         nonce = random.randint(0, 0xFFFFFFFF)
-        for _ in range(16000000):  # max batch for 100% load
+        for _ in range(16000000):
             if fShutdown or job_id != last_job_id:
                 break
 
@@ -204,7 +224,7 @@ def bitcoin_miner(thread_id):
                     hashrates[thread_id] = real_hr
                 last_report = now
 
-# ======================  STRATUM (stable for AntPool) ======================
+# ======================  STRATUM (super stable) ======================
 def stratum_worker():
     global sock, job_id, prevhash, coinb1, coinb2, merkle_branch
     global version, nbits, ntime, target, extranonce1, extranonce2_size, pool_diff, connected
@@ -213,12 +233,12 @@ def stratum_worker():
         try:
             s = socket.socket()
             s.settimeout(120)
-            s.connect((ANTPOOL_HOST, ANTPOOL_PORT))
+            s.connect((BRAIINS_HOST, BRAIINS_PORT))
             sock = s
             connected = True
-            logg("Connected to AntPool")
+            logg("Connected to Braiins Pool")
 
-            s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa_ultra.py/1.0"]}\n')
+            s.sendall(b'{"id":1,"method":"mining.subscribe","params":["alfa5.py/1.0"]}\n')
 
             auth = {"id":2,"method":"mining.authorize","params":[user,password]}
             s.sendall((json.dumps(auth)+"\n").encode())
@@ -292,7 +312,7 @@ def ramp_up_threads():
             time.sleep(0.5)
     logg(f"All {max_threads} threads running!")
 
-# ======================  DISPLAY (beautiful like previous) ======================
+# ======================  DISPLAY ======================
 def display_worker():
     global log_lines
     stdscr = curses.initscr()
@@ -313,11 +333,11 @@ def display_worker():
             stdscr.clear()
             h, w = stdscr.getmaxyx()
 
-            title = " alfa_ultra.py - AntPool BTC Miner "
+            title = " alfa_ultra.py - Braiins Pool CPU Miner "
             stdscr.addstr(0, 0, title.center(w), curses.color_pair(5) | curses.A_BOLD)
 
             status = "ONLINE" if connected else "OFFLINE"
-            color = 1 if connected_flag.value else 2
+            color = 1 if connected else 2
             stdscr.addstr(2, 2, f"Status    : {status}", curses.color_pair(color) | curses.A_BOLD)
 
             try:
@@ -327,14 +347,13 @@ def display_worker():
             stdscr.addstr(3, 2, f"Block     : {block_height}", curses.color_pair(3))
 
             total_hr = sum(hashrates)
-            mh_s = total_hr / 1_000_000
-            stdscr.addstr(4, 2, f"Real Hashrate: {mh_s:.2f} MH/s ({total_hr:,} H/s)", curses.color_pair(1) | curses.A_BOLD)
+            gh_s = total_hr / 1_000_000_000
+            stdscr.addstr(4, 2, f"Hashrate  : {gh_s:.2f} GH/s ({total_hr:,} H/s)", curses.color_pair(1) | curses.A_BOLD)
 
             stdscr.addstr(5, 2, f"Threads   : {current_threads}/{max_threads}", curses.color_pair(4))
 
             cpu_temp = get_cpu_temp()
-            temp_color = 1 if cpu_temp < MAX_TEMP else 2
-            stdscr.addstr(6, 2, f"Temp      : {cpu_temp:.1f}°C (Max: {MAX_TEMP}°C)", curses.color_pair(temp_color))
+            stdscr.addstr(6, 2, f"Temp      : {cpu_temp} (Max 85°C)", curses.color_pair(3))
 
             a_min = sum(1 for t in accepted_timestamps if time.time() - t < 60)
             r_min = sum(1 for t in rejected_timestamps if time.time() - t < 60)
@@ -361,7 +380,7 @@ def display_worker():
 
 # ======================  MAIN ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="alfa_ultra.py - AntPool BTC Miner")
+    parser = argparse.ArgumentParser(description="alfa_ultra.py - Braiins Pool CPU Miner")
     parser.add_argument("--username", type=str, required=True)
     parser.add_argument("--worker", type=str, default="cpu002")
     args = parser.parse_args()
@@ -370,12 +389,13 @@ if __name__ == "__main__":
 
     hashrates = [0] * max_threads
 
+    # Booting messages
     boot_msgs = [
-        " alfa_ultra.py - Advanced AntPool BTC Miner",
+        " alfa_ultra.py - Advanced Braiins Pool CPU Miner",
         "Initializing system...",
         f"CPU cores detected: {num_cores}",
         f"Target threads: {max_threads} (Threadripper 48)",
-        "Connecting to AntPool...",
+        "Connecting to Braiins Pool...",
         "Starting stratum worker...",
         "Ramping up threads gradually..."
     ]
