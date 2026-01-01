@@ -11,14 +11,14 @@ import sys
 import os
 import argparse
 import struct
-import threading
-import logging
+import subprocess
 from datetime import datetime
 from flask import Flask, jsonify
+import threading
 
 # ================= CONFIGURATION =================
 API_PORT = 60060
-MAX_TEMP_C = 85.0  # Changed to 85°C as requested
+MAX_TEMP_C = 85.0
 VERSION_STRING = "AlfaUltra/2.0"
 
 # ================= UTILS & MATH =================
@@ -39,7 +39,8 @@ def get_cpu_temp():
             if "Tdie" in line or "Tctl" in line:
                 parts = line.split("+")
                 if len(parts) > 1:
-                    return float(parts[1].split("°")[0])
+                    temp_str = parts[1].split("°")[0].strip()
+                    return float(temp_str)
     except: pass
     return 0.0
 
@@ -72,7 +73,7 @@ def miner_process(worker_id, job_queue, result_queue, stop_flag, stats_array, cu
             
             target = diff_to_target(current_diff.value)
             nonce = worker_id * 10000000
-            batch_size = 100000  # Increased batch for higher load
+            batch_size = 100000  # High load
             
             while not stop_flag.value:
                 if not job_queue.empty(): break
@@ -99,7 +100,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--username", required=True)
     parser.add_argument("--worker", default="001")
-    parser.add_argument("--pool", default="stratum.antpool.com")  # AntPool
+    parser.add_argument("--pool", default="stratum.antpool.com")
     parser.add_argument("--port", type=int, default=3333)
     args = parser.parse_args()
 
@@ -127,7 +128,7 @@ def main():
     sock = None
     connected = False
     shares_accepted = 0; shares_rejected = 0
-    log_msg = ["Initializing Miner..."]
+    log_msg = ["Initializing AlfaUltra..."]
 
     try:
         while True:
@@ -135,12 +136,12 @@ def main():
                 try:
                     if sock: sock.close()
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(120)  # 120sec timeout for connection
+                    sock.settimeout(120)  # 120sec timeout
                     sock.connect((clean_pool, args.port))
                     sock.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": [VERSION_STRING]}) + "\n").encode())
                     sock.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [full_user, "x"]}) + "\n").encode())
                     connected = True
-                    log_msg.append(f"Connected to {clean_pool}")
+                    log_msg.append(f"Connected to {clean_pool}:{args.port}")
                 except Exception as e:
                     log_msg.append(f"Connect Fail: {e}")
                     time.sleep(5); continue
@@ -159,9 +160,14 @@ def main():
                         log_msg.append(f"New Job: {resp['params'][0][:8]}")
                     elif resp.get("method") == "mining.set_difficulty":
                         current_diff.value = float(resp["params"][0])
+                        log_msg.append(f"Difficulty set to {current_diff.value}")
                     elif resp.get("id") == 4:
-                        if resp.get("result"): shares_accepted += 1; log_msg.append("SHARE ACCEPTED")
-                        else: shares_rejected += 1; log_msg.append("SHARE REJECTED")
+                        if resp.get("result"): 
+                            shares_accepted += 1
+                            log_msg.append("*** SHARE ACCEPTED ***")
+                        else: 
+                            shares_rejected += 1
+                            log_msg.append("[!] Share rejected")
             except socket.timeout: pass
             except Exception: connected = False
 
@@ -177,10 +183,10 @@ def main():
             h = sum(stats_array)
             for i in range(len(stats_array)): stats_array[i] = 0
             
-            stdscr.addstr(0, 0, f" ALFA ULTRA | {full_user} | {clean_pool}", curses.A_BOLD)
+            stdscr.addstr(0, 0, f" ALFA ULTRA | {full_user} | {clean_pool}:{args.port}", curses.A_BOLD)
             stdscr.addstr(2, 2, f"Status: {'ONLINE' if connected else 'OFFLINE'}", curses.color_pair(1 if connected else 2))
             stdscr.addstr(3, 2, f"Temp  : {temp:.1f}°C | Limit: {MAX_TEMP_C}°C")
-            stdscr.addstr(4, 2, f"Speed : {h/500:.2f} KH/s")  # Real hashrate (no fake)
+            stdscr.addstr(4, 2, f"Speed : {h/500:.2f} KH/s")
             stdscr.addstr(5, 2, f"Shares: Acc {shares_accepted} / Rej {shares_rejected}")
             
             msg_y = 7
@@ -188,7 +194,7 @@ def main():
                 stdscr.addstr(msg_y, 2, f"> {m}")
                 msg_y += 1
             
-            api_stats.update({"hashrate": h, "temp": temp, "accepted": shares_accepted})
+            api_stats.update({"hashrate": h, "temp": temp, "accepted": shares_accepted, "rejected": shares_rejected})
             stdscr.refresh()
             time.sleep(0.5)
 
