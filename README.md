@@ -15,6 +15,7 @@ import subprocess
 from datetime import datetime
 from flask import Flask, jsonify
 import threading
+import curses
 
 # ================= CONFIGURATION =================
 API_PORT = 60060
@@ -107,7 +108,6 @@ def main():
     clean_pool = args.pool.replace("stratum+tcp://", "").split(":")[0]
     full_user = f"{args.username}.{args.worker}"
     
-    import curses
     stdscr = curses.initscr()
     curses.noecho(); curses.cbreak(); stdscr.nodelay(1)
     curses.start_color()
@@ -187,7 +187,7 @@ def main():
             h = sum(stats_array)
             for i in range(len(stats_array)): stats_array[i] = 0
             
-            # Pretty print title
+            # Pretty title
             title = f" ALFA ULTRA | {full_user} | {clean_pool}:{args.port} "
             stdscr.addstr(0, 0, title.center(stdscr.getmaxyx()[1]), curses.color_pair(5) | curses.A_BOLD)
 
@@ -196,7 +196,7 @@ def main():
             status_color = 1 if connected else 2
             stdscr.addstr(2, 2, f"Status    : {status_text}", curses.color_pair(status_color) | curses.A_BOLD)
 
-            # Temp with pretty format
+            # Temp pretty
             stdscr.addstr(3, 2, f"Temp      : {temp:.1f}°C | Limit: {MAX_TEMP_C}°C", curses.color_pair(3))
 
             # Hashrate pretty
@@ -206,13 +206,17 @@ def main():
             # Shares pretty
             stdscr.addstr(5, 2, f"Shares    : Acc {shares_accepted} / Rej {shares_rejected}", curses.color_pair(1 if shares_accepted > shares_rejected else 2))
 
-            # Log section with pretty header
+            # Log header
             stdscr.addstr(7, 2, "Log:", curses.color_pair(4) | curses.A_UNDERLINE)
+
+            # 40 lines of small log text
             msg_y = 8
-            for m in log_msg[-8:]:
+            for m in log_msg[-40:]:
                 color = 1 if "ACCEPTED" in m else (2 if "rejected" in m.lower() or "error" in m.lower() else 3)
                 stdscr.addstr(msg_y, 2, f"> {m}", curses.color_pair(color))
                 msg_y += 1
+                if msg_y >= stdscr.getmaxyx()[0] - 1:
+                    break
             
             api_stats.update({"hashrate": h, "temp": temp, "accepted": shares_accepted, "rejected": shares_rejected})
             stdscr.refresh()
