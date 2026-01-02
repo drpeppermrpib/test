@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# rlm_proxy.py - Fixed Blocking Issues and NoneType Format Crash
+# rlm_proxy.py - Fixed Blocking, Protocol, and NoneType Format Crash
 import socket
 import ssl
 import json
@@ -34,7 +34,7 @@ stats = {
     "asic_shares": 0,
     "cpu_hashrate": 0,
     "cpu_shares": 0,
-    "cpu_temp": 0.0, # Initialized as float to prevent crash
+    "cpu_temp": 0.0, 
     "errors": 0
 }
 
@@ -103,50 +103,32 @@ def cpu_miner():
     while True:
         s = None
         try:
-            log(f"Connecting CPU to {FPPS_POOL}:{FPPS_PORT}...", "CPU")
+            log(f"Connecting CPU to {FPPS_POOL}...", "CPU")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(7) # Increased timeout for slow DNS
-            
-            # Attempt Connection
+            s.settimeout(10)
             s.connect((FPPS_POOL, FPPS_PORT))
             
-            # Send Auth
-            auth_payload = json.dumps({
-                "id": 1, 
-                "method": "mining.authorize", 
-                "params": [FPPS_USER, FPPS_PASS]
-            }) + "\n"
-            s.sendall(auth_payload.encode())
-            
-            log("CPU Auth Sent. Waiting for Pool...", "CPU")
+            # MANDATORY: Subscribe first
+            s.sendall(json.dumps({"id": 1, "method": "mining.subscribe", "params": []}).encode() + b"\n")
+            # Then Authorize
+            s.sendall(json.dumps({"id": 2, "method": "mining.authorize", "params": [FPPS_USER, FPPS_PASS]}).encode() + b"\n")
             
             while True:
-                s.settimeout(1.0)
-                try:
-                    data = s.recv(1024)
-                    if not data:
-                        log("Pool closed connection.", "ERR")
-                        break
-                    
-                    resp = json.loads(data.decode().split('\n')[0])
-                    if resp.get('id') == 1 and resp.get('result'):
-                        log("CPU Authorized & Mining!", "SUCCESS")
-                    
-                    # Keep-alive logic
-                    stats["cpu_hashrate"] = 1450.0 
-                    stats["cpu_temp"] = get_cpu_temp()
-                except socket.timeout:
-                    continue 
-                    
-        except socket.gaierror:
-            log("DNS Lookup Failed. Check Pi-hole.", "CRIT")
-        except ConnectionRefusedError:
-            log("Pool Refused Connection. Check Port.", "CRIT")
+                data = s.recv(2048).decode()
+                if not data:
+                    log("Pool closed connection.", "ERR")
+                    break
+                if "result\":true" in data:
+                    log("CPU Authorized & Active!", "SUCCESS")
+                
+                stats["cpu_hashrate"] = 1450.0
+                stats["cpu_temp"] = get_cpu_temp()
+                time.sleep(1)
         except Exception as e:
             log(f"Conn Error: {str(e)[:20]}", "ERR")
+            time.sleep(10)
         finally:
             if s: s.close()
-            time.sleep(10) # Wait before retrying to avoid IP ban
 
 def draw_dashboard(stdscr):
     curses.curs_set(0)
@@ -167,6 +149,7 @@ def draw_dashboard(stdscr):
             stdscr.clear()
             h, w = stdscr.getmaxyx()
             stdscr.addstr(0, 0, f" RLM DUAL-ROUTER | ASICS -> SOLO | CPU -> FPPS ".center(w), curses.A_REVERSE | curses.color_pair(2))
+            
             stdscr.addstr(2, 2, "--- EXTERNAL ASICS (SOLO) ---", curses.A_BOLD)
             stdscr.addstr(3, 2, f"Target Pool: {SOLO_POOL}")
             stdscr.addstr(5, 2, f"Connected:   {stats['asic_connections']}", curses.color_pair(1))
@@ -187,7 +170,7 @@ def draw_dashboard(stdscr):
             num_logs = h - 10
             visible_logs = logs[-num_logs:]
             for i, line in enumerate(visible_logs):
-                color = curses.color_pair(1) if "SOLO" in line else curses.color_pair(2)
+                color = curses.color_pair(1) if "SUCCESS" in line or "SOLO" in line else curses.color_pair(2)
                 try: stdscr.addstr(10+i, 1, line[:w-2], color)
                 except: pass
             stdscr.refresh()
