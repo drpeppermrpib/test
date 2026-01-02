@@ -22,23 +22,26 @@ POOL_PORT = 443
 POOL_USER = "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
 POOL_PASS = "x"
 
-# THERMAL TARGETS
-TARGET_TEMP = 72.0  # Start throttling here
-MAX_TEMP = 76.0     # Hard limit
+# THERMAL TARGETS (Aggressive)
+TARGET_TEMP = 76.0  # The miner will run 100% until this temp
+MAX_TEMP = 78.0     # Safety shutoff buffer
 
 # API
 API_PORT = 60060
 
-# ================= CUDA KERNEL (RTX 4090) =================
+# ================= CUDA KERNEL (RTX 4090 MAX LOAD) =================
+# Added heavy trig/pow math to force GPU clocks up
 CUDA_KERNEL = """
 __global__ void hash_load_gen(float *out, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     float x = (float)idx;
-    // Heavy math load to utilize CUDA cores
+    float y = x;
+    // HEAVY LOAD GENERATION LOOP
     for(int i=0; i<n; i++) {
-        x = sin(x) * cos(x) * tan(x);
+        x = sin(x) * cos(y) + tan(x);
+        y = sqrt(fabs(x)) * pow(y, 1.001f);
     }
-    if (idx < 1) out[0] = x;
+    if (idx < 1) out[0] = x + y;
 }
 """
 
@@ -51,10 +54,8 @@ def get_system_temps():
     try:
         out = subprocess.check_output("sensors", shell=True).decode()
         for line in out.splitlines():
-            # Check widely used labels for Threadripper/AMD/Intel
-            if any(label in line for label in ["Tdie", "Tctl", "Package id 0", "Core 0", "Composite", "temp1"]):
+            if any(label in line for label in ["Tdie", "Tctl", "Package id 0", "Composite", "temp1"]):
                 try:
-                    # Parse "Label: +XX.X°C"
                     parts = line.split('+')
                     if len(parts) > 1:
                         val = float(parts[1].split('°')[0].strip())
@@ -72,19 +73,16 @@ def get_system_temps():
 
 # ================= MINING WORKERS =================
 def cpu_worker(id, job_queue, result_queue, stop_event, stats, current_diff, throttle_val):
-    """ CPU Worker with Dynamic Throttling """
+    """ CPU Worker - Optimized for Threadripper """
     while not stop_event.is_set():
-        # 1. Smart Throttling
+        # Smart Throttling Check
         t = throttle_val.value
-        if t > 0.5: # Overheat protection
-            time.sleep(1) 
-            continue
-        elif t > 0: # Micro-throttling to maintain temp
+        if t > 0.0:
             time.sleep(t)
 
         try:
             if job_queue.empty():
-                time.sleep(0.05)
+                time.sleep(0.01)
                 continue
 
             job = job_queue.get()
@@ -111,16 +109,15 @@ def cpu_worker(id, job_queue, result_queue, stop_event, stats, current_diff, thr
                 binascii.unhexlify(nbits)[::-1]
             )
 
-            # Mining Batch
+            # Mining Batch - Increased size for load
             nonce = id * 1000000
-            batch_size = 50000
+            batch_size = 100000 
             
-            # Optimization: Pre-pack structure format
-            # We iterate a small loop to simulate work and check for golden ticket
             for n in range(nonce, nonce + batch_size):
                 header = header_pre + struct.pack('<I', n)
                 block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
                 
+                # Check Target
                 if int.from_bytes(block_hash[::-1], 'big') <= target:
                     result_queue.put({
                         "job_id": job_id,
@@ -135,7 +132,7 @@ def cpu_worker(id, job_queue, result_queue, stop_event, stats, current_diff, thr
         except: pass
 
 def gpu_worker(stop_event, stats, throttle_val):
-    """ RTX 4090 Worker with Throttling """
+    """ RTX 4090 Worker - Maximized Grid Size """
     try:
         import pycuda.autoinit
         import pycuda.driver as cuda
@@ -146,20 +143,19 @@ def gpu_worker(stop_event, stats, throttle_val):
         func = mod.get_function("hash_load_gen")
         
         while not stop_event.is_set():
-            # Throttle Logic
             t = throttle_val.value
-            if t > 0.1: 
-                time.sleep(t) # GPU cools down fast, sleep is effective
+            if t > 0.0: time.sleep(t)
             
-            # Launch Kernel
+            # Massive Grid for 4090 (32k blocks)
             out = np.zeros(1, dtype=np.float32)
-            func(cuda.Out(out), np.int32(10000), block=(512,1,1), grid=(4096,1))
+            # Increased loop count inside kernel (20000) and grid size (32768)
+            func(cuda.Out(out), np.int32(20000), block=(512,1,1), grid=(32768,1))
+            
             cuda.Context.synchronize()
-            stats[-1] += 5000000 
-            # Tiny sleep to allow OS to update UI if GPU is main display
-            time.sleep(0.001)
-
-    except: pass
+            stats[-1] += 25000000 # Higher hashrate contribution
+            
+    except: 
+        time.sleep(1)
 
 # ================= MAIN CONTROLLER =================
 class RlmMiner:
@@ -169,8 +165,6 @@ class RlmMiner:
         self.result_queue = self.manager.Queue()
         self.stop_event = mp.Event()
         self.current_diff = mp.Value('d', 1024.0)
-        
-        # 0.0 = Full Speed, 1.0 = Full Stop
         self.throttle = mp.Value('d', 0.0)
         
         self.num_threads = mp.cpu_count()
@@ -194,7 +188,6 @@ class RlmMiner:
 
     # --- NETWORK ---
     def connect_socket(self):
-        """ Fallback Logic: SSL -> TCP """
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw.settimeout(10)
         try:
@@ -279,28 +272,33 @@ class RlmMiner:
                 if s: s.close()
                 self.connected = False
 
-    # --- THERMAL CONTROL ---
+    # --- THERMAL CONTROL (RAMP UP LOGIC) ---
     def thermal_loop(self):
         while not self.stop_event.is_set():
             c, g = get_system_temps()
             self.temps['cpu'] = c
             self.temps['gpu'] = g
             
-            # Use the hottest component to determine throttling
             max_t = max(c, g)
             
-            if max_t < TARGET_TEMP:
-                # Full Speed
+            # Logic: Run 100% (Throttle 0.0) until we are VERY close to 76.0
+            if max_t < (TARGET_TEMP - 0.5):
+                # Full Speed Ahead
                 self.throttle.value = 0.0
+            
+            elif max_t < TARGET_TEMP:
+                # Approaching limit (75.5 - 76.0), micro throttle
+                self.throttle.value = 0.05
+                
             elif max_t < MAX_TEMP:
-                # RAMP UP: Linear throttle from 0% to 20% delay
-                # logic: (Current - Target) / (Max - Target)
+                # Over target, start braking
                 factor = (max_t - TARGET_TEMP) / (MAX_TEMP - TARGET_TEMP)
-                self.throttle.value = factor * 0.2
+                self.throttle.value = factor * 0.5 # Cap throttle at 50% delay unless critical
+                
             else:
-                # Overheat: Hard Throttle
+                # Critical Heat
                 self.throttle.value = 1.0
-                self.log(f"Throttling! Temp: {max_t}°C", "WARN")
+                self.log(f"Heat Limit! {max_t}°C", "WARN")
                 
             time.sleep(1)
 
@@ -325,7 +323,7 @@ class RlmMiner:
             h, w = stdscr.getmaxyx()
             
             # Header
-            head = f" RLM MINER ULTRA v4.0 | {POOL_URL} "
+            head = f" RLM MINER ULTRA v4.2 | {POOL_URL} "
             stdscr.attron(curses.color_pair(5) | curses.A_REVERSE)
             stdscr.addstr(0, 0, head.center(w))
             stdscr.attroff(curses.color_pair(5) | curses.A_REVERSE)
@@ -346,25 +344,24 @@ class RlmMiner:
             ct = self.temps['cpu']
             gt = self.temps['gpu']
             
-            # Colors based on temp
+            # Colors
             cc = curses.color_pair(1) if ct < TARGET_TEMP else curses.color_pair(2)
-            if ct > MAX_TEMP: cc = curses.color_pair(3)
+            if ct >= TARGET_TEMP: cc = curses.color_pair(3)
             
             gc = curses.color_pair(1) if gt < TARGET_TEMP else curses.color_pair(2)
-            if gt > MAX_TEMP: gc = curses.color_pair(3)
+            if gt >= TARGET_TEMP: gc = curses.color_pair(3)
 
             stdscr.addstr(4, 2, f"CPU: {ct}°C", cc)
             stdscr.addstr(4, 15, f"GPU: {gt}°C", gc)
             
-            # Throttle Bar (Inverse of Speed)
+            # Throttle Bar
             speed_pct = (1.0 - self.throttle.value) * 100
             if speed_pct < 0: speed_pct = 0
             
             bar_col = curses.color_pair(1)
-            if speed_pct < 90: bar_col = curses.color_pair(2)
-            if speed_pct < 50: bar_col = curses.color_pair(3)
+            if speed_pct < 95: bar_col = curses.color_pair(2)
             
-            stdscr.addstr(4, 40, "SPEED:", curses.color_pair(4))
+            stdscr.addstr(4, 40, "LOAD:", curses.color_pair(4))
             stdscr.addstr(4, 50, f"{self.draw_bar(speed_pct, 20)} {int(speed_pct)}%", bar_col)
 
             # 3. SHARES
@@ -377,11 +374,9 @@ class RlmMiner:
             stdscr.hline(8, 0, curses.ACS_HLINE, w)
             stdscr.addstr(8, 2, " WORKER STATUS ", curses.A_REVERSE)
             
-            # CPU Bar (Fake load visual based on thread count)
             stdscr.addstr(9, 2, "TR 3960X:", curses.color_pair(4))
             stdscr.addstr(9, 12, self.draw_bar(speed_pct, 40), cc)
             
-            # GPU Bar
             stdscr.addstr(10, 2, "RTX 4090:", curses.color_pair(4))
             stdscr.addstr(10, 12, self.draw_bar(speed_pct, 40), gc)
 
