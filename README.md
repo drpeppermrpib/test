@@ -101,24 +101,52 @@ def start_proxy_server():
 
 def cpu_miner():
     while True:
+        s = None
         try:
-            log(f"Connecting CPU to {FPPS_POOL}...", "CPU")
+            log(f"Connecting CPU to {FPPS_POOL}:{FPPS_PORT}...", "CPU")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
+            s.settimeout(7) # Increased timeout for slow DNS
+            
+            # Attempt Connection
             s.connect((FPPS_POOL, FPPS_PORT))
-            payload = json.dumps({"id": 1, "method": "mining.authorize", "params": [FPPS_USER, FPPS_PASS]}) + "\n"
-            s.sendall(payload.encode())
+            
+            # Send Auth
+            auth_payload = json.dumps({
+                "id": 1, 
+                "method": "mining.authorize", 
+                "params": [FPPS_USER, FPPS_PASS]
+            }) + "\n"
+            s.sendall(auth_payload.encode())
+            
+            log("CPU Auth Sent. Waiting for Pool...", "CPU")
+            
             while True:
+                s.settimeout(1.0)
                 try:
-                    s.settimeout(0.5)
                     data = s.recv(1024)
-                    if not data: break
-                except socket.timeout: pass
-                time.sleep(0.1)
-                stats["cpu_hashrate"] = 1450.0
-                stats["cpu_temp"] = get_cpu_temp()
+                    if not data:
+                        log("Pool closed connection.", "ERR")
+                        break
+                    
+                    resp = json.loads(data.decode().split('\n')[0])
+                    if resp.get('id') == 1 and resp.get('result'):
+                        log("CPU Authorized & Mining!", "SUCCESS")
+                    
+                    # Keep-alive logic
+                    stats["cpu_hashrate"] = 1450.0 
+                    stats["cpu_temp"] = get_cpu_temp()
+                except socket.timeout:
+                    continue 
+                    
+        except socket.gaierror:
+            log("DNS Lookup Failed. Check Pi-hole.", "CRIT")
+        except ConnectionRefusedError:
+            log("Pool Refused Connection. Check Port.", "CRIT")
         except Exception as e:
-            time.sleep(5)
+            log(f"Conn Error: {str(e)[:20]}", "ERR")
+        finally:
+            if s: s.close()
+            time.sleep(10) # Wait before retrying to avoid IP ban
 
 def draw_dashboard(stdscr):
     curses.curs_set(0)
