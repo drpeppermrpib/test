@@ -9,359 +9,383 @@ import curses
 import binascii
 import struct
 import hashlib
-import subprocess
-import sys
 import os
+import sys
 from datetime import datetime
 
-# ================= CONFIGURATION =================
-# PRIMARY POOL (SOLO)
-POOL_URL = "solo.stratum.braiins.com"
-POOL_PORT = 443
-POOL_USER = "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
-POOL_PASS = "x"
+# ================= USER CONFIGURATION =================
+# 1. PRIMARY (SOLO)
+SOLO_URL = "solo.stratum.braiins.com"
+SOLO_PORT = 443
+SOLO_USER = "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
+SOLO_PASS = "x"
 
-# HARDWARE SETTINGS
-MAX_TEMP = 75.0  # Celsius
+# 2. FAILOVER (POOL - Used if Solo disconnects)
+FAILOVER_URL = "stratum.braiins.com"
+FAILOVER_PORT = 3333 # Usually TCP
+FAILOVER_USER = "drpeppermrpib.rlm"
+FAILOVER_PASS = "x"
+
+# 3. THERMAL TARGET
+TARGET_TEMP = 76.0  # The miner will throttle to hold this temp
 API_PORT = 60060
 
-# ================= CUDA ENGINE (RTX 4090) =================
-CUDA_KERNEL = """
-__global__ void hash_load_gen(float *out, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float x = (float)idx;
-    for(int i=0; i<n; i++) {
-        x = sin(x) * cos(x);
-    }
-    if (idx < 1) out[0] = x;
-}
-"""
+# ================= GPU CUDA CHECK =================
+try:
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    from pycuda.compiler import SourceModule
+    import numpy as np
+    HAS_CUDA = True
+except:
+    HAS_CUDA = False
 
-# ================= SYSTEM MONITORING =================
-def get_cpu_temp():
-    try:
-        # Check multiple potential sensor labels for Threadripper
-        zones = subprocess.check_output("sensors", shell=True).decode().split('\n')
-        max_t = 0.0
-        for line in zones:
-            if any(x in line for x in ["Tdie", "Tctl", "Package id 0", "Composite"]):
+# ================= SHARED MEMORY =================
+class SharedData:
+    def __init__(self, manager):
+        self.job_queue = manager.Queue()
+        self.result_queue = manager.Queue()
+        self.log_queue = manager.Queue()
+        
+        # Sync Variables
+        self.stop_event = manager.Event()
+        self.throttle_delay = manager.Value('d', 0.0) # Dynamic sleep time (0.0 = Full Speed)
+        
+        # Stats Dictionary
+        self.stats = manager.dict()
+        self.stats['accepted'] = 0
+        self.stats['rejected'] = 0
+        self.stats['pool_name'] = "Initializing..."
+        self.stats['connected'] = False
+        self.stats['temp_cpu'] = 0.0
+        self.stats['temp_gpu'] = 0.0
+        self.stats['difficulty'] = 1000.0
+        self.stats['gpu_load'] = 0 # 0-100%
+
+# ================= NETWORK ENGINE (FAILOVER SUPPORT) =================
+def network_thread(shared):
+    """Manages connection, handles SSL EOF errors, switches pools"""
+    
+    # Pool list: (Name, URL, Port, User, Pass, UseSSL)
+    pools = [
+        ("SOLO (Primary)", SOLO_URL, SOLO_PORT, SOLO_USER, SOLO_PASS, True),
+        ("FAILOVER (Stratum)", FAILOVER_URL, FAILOVER_PORT, FAILOVER_USER, FAILOVER_PASS, False)
+    ]
+    pool_index = 0
+
+    while not shared.stop_event.is_set():
+        name, url, port, user, pwd, use_ssl = pools[pool_index]
+        shared.stats['pool_name'] = name
+        sock = None
+        
+        try:
+            shared.log_queue.put(("WARN", f"Connecting to {name} @ {url}:{port}..."))
+            
+            # TCP Connect
+            raw_sock = socket.create_connection((url, port), timeout=10)
+            
+            # SSL Handling
+            if use_ssl:
                 try:
-                    parts = line.split('+')
-                    if len(parts) > 1:
-                        val = float(parts[1].split('°')[0].strip())
-                        if val > max_t: max_t = val
-                except: continue
-        return max_t
-    except:
-        return 0.0
+                    context = ssl.create_default_context()
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    sock = context.wrap_socket(raw_sock, server_hostname=url)
+                except ssl.SSLError as e:
+                    shared.log_queue.put(("BAD", f"SSL Fail: {e}. Retrying without SSL..."))
+                    sock = raw_sock # Fallback to TCP if SSL fails hard
+            else:
+                sock = raw_sock
 
-# ================= WORKER PROCESSES =================
-def miner_process(id, job_queue, result_queue, stop_event, stats, current_diff):
-    """ CPU Mining Worker """
-    while not stop_event.is_set():
-        try:
-            if job_queue.empty():
-                time.sleep(0.05)
-                continue
-
-            job = job_queue.get()
-            job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean = job
-
-            # Calculate Difficulty Target
-            diff = current_diff.value
-            if diff <= 0: diff = 1
-            # Standard Bitcoin diff calculation
-            target = (0xffff0000 * 2**(256-64) // int(diff)) 
-
-            # Build Header (Simplification for Python Performance)
-            extranonce2 = struct.pack('<I', id).hex().zfill(8)
-            coinbase = binascii.unhexlify(coinb1 + extranonce2 + coinb2)
-            cb_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
+            # Stratum Handshake
+            sock.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": ["RLM/4.0"]}) + "\n").encode())
+            sock.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [user, pwd]}) + "\n").encode())
             
-            merkle = cb_hash
-            for b in merkle_branch:
-                merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(b)).digest()).digest()
-
-            # Python is slow, so we check a small batch
-            # This logic proves the worker is active and correctly processing jobs
-            nonce_start = id * 1000000
-            stats[id] += 50000 # Report hashrate to UI
+            shared.stats['connected'] = True
+            shared.log_queue.put(("GOOD", f"Connected to {name}!"))
             
-            # Real mining check (unlikely to find block in Python, but logic is valid)
-            # We skip the heavy loop to keep the UI responsive and simulate load via GPU
-            time.sleep(0.01)
+            # Loop
+            sock.settimeout(0.2)
+            buffer = ""
+            fails = 0
             
-        except Exception:
-            pass
+            while not shared.stop_event.is_set():
+                # Send Shares
+                while not shared.result_queue.empty():
+                    res = shared.result_queue.get()
+                    req = json.dumps({"id": 4, "method": "mining.submit", "params": [user, res['job_id'], res['extranonce2'], res['ntime'], res['nonce']]}) + "\n"
+                    sock.sendall(req.encode())
+                    shared.log_queue.put(("INFO", f"Submitting Share > {name}"))
 
-def gpu_load_process(stop_event, stats):
-    """ RTX 4090 Load Generator """
-    try:
-        import pycuda.autoinit
-        import pycuda.driver as cuda
-        from pycuda.compiler import SourceModule
-        import numpy as np
+                # Read Data
+                try:
+                    chunk = sock.recv(4096).decode()
+                    if not chunk:
+                        raise Exception("Pool closed connection")
+                    buffer += chunk
+                    
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        if not line: continue
+                        msg = json.loads(line)
+                        
+                        if msg.get('method') == 'mining.notify':
+                            p = msg['params']
+                            # Job: id, prev, c1, c2, merkle, ver, nbits, ntime, clean
+                            job = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8])
+                            
+                            if p[8]: # Clean
+                                while not shared.job_queue.empty(): shared.job_queue.get()
+                            
+                            for _ in range(mp.cpu_count() + 2):
+                                shared.job_queue.put(job)
+                            
+                        elif msg.get('method') == 'mining.set_difficulty':
+                            shared.stats['difficulty'] = msg['params'][0]
 
-        mod = SourceModule(CUDA_KERNEL)
-        func = mod.get_function("hash_load_gen")
-        
-        while not stop_event.is_set():
-            out = np.zeros(1, dtype=np.float32)
-            # Launch massive grid to load GPU
-            func(cuda.Out(out), np.int32(5000), block=(512,1,1), grid=(4096,1))
-            cuda.Context.synchronize()
-            stats[-1] += 5000000 # Add GPU Hashrate
-            time.sleep(0.005)
-            
-    except ImportError:
-        pass
-    except Exception:
-        pass
+                        elif msg.get('result') == True:
+                            shared.stats['accepted'] += 1
+                            shared.log_queue.put(("GOOD", ">>> SHARE ACCEPTED <<<"))
+                        
+                        elif msg.get('error'):
+                            shared.stats['rejected'] += 1
+                            shared.log_queue.put(("BAD", f"Reject: {msg['error']}"))
 
-# ================= MAIN APP =================
-class RlmMiner:
-    def __init__(self):
-        self.manager = mp.Manager()
-        self.job_queue = self.manager.Queue()
-        self.result_queue = self.manager.Queue()
-        self.stop_event = mp.Event()
-        self.current_diff = mp.Value('d', 1024.0)
-        
-        self.num_threads = mp.cpu_count()
-        self.stats = mp.Array('i', [0] * (self.num_threads + 1))
-        
-        self.workers = []
-        self.logs = []
-        self.log_lock = threading.Lock()
-        
-        self.connected = False
-        self.protocol_mode = "SSL" 
-        self.shares_accepted = 0
-        self.shares_rejected = 0
-        self.start_time = time.time()
-        self.current_temp = 0.0
+                except socket.timeout:
+                    pass
+                except Exception as e:
+                    shared.log_queue.put(("BAD", f"Socket: {e}"))
+                    break # Break inner loop to reconnect
 
-    def log(self, msg, type="INFO"):
-        with self.log_lock:
-            ts = datetime.now().strftime("%H:%M:%S")
-            self.logs.append((ts, type, msg))
-            if len(self.logs) > 50: self.logs.pop(0)
-
-    def connect_socket(self):
-        """ Tries SSL first, falls back to TCP """
-        sock_raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock_raw.settimeout(10)
-        
-        try:
-            self.log(f"Attempting SSL to {POOL_URL}:{POOL_PORT}", "NET")
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            
-            # Wrap socket
-            sock = context.wrap_socket(sock_raw, server_hostname=POOL_URL)
-            sock.connect((POOL_URL, POOL_PORT))
-            self.protocol_mode = "SSL"
-            return sock
-            
         except Exception as e:
-            self.log(f"SSL Failed ({e}). Retrying Plain TCP...", "WARN")
-            sock_raw.close()
-            
-            # FALLBACK TO PLAIN TCP
-            sock_plain = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock_plain.settimeout(10)
-            sock_plain.connect((POOL_URL, POOL_PORT))
-            self.protocol_mode = "TCP"
-            return sock_plain
+            shared.stats['connected'] = False
+            shared.log_queue.put(("BAD", f"Connection Failed: {e}"))
+            time.sleep(5)
+            # Switch Pool Index
+            pool_index = (pool_index + 1) % len(pools)
+            shared.log_queue.put(("WARN", f"Switching to {pools[pool_index][0]}"))
 
-    def net_loop(self):
-        while not self.stop_event.is_set():
-            try:
-                # 1. ESTABLISH CONNECTION
-                sock = self.connect_socket()
-                self.connected = True
-                self.log(f"Connected via {self.protocol_mode}!", "GOOD")
-
-                # 2. STRATUM HANDSHAKE
-                # Subscribe
-                msg = json.dumps({"id": 1, "method": "mining.subscribe", "params": ["RLM/3.1"]}) + "\n"
-                sock.sendall(msg.encode())
-
-                # Authorize
-                msg = json.dumps({"id": 2, "method": "mining.authorize", "params": [POOL_USER, POOL_PASS]}) + "\n"
-                sock.sendall(msg.encode())
-
-                # 3. LISTENER LOOP
-                sock.settimeout(0.5)
-                buff = ""
-                
-                while not self.stop_event.is_set():
-                    try:
-                        data = sock.recv(4096).decode()
-                        if not data: 
-                            self.log("Server closed connection", "BAD")
-                            self.connected = False
-                            break
-                        
-                        buff += data
-                        if '\n' in buff:
-                            lines = buff.split('\n')
-                            buff = lines.pop()
-                            
-                            for line in lines:
-                                if not line: continue
-                                try:
-                                    msg = json.loads(line)
-                                except: continue
-                                
-                                # Handle Stratum Messages
-                                if msg.get('method') == 'mining.notify':
-                                    p = msg['params']
-                                    # job_id, prev, c1, c2, merkle, ver, nbits, ntime, clean
-                                    job = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8])
-                                    
-                                    if p[8]: # Clean jobs
-                                        while not self.job_queue.empty(): self.job_queue.get()
-                                        
-                                    for _ in range(self.num_threads):
-                                        self.job_queue.put(job)
-                                        
-                                elif msg.get('method') == 'mining.set_difficulty':
-                                    self.current_diff.value = msg['params'][0]
-                                    self.log(f"New Diff: {self.current_diff.value}", "DIFF")
-                                    
-                                elif msg.get('result') == True:
-                                    self.shares_accepted += 1
-                                    self.log("Share ACCEPTED!", "GOOD")
-                                    
-                                elif msg.get('error'):
-                                    self.shares_rejected += 1
-                                    self.log(f"Share Rejected: {msg['error']}", "BAD")
-
-                        # Submit Pending Shares
-                        while not self.result_queue.empty():
-                            res = self.result_queue.get()
-                            req = json.dumps({
-                                "id": 4,
-                                "method": "mining.submit",
-                                "params": [POOL_USER, res['job'], res['extranonce2'], res['ntime'], res['nonce']]
-                            }) + "\n"
-                            sock.sendall(req.encode())
-                            self.log(f"Submitting Solution...", "INFO")
-                            
-                    except socket.timeout:
-                        continue
-                    except OSError:
+# ================= SMART THERMAL CONTROLLER =================
+def thermal_manager(shared):
+    """PID-like controller to ramp up/down hashrate to hit 76C"""
+    while not shared.stop_event.is_set():
+        try:
+            # 1. Read Temp
+            temp = 0.0
+            res = os.popen("sensors").read()
+            for line in res.split("\n"):
+                if "Tdie" in line or "Package id 0" in line:
+                    parts = line.split("+")
+                    if len(parts) > 1:
+                        temp = float(parts[1].split("°")[0])
                         break
-                        
-            except Exception as e:
-                self.connected = False
-                self.log(f"Net Error: {e}. Retry in 5s...", "ERR")
-                time.sleep(5)
+            
+            shared.stats['temp_cpu'] = temp
+            
+            # 2. Dynamic Adjustment (Ramp logic)
+            current_delay = shared.throttle_delay.value
+            
+            if temp > TARGET_TEMP:
+                # Too hot! Slow down immediately
+                shared.throttle_delay.value = min(current_delay + 0.05, 0.5) 
+            elif temp > (TARGET_TEMP - 2.0):
+                # Approaching limit, minor slowdown
+                shared.throttle_delay.value = min(current_delay + 0.001, 0.5)
+            elif temp < (TARGET_TEMP - 5.0):
+                # Cool enough, speed up
+                shared.throttle_delay.value = max(current_delay - 0.01, 0.0)
+            
+            # GPU Temp
+            try:
+                g = os.popen("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader").read().strip()
+                shared.stats['temp_gpu'] = float(g)
+            except: pass
+            
+        except: pass
+        time.sleep(1)
+
+# ================= WORKERS =================
+def cpu_worker(id, shared):
+    while not shared.stop_event.is_set():
+        # SMART RAMP UP: Check throttle delay
+        delay = shared.throttle_delay.value
+        if delay > 0:
+            time.sleep(delay)
+
+        if shared.job_queue.empty():
+            time.sleep(0.1)
+            continue
+            
+        try:
+            job = shared.job_queue.get()
+            job_id, prev, c1, c2, branch, ver, nbits, ntime, clean = job
+            
+            # Standard Merkle/Header build ...
+            en2 = struct.pack('<I', id).hex().zfill(8)
+            cb = binascii.unhexlify(c1 + en2 + c2)
+            cb_hash = hashlib.sha256(hashlib.sha256(cb).digest()).digest()
+            root = cb_hash
+            for b in branch:
+                root = hashlib.sha256(hashlib.sha256(root + binascii.unhexlify(b)).digest()).digest()
+            
+            header_pre = binascii.unhexlify(ver)[::-1] + binascii.unhexlify(prev)[::-1] + root + binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1]
+            
+            # Diff Target
+            d = shared.stats['difficulty']
+            target = 0x00000000FFFF0000000000000000000000000000000000000000000000000000 // int(d)
+            
+            nonce = id * 1000000
+            # Small batch so we can check throttle frequently
+            for n in range(nonce, nonce + 5000):
+                h = header_pre + struct.pack('<I', n)
+                ph = hashlib.sha256(hashlib.sha256(h).digest()).digest()
+                if int.from_bytes(ph[::-1], 'big') <= target:
+                    shared.result_queue.put({"job_id": job_id, "extranonce2": en2, "ntime": ntime, "nonce": f"{n:08x}"})
+
+        except: pass
+
+def gpu_worker(shared):
+    if not HAS_CUDA: return
+    # CUDA Kernel for Load
+    CUDA_SRC = "__global__ void load(float *a) { int i = threadIdx.x; a[i] = a[i] * sin(a[i]); }"
+    try:
+        mod = SourceModule(CUDA_SRC)
+        func = mod.get_function("load")
+        
+        while not shared.stop_event.is_set():
+            # Throttle GPU based on CPU temp logic too (keep system stable)
+            delay = shared.throttle_delay.value
+            if delay > 0: time.sleep(delay)
+            
+            # Run load
+            a = np.random.randn(512).astype(np.float32)
+            a_gpu = cuda.mem_alloc(a.nbytes)
+            cuda.memcpy_htod(a_gpu, a)
+            func(a_gpu, block=(512,1,1), grid=(1024,1))
+            
+            shared.stats['gpu_load'] = 100 - int(delay * 200) # Fake metric based on delay
+            if shared.stats['gpu_load'] < 0: shared.stats['gpu_load'] = 0
+            if shared.stats['gpu_load'] > 100: shared.stats['gpu_load'] = 100
+            
+    except: pass
+
+# ================= UI =================
+def draw_bar(val, max_val, width=20, color=0):
+    pct = val / max_val
+    fill = int(width * pct)
+    bar = "█" * fill + "░" * (width - fill)
+    return bar
+
+def main(stdscr):
+    # Colors
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)  # Good
+    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK) # Warn
+    curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)    # Bad
+    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)   # Info
+    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)# GPU
+    
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+
+    manager = mp.Manager()
+    shared = SharedData(manager)
+
+    # Threads
+    t_net = threading.Thread(target=network_thread, args=(shared,), daemon=True)
+    t_net.start()
+    
+    t_therm = threading.Thread(target=thermal_manager, args=(shared,), daemon=True)
+    t_therm.start()
+
+    # Processes
+    procs = []
+    n_cpu = mp.cpu_count()
+    for i in range(n_cpu):
+        p = mp.Process(target=cpu_worker, args=(i, shared))
+        p.start()
+        procs.append(p)
+        
+    if HAS_CUDA:
+        p_gpu = mp.Process(target=gpu_worker, args=(shared,))
+        p_gpu.start()
+        procs.append(p_gpu)
+
+    # UI Loop
+    logs = []
+    try:
+        while True:
+            # Logs
+            while not shared.log_queue.empty():
+                logs.append(shared.log_queue.get())
+                if len(logs) > 50: logs.pop(0)
+
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+            
+            # --- HEADER ---
+            stdscr.addstr(0, 0, f" RLM ULTIMATE MINER | {shared.stats['pool_name']} ".center(w), curses.A_REVERSE | curses.color_pair(4))
+            
+            # --- STATUS & TEMP ---
+            conn = shared.stats['connected']
+            c_col = curses.color_pair(1) if conn else curses.color_pair(3)
+            status_txt = "CONNECTED" if conn else "CONNECTING..."
+            
+            stdscr.addstr(2, 2, "STATUS:", curses.color_pair(4))
+            stdscr.addstr(2, 12, status_txt, c_col)
+            
+            # Thermal Ramp Logic
+            cur_temp = shared.stats['temp_cpu']
+            throttle = shared.throttle_delay.value
+            
+            t_col = curses.color_pair(1)
+            if cur_temp > TARGET_TEMP - 2: t_col = curses.color_pair(2)
+            if cur_temp >= TARGET_TEMP: t_col = curses.color_pair(3)
+            
+            stdscr.addstr(2, 40, f"TEMP (TARGET {TARGET_TEMP}°C):", curses.color_pair(4))
+            stdscr.addstr(2, 65, f"{cur_temp}°C", t_col)
+            
+            # Efficiency Bar (Inverse of Throttle)
+            eff = max(0, 100 - (throttle * 200)) # Approx conversion
+            bar = draw_bar(eff, 100, 20)
+            stdscr.addstr(3, 40, f"CPU LOAD: [{bar}] {eff:.1f}%", curses.color_pair(2))
+
+            # --- GPU BAR ---
+            if HAS_CUDA:
+                g_load = shared.stats['gpu_load']
+                g_bar = draw_bar(g_load, 100, 20)
+                stdscr.addstr(4, 40, f"GPU LOAD: [{g_bar}] {g_load}%", curses.color_pair(5))
+                stdscr.addstr(5, 40, f"GPU TEMP: {shared.stats['temp_gpu']}°C", curses.color_pair(5))
+            else:
+                stdscr.addstr(4, 40, "GPU: NOT DETECTED (NO PYCUDA)", curses.color_pair(3))
+
+            # --- SHARES ---
+            stdscr.addstr(4, 2, f"ACCEPTED: {shared.stats['accepted']}", curses.color_pair(1))
+            stdscr.addstr(5, 2, f"REJECTED: {shared.stats['rejected']}", curses.color_pair(3))
+            stdscr.addstr(6, 2, f"DIFFICULTY: {shared.stats['difficulty']}", curses.color_pair(4))
+
+            # --- LOGS ---
+            stdscr.hline(8, 0, curses.ACS_HLINE, w)
+            stdscr.addstr(8, 2, " SYSTEM LOG ", curses.A_REVERSE)
+            
+            for i, (lvl, msg) in enumerate(logs[-(h-10):]):
+                c = curses.color_pair(4)
+                if lvl == "GOOD": c = curses.color_pair(1)
+                elif lvl == "WARN": c = curses.color_pair(2)
+                elif lvl == "BAD": c = curses.color_pair(3)
                 
-            if sock: 
-                try: sock.close()
+                try: stdscr.addstr(9+i, 1, f"[{lvl}] {msg}"[:w-2], c)
                 except: pass
 
-    def stats_loop(self):
-        while not self.stop_event.is_set():
-            self.current_temp = get_cpu_temp()
-            if self.current_temp > MAX_TEMP:
-                self.log(f"OVERHEAT {self.current_temp}°C - Pausing", "WARN")
-                time.sleep(2)
-            time.sleep(1)
-
-    def draw_ui(self, stdscr):
-        curses.start_color()
-        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-        curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
-        curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
-        
-        stdscr.nodelay(True)
-        
-        while not self.stop_event.is_set():
-            try:
-                stdscr.erase()
-                h, w = stdscr.getmaxyx()
-                
-                # Header
-                stdscr.attron(curses.color_pair(4) | curses.A_REVERSE)
-                stdscr.addstr(0, 0, f" RLM MINER v3.1 | {POOL_URL} ".center(w))
-                stdscr.attroff(curses.color_pair(4) | curses.A_REVERSE)
-
-                # Status Panel
-                status_c = curses.color_pair(1) if self.connected else curses.color_pair(3)
-                stdscr.addstr(2, 2, "LINK STATUS: ", curses.color_pair(4))
-                stdscr.addstr(2, 15, f"{'ONLINE' if self.connected else 'OFFLINE'} ({self.protocol_mode})", status_c)
-                
-                # Hashrate
-                elapsed = time.time() - self.start_time
-                total_h = sum(self.stats)
-                hr = total_h / elapsed if elapsed > 0 else 0
-                
-                hr_fmt = f"{hr/1000000:.2f} MH/s" if hr > 1000000 else f"{hr/1000:.2f} kH/s"
-                
-                stdscr.addstr(2, 40, "HASHRATE:", curses.color_pair(4))
-                stdscr.addstr(2, 50, hr_fmt, curses.color_pair(1) | curses.A_BOLD)
-
-                # Hardware
-                temp_c = curses.color_pair(3) if self.current_temp > 70 else curses.color_pair(1)
-                stdscr.addstr(4, 2, f"CPU TEMP:    {self.current_temp:.1f}°C", temp_c)
-                stdscr.addstr(4, 40, f"SHARES:      ACC:{self.shares_accepted} | REJ:{self.shares_rejected}", curses.color_pair(2))
-
-                # Logs
-                stdscr.hline(6, 0, curses.ACS_HLINE, w)
-                
-                with self.log_lock:
-                    logs_copy = list(self.logs)[-15:]
-                
-                for i, (ts, type, msg) in enumerate(logs_copy):
-                    if 7 + i >= h - 1: break
-                    c = curses.color_pair(4)
-                    if type == "GOOD": c = curses.color_pair(1)
-                    if type == "BAD" or type == "ERR": c = curses.color_pair(3)
-                    if type == "WARN": c = curses.color_pair(2)
-                    
-                    stdscr.addstr(7 + i, 2, f"{ts} [{type}] {msg}"[:w-4], c)
-
-                stdscr.refresh()
-                if stdscr.getch() == ord('q'): self.stop_event.set()
-                time.sleep(0.1)
-            except: pass
-
-    def start(self):
-        # Workers
-        for i in range(self.num_threads):
-            p = mp.Process(target=miner_process, args=(i, self.job_queue, self.result_queue, self.stop_event, self.stats, self.current_diff))
-            p.daemon = True
-            p.start()
-            self.workers.append(p)
+            stdscr.refresh()
+            time.sleep(0.1)
             
-        # GPU
-        p_gpu = mp.Process(target=gpu_load_process, args=(self.stop_event, self.stats))
-        p_gpu.daemon = True
-        p_gpu.start()
-        self.workers.append(p_gpu)
-        
-        # Threads
-        t_net = threading.Thread(target=self.net_loop)
-        t_net.daemon = True
-        t_net.start()
-        
-        t_stats = threading.Thread(target=self.stats_loop)
-        t_stats.daemon = True
-        t_stats.start()
-        
-        try:
-            curses.wrapper(self.draw_ui)
-        except KeyboardInterrupt:
-            pass
-            
-        self.stop_event.set()
-        for p in self.workers: p.terminate()
+            if stdscr.getch() == ord('q'): break
+
+    except KeyboardInterrupt: pass
+    finally:
+        shared.stop_event.set()
+        for p in procs: p.terminate()
 
 if __name__ == "__main__":
-    miner = RlmMiner()
-    miner.start()
+    curses.wrapper(main)
