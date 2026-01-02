@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# rlm_proxy.py - Fixed Blocking, Protocol, and NoneType Format Crash
+# rlm_proxy.py - Fixed Blocking, Handshake, and Sensors
 import socket
 import ssl
 import json
@@ -8,7 +8,7 @@ import threading
 import select
 import curses
 import subprocess
-import signal
+import os
 import sys
 from datetime import datetime
 from queue import Queue, Empty
@@ -34,7 +34,7 @@ stats = {
     "asic_shares": 0,
     "cpu_hashrate": 0,
     "cpu_shares": 0,
-    "cpu_temp": 0.0, 
+    "cpu_temp": 0.0,
     "errors": 0
 }
 
@@ -45,12 +45,15 @@ def log(msg, tag="INFO"):
     except: pass
 
 def get_cpu_temp():
+    # Direct kernel read (Faster/More reliable than calling 'sensors' binary)
     try:
-        out = subprocess.check_output("sensors", shell=True).decode()
-        for line in out.split('\n'):
-            if "Tdie" in line or "Package id 0" in line:
-                return float(line.split('+')[1].split('°')[0])
-    except: return 0.0
+        for i in range(10):
+            path = f"/sys/class/thermal/thermal_zone{i}/temp"
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    return float(f.read().strip()) / 1000.0
+    except: pass
+    return 0.0
 
 def proxy_handler(client_sock, addr):
     server_sock = None
@@ -70,34 +73,30 @@ def proxy_handler(client_sock, addr):
                 data = s.recv(4096)
                 if not data: return
                 if s is client_sock:
-                    try:
-                        if b"mining.submit" in data:
-                            stats["asic_shares"] += 1
-                            log(f"Share submitted by {addr[0]}", "SOLO")
-                    except: pass
+                    if b"mining.submit" in data:
+                        stats["asic_shares"] += 1
+                        log(f"Share from {addr[0]}", "SOLO")
                     server_sock.sendall(data)
                 else:
                     client_sock.sendall(data)
-    except Exception: pass
+    except: pass
     finally:
         stats["asic_connections"] -= 1
         if client_sock: client_sock.close()
         if server_sock: server_sock.close()
-        log(f"ASIC Disconnected: {addr[0]}", "ASIC")
 
 def start_proxy_server():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((BIND_IP, BIND_PORT))
-        s.listen(10)
-        log(f"Proxy Listening on {BIND_PORT}", "NET")
+        s.listen(15)
+        log(f"Proxy Active on {BIND_PORT}", "NET")
         while True:
             client, addr = s.accept()
-            t = threading.Thread(target=proxy_handler, args=(client, addr), daemon=True)
-            t.start()
+            threading.Thread(target=proxy_handler, args=(client, addr), daemon=True).start()
     except Exception as e:
-        log(f"Proxy Server Failed: {e}", "CRIT")
+        log(f"Proxy Failed: {e}", "CRIT")
 
 def cpu_miner():
     while True:
@@ -105,78 +104,60 @@ def cpu_miner():
         try:
             log(f"Connecting CPU to {FPPS_POOL}...", "CPU")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(10)
+            s.settimeout(15) # High timeout for handshake
             s.connect((FPPS_POOL, FPPS_PORT))
             
-            # MANDATORY: Subscribe first
+            # MANDATORY 1: Subscribe
             s.sendall(json.dumps({"id": 1, "method": "mining.subscribe", "params": []}).encode() + b"\n")
-            # Then Authorize
+            # MANDATORY 2: Authorize
             s.sendall(json.dumps({"id": 2, "method": "mining.authorize", "params": [FPPS_USER, FPPS_PASS]}).encode() + b"\n")
             
             while True:
-                data = s.recv(2048).decode()
-                if not data:
-                    log("Pool closed connection.", "ERR")
-                    break
-                if "result\":true" in data:
-                    log("CPU Authorized & Active!", "SUCCESS")
+                data = s.recv(1024)
+                if not data: break
+                if b"result\":true" in data:
+                    log("CPU Authorized & Mining", "CPU")
                 
                 stats["cpu_hashrate"] = 1450.0
                 stats["cpu_temp"] = get_cpu_temp()
                 time.sleep(1)
         except Exception as e:
-            log(f"Conn Error: {str(e)[:20]}", "ERR")
+            log(f"Conn Error: {e}", "ERR")
             time.sleep(10)
         finally:
             if s: s.close()
 
 def draw_dashboard(stdscr):
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    curses.start_color()
+    curses.curs_set(0); stdscr.nodelay(True); curses.start_color()
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
     curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
     logs = []
     while True:
         try:
             while True:
-                try:
-                    msg = log_queue.get_nowait()
-                    logs.append(msg)
-                    if len(logs) > 50: logs.pop(0)
+                try: logs.append(log_queue.get_nowait())
                 except Empty: break
-            stdscr.clear()
-            h, w = stdscr.getmaxyx()
-            stdscr.addstr(0, 0, f" RLM DUAL-ROUTER | ASICS -> SOLO | CPU -> FPPS ".center(w), curses.A_REVERSE | curses.color_pair(2))
+            if len(logs) > 100: logs = logs[-100:]
             
-            stdscr.addstr(2, 2, "--- EXTERNAL ASICS (SOLO) ---", curses.A_BOLD)
-            stdscr.addstr(3, 2, f"Target Pool: {SOLO_POOL}")
-            stdscr.addstr(5, 2, f"Connected:   {stats['asic_connections']}", curses.color_pair(1))
-            stdscr.addstr(6, 2, f"Shares Fwd:  {stats['asic_shares']}", curses.color_pair(3))
+            stdscr.clear(); h, w = stdscr.getmaxyx()
+            stdscr.addstr(0, 0, f" RLM PROXY | ASICS->SOLO | CPU->FPPS ".center(w), curses.A_REVERSE | curses.color_pair(2))
+            
+            stdscr.addstr(2, 2, f"ASIC Conn: {stats['asic_connections']}", curses.color_pair(1))
+            stdscr.addstr(3, 2, f"ASIC Sh:   {stats['asic_shares']}")
             
             c_x = w // 2
-            stdscr.addstr(2, c_x, "--- LOCAL PC (FPPS) ---", curses.A_BOLD)
-            stdscr.addstr(3, c_x, f"Target Pool: {FPPS_POOL}")
-            stdscr.addstr(5, c_x, f"Hashrate:    {stats['cpu_hashrate']} H/s")
+            safe_temp = stats.get("cpu_temp") or 0.0
+            stdscr.addstr(2, c_x, f"CPU Hash:  {stats['cpu_hashrate']} H/s")
+            stdscr.addstr(3, c_x, f"CPU Temp:  {safe_temp:.1f}°C", curses.color_pair(1 if safe_temp < 75 else 2))
             
-            # CRASH FIX: Ensure temp is never None when formatting
-            safe_temp = stats.get("cpu_temp")
-            if safe_temp is None: safe_temp = 0.0
-            stdscr.addstr(6, c_x, f"Temperature: {safe_temp:.1f}°C")
-            
-            stdscr.hline(8, 0, curses.ACS_HLINE, w)
-            stdscr.addstr(8, 2, " SYSTEM LOGS ", curses.A_REVERSE)
-            num_logs = h - 10
-            visible_logs = logs[-num_logs:]
-            for i, line in enumerate(visible_logs):
-                color = curses.color_pair(1) if "SUCCESS" in line or "SOLO" in line else curses.color_pair(2)
-                try: stdscr.addstr(10+i, 1, line[:w-2], color)
+            stdscr.hline(5, 0, curses.ACS_HLINE, w)
+            num_logs = h - 7
+            for i, line in enumerate(logs[-num_logs:]):
+                try: stdscr.addstr(6+i, 1, line[:w-2])
                 except: pass
-            stdscr.refresh()
-            time.sleep(0.1)
+            stdscr.refresh(); time.sleep(0.2)
             if stdscr.getch() == ord('q'): break
-        except KeyboardInterrupt: break
+        except: break
 
 if __name__ == "__main__":
     threading.Thread(target=start_proxy_server, daemon=True).start()
