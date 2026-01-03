@@ -295,7 +295,7 @@ class RlmMiner:
                 try:
                     r = self.log_queue.get_nowait()
                     self.logs.append((datetime.now().strftime("%H:%M:%S"), r[0], r[1]))
-                    if len(self.logs) > 12: self.logs.pop(0)
+                    if len(self.logs) > 40: self.logs.pop(0)
                 except: break
 
             stdscr.erase(); h, w = stdscr.getmaxyx()
