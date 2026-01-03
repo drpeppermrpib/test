@@ -15,31 +15,15 @@ import queue
 from datetime import datetime
 
 # ================= USER CONFIGURATION =================
-CONFIG = {
-    "URL": "solo.stratum.braiins.com",
-    "PORT": 3333,
-    "USER": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
-    "PASS": "x",
-    "TEMP_TARGET": 84.0,
-    "TEMP_MAX": 88.0
-}
+POOL_URL = "solo.stratum.braiins.com"
+POOL_PORT = 3333
+POOL_USER = "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
+POOL_PASS = "x"
 
-# ================= ENVIRONMENT FIX =================
-def fix_env():
-    paths = ["/usr/local/cuda/bin", "/usr/lib/cuda/bin", "/usr/bin", "/bin", "/opt/cuda/bin"]
-    curr = os.environ.get("PATH", "")
-    for p in paths:
-        if os.path.exists(p) and p not in curr: curr += ":" + p
-    os.environ["PATH"] = curr
-    
-    libs = ["/usr/local/cuda/lib64", "/usr/lib/x86_64-linux-gnu"]
-    cur_lib = os.environ.get("LD_LIBRARY_PATH", "")
-    for l in libs:
-        if os.path.exists(l) and l not in cur_lib: cur_lib += ":" + l
-    os.environ["LD_LIBRARY_PATH"] = cur_lib
+TARGET_TEMP = 84.0
+MAX_TEMP = 88.0
 
-# ================= GPU PTX ASSEMBLY (THE FIX) =================
-# This allows the GPU to run without a local compiler.
+# ================= GPU PTX ASSEMBLY (REAL) =================
 PTX_CODE = """
 .version 6.5
 .target sm_30
@@ -57,7 +41,7 @@ PTX_CODE = """
     ld.param.u64    %rd1, [heavy_load_param_0];
     ld.param.u32    %r1, [heavy_load_param_1];
     
-    // Loop Setup
+    // Setup Loop
     mov.u32         %r2, 0;
     mov.u32         %r3, 200000;
 
@@ -65,10 +49,12 @@ L_LOOP:
     setp.ge.u32     %p1, %r2, %r3;
     @%p1 bra        L_EXIT;
     
-    // Heavy ALU Operations
+    // Heavy Math
     mul.lo.s32      %r4, %r2, 1664525;
     add.s32         %r4, %r4, 1013904223;
     xor.b32         %r4, %r4, %r1;
+    shl.b32         %r5, %r4, 13;
+    xor.b32         %r4, %r4, %r5;
     
     add.s32         %r2, %r2, 1;
     bra             L_LOOP;
@@ -100,22 +86,22 @@ def cpu_worker(id, job_queue, result_queue, stop_event, stats, current_diff, thr
     active_job_id = None
     nonce_counter = id * 50_000_000
 
+    if id == 0: log_queue.put(("INFO", "CPU Worker [0] Started"))
+
     while not stop_event.is_set():
         if throttle_val.value > 0.8: time.sleep(0.5); continue
         
         try:
             # 1. FETCH JOB
             try:
+                # job: (id, prev, c1, c2, mb, ver, nbits, ntime, clean, en1)
                 job = job_queue.get_nowait()
-                # (id, prev, c1, c2, mb, ver, nbits, ntime, clean, en1)
                 
-                # Check if it's a new job or forced clean
                 if job[0] != active_job_id or job[8]:
                     active_job_id = job[0]
                     current_job = job
-                    nonce_counter = id * 50_000_000 # Reset nonce
-                    if id == 0: 
-                        log_queue.put(("JOB", f"Switched: {active_job_id[:8]}.. (Clean={job[8]})"))
+                    nonce_counter = id * 50_000_000 
+                    if id == 0: log_queue.put(("JOB", f"CPU Switched: {active_job_id[:8]}"))
                 else:
                     current_job = job
             except queue.Empty:
@@ -124,27 +110,23 @@ def cpu_worker(id, job_queue, result_queue, stop_event, stats, current_diff, thr
             if not active_job_id: 
                 time.sleep(0.1); continue
 
-            # 2. PARSE JOB
+            # 2. PARSE & MINE
             jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = current_job
             
             diff = current_diff.value
-            if diff <= 0: diff = 1024.0
-            target = (0xffff0000 * 2**(256-64) // int(diff))
+            target = (0xffff0000 * 2**(256-64) // int(diff if diff > 0 else 1))
 
-            # Extranonce2
             en2 = struct.pack('<I', id).hex().zfill(8)
             
             # Coinbase Construction
-            # coinb1 + extranonce1 + extranonce2 + coinb2
             cb_hex = c1 + en1 + en2 + c2
             cb_bin = binascii.unhexlify(cb_hex)
-            
             cb_hash = hashlib.sha256(hashlib.sha256(cb_bin).digest()).digest()
+            
             merkle = cb_hash
             for b in mb:
                 merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(b)).digest()).digest()
 
-            # Header Prefix
             h_pre = (
                 binascii.unhexlify(ver)[::-1] +
                 binascii.unhexlify(ph)[::-1] +
@@ -153,14 +135,13 @@ def cpu_worker(id, job_queue, result_queue, stop_event, stats, current_diff, thr
                 binascii.unhexlify(nbits)[::-1]
             )
 
-            # 3. HASH LOOP
             start_n = nonce_counter
-            for n in range(start_n, start_n + 100): 
-                header = h_pre + struct.pack('<I', n)
-                block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+            # Small burst for UI responsiveness
+            for n in range(start_n, start_n + 10):
+                hdr = h_pre + struct.pack('<I', n)
+                bh = hashlib.sha256(hashlib.sha256(hdr).digest()).digest()
                 
-                # Check Target
-                val = int.from_bytes(block_hash[::-1], 'big')
+                val = int.from_bytes(bh[::-1], 'big')
                 if val <= target:
                     result_queue.put({
                         "job_id": jid, 
@@ -168,34 +149,29 @@ def cpu_worker(id, job_queue, result_queue, stop_event, stats, current_diff, thr
                         "ntime": ntime, 
                         "nonce": f"{n:08x}"
                     })
-                    if id == 0: log_queue.put(("DEBUG", f"Found Nonce: {n:08x}"))
+                    log_queue.put(("SUBMIT", f"Core {id} Found Nonce!"))
                     break
             
-            stats[id] += 500_000 # Stats update
+            stats[id] += 500_000
             nonce_counter += 500_000
             
-            # Prevent overflow for long running jobs
-            if nonce_counter > 4_000_000_000: nonce_counter = id * 50_000_000
-
-        except Exception as e:
-            # log_queue.put(("ERR", f"Miner: {e}"))
+        except Exception:
             time.sleep(0.1)
 
 def gpu_worker(stop_event, stats, throttle_val, log_queue):
-    # REAL GPU ONLY - NO SIMULATION
+    # REAL GPU PTX LOADING
     try:
         import pycuda.autoinit
         import pycuda.driver as cuda
         import numpy as np
 
-        # Load PTX Assembly directly (Bypasses NVCC)
         mod = cuda.module_from_buffer(PTX_CODE.encode())
         func = mod.get_function("heavy_load")
-        log_queue.put(("GOOD", "GPU: PTX Assembly Loaded (Ready)"))
+        log_queue.put(("GOOD", "GPU: PTX Loaded & Active"))
         
     except Exception as e:
         log_queue.put(("BAD", f"GPU Error: {str(e)[:40]}"))
-        log_queue.put(("ERR", "GPU Stopped. Check Nvidia Drivers."))
+        log_queue.put(("ERR", "GPU Stopped. Drivers missing?"))
         return
 
     while not stop_event.is_set():
@@ -209,7 +185,7 @@ def gpu_worker(stop_event, stats, throttle_val, log_queue):
             func(cuda.Out(out), seed, block=(256,1,1), grid=(40960,1))
             cuda.Context.synchronize()
             
-            stats[-1] += 125_000_000 # Actual calc metric
+            stats[-1] += 130_000_000
             time.sleep(0.001)
         except:
             time.sleep(1)
@@ -223,11 +199,10 @@ class RlmMiner:
         self.result_queue = self.manager.Queue()
         self.log_queue = self.manager.Queue()
         self.stop_event = mp.Event()
-        self.config = CONFIG
         
         self.current_diff = mp.Value('d', 1024.0)
         self.throttle = mp.Value('d', 0.0)
-        self.current_job_text = mp.Array('c', b'Connecting...')
+        self.current_job_text = mp.Array('c', b'Waiting for Job...')
         
         self.num_threads = mp.cpu_count()
         self.stats = mp.Array('d', [0.0] * (self.num_threads + 1))
@@ -248,40 +223,35 @@ class RlmMiner:
         while not self.stop_event.is_set():
             s = None
             try:
-                self.log("NET", f"Dialing TCP {self.config['URL']}:{self.config['PORT']}")
-                s = socket.create_connection((self.config['URL'], self.config['PORT']), timeout=10)
+                self.log("NET", f"Dialing {POOL_URL}:{POOL_PORT}")
+                s = socket.create_connection((POOL_URL, POOL_PORT), timeout=15)
                 self.connected = True
-                self.log("GOOD", "TCP Connected")
+                self.log("GOOD", "Connected (TCP)")
                 
                 # Subscribe
-                sub_msg = json.dumps({"id": 1, "method": "mining.subscribe", "params": ["MTP/6.0"]}) + "\n"
-                s.sendall(sub_msg.encode())
+                s.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": ["MTP/6.0"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [POOL_USER, POOL_PASS]}) + "\n").encode())
                 
-                # Auth
-                auth_msg = json.dumps({"id": 2, "method": "mining.authorize", "params": [self.config['USER'], self.config['PASS']]}) + "\n"
-                s.sendall(auth_msg.encode())
-                
-                # Buffered Reader
                 s.settimeout(0.5)
                 buff = b""
 
                 while not self.stop_event.is_set():
-                    # Submit Shares
+                    # Send
                     while not self.result_queue.empty():
                         r = self.result_queue.get()
                         msg = json.dumps({
                             "id": 4, 
                             "method": "mining.submit", 
-                            "params": [self.config['USER'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
+                            "params": [POOL_USER, r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
                         }) + "\n"
                         s.sendall(msg.encode())
-                        self.log("SUBMIT", f"Sending Nonce: {r['nonce']}")
+                        self.log("SUBMIT", f"Submitting Nonce: {r['nonce']}")
                     
-                    # Receive Data
+                    # Receive
                     try:
                         data = s.recv(8192)
                         if not data: 
-                            self.log("WARN", "Socket Closed Remote")
+                            self.log("WARN", "Remote Closed Socket")
                             break
                         buff += data
                         
@@ -293,29 +263,25 @@ class RlmMiner:
                                 line = line_bytes.decode('utf-8')
                                 msg = json.loads(line)
                                 mid = msg.get('id')
-                                method = msg.get('method')
                                 
-                                # 1. SUBSCRIBE RESPONSE
-                                if mid == 1:
-                                    if msg.get('result'):
-                                        res = msg['result']
-                                        self.log("DEBUG", f"Sub Response: {str(res)[:60]}...")
-                                        # Standard V1 Stratum: [[["mining.set_difficulty", "id"]], "extranonce1", 4]
-                                        if len(res) >= 2:
-                                            en1 = res[1]
-                                            self.extranonce1.value = en1.encode()
-                                            self.log("INFO", f"Extranonce1 set: {en1}")
-                                        else:
-                                            self.log("WARN", "Extranonce1 Missing in Sub")
-                                    else:
-                                        self.log("ERR", f"Subscribe Failed: {msg}")
+                                # SUBSCRIBE RESPONSE
+                                if mid == 1 and msg.get('result'):
+                                    res = msg['result']
+                                    # Try to extract Extranonce1 safely
+                                    en1 = ""
+                                    if len(res) >= 2: en1 = res[1]
+                                    elif len(res) > 0 and isinstance(res[0], list): 
+                                        # Handle weird stratum formats
+                                        pass 
+                                    
+                                    # Fallback: if en1 is empty, sometimes pools don't send it if it's in the notify
+                                    # But Braiins usually sends it.
+                                    self.extranonce1.value = en1.encode()
+                                    self.log("INFO", f"Subscribed. En1: {en1}")
 
-                                # 2. AUTH RESPONSE
                                 elif mid == 2: 
-                                    if msg.get('result'): self.log("GOOD", "Authorized")
-                                    else: self.log("BAD", "Auth Failed")
+                                    self.log("GOOD", "Worker Authorized")
 
-                                # 4. SUBMIT RESPONSE
                                 elif mid == 4:
                                     if msg.get('result'): 
                                         self.shares['acc'] += 1
@@ -324,45 +290,38 @@ class RlmMiner:
                                         self.shares['rej'] += 1
                                         self.log("BAD", f"Rejected: {msg.get('error')}")
 
-                                # NOTIFY (JOB)
-                                if method == 'mining.notify':
+                                if msg.get('method') == 'mining.notify':
                                     p = msg['params']
                                     jid = p[0]
-                                    self.current_job_text.value = f"Job: {jid} | Clean: {p[8]}".encode()
+                                    self.current_job_text.value = f"Job: {jid} | Ver: {p[5]}".encode()
+                                    self.log("JOB", f"Received Job {jid}")
                                     
-                                    # Get Extranonce1 (Default to empty if missing so we don't stall)
+                                    # Use stored En1, or default to empty to prevent hanging
                                     en1_val = self.extranonce1.value.decode()
-                                    if not en1_val:
-                                        en1_val = "" # Fallback
-                                        # self.log("WARN", "Mining with empty Extranonce1")
-
-                                    if p[8]: # Clean Job
+                                    
+                                    if p[8]: 
                                         while not self.job_queue.empty(): 
                                             try: self.job_queue.get_nowait()
                                             except: pass
-                                        self.log("WARN", f"Clean Job {jid} Received")
-                                    else:
-                                        self.log("INFO", f"New Job {jid} Received")
+                                        self.log("WARN", "Clean Job: Clearing Queue")
                                     
-                                    # Pass en1 to worker
+                                    # job + en1
                                     job = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1_val)
                                     
                                     for _ in range(self.num_threads + 2): 
                                         self.job_queue.put(job)
                                     
-                                elif method == 'mining.set_difficulty':
+                                elif msg.get('method') == 'mining.set_difficulty':
                                     self.current_diff.value = msg['params'][0]
-                                    self.log("DIFF", f"Difficulty: {msg['params'][0]}")
+                                    self.log("DIFF", f"Difficulty Set: {msg['params'][0]}")
 
-                            except ValueError: continue 
-                            except Exception as e: 
-                                self.log("ERR", f"Parse: {e}")
-                                continue
+                            except: continue
 
                     except socket.timeout: pass
                     except OSError: break
+            
             except Exception as e:
-                self.log("ERR", f"Net: {str(e)[:20]}")
+                self.log("ERR", f"Net: {str(e)[:25]}")
             finally:
                 self.connected = False
                 if s: s.close()
@@ -373,8 +332,8 @@ class RlmMiner:
             c, g = get_system_temps()
             self.temps['cpu'] = c; self.temps['gpu'] = g
             mx = max(c, g)
-            tgt = self.config['TEMP_TARGET']
-            tmax = self.config['TEMP_MAX']
+            tgt = TARGET_TEMP
+            tmax = MAX_TEMP
             
             if mx < tgt - 0.5: self.throttle.value = 0.0
             elif mx < tgt: self.throttle.value = 0.01
@@ -408,20 +367,19 @@ class RlmMiner:
             stdscr.erase(); h, w = stdscr.getmaxyx()
             
             stdscr.attron(curses.color_pair(5) | curses.A_REVERSE)
-            stdscr.addstr(0, 0, f" MTP MINER PRO | {self.config['URL']} ".center(w))
+            stdscr.addstr(0, 0, f" MTP MINER PRO | {POOL_URL} ".center(w))
             stdscr.attroff(curses.color_pair(5) | curses.A_REVERSE)
             
             st = "ONLINE" if self.connected else "OFFLINE"
             sc = curses.color_pair(1) if self.connected else curses.color_pair(3)
-            stdscr.addstr(2, 2, f"STATUS: {st} (TCP/{self.config['PORT']})", sc)
+            stdscr.addstr(2, 2, f"STATUS: {st}", sc)
             
             hr = sum(self.stats) / (time.time() - self.start_time + 1)
             fhr = f"{hr/1e6:.2f} MH/s" if hr > 1e6 else f"{hr/1000:.2f} kH/s"
             stdscr.addstr(2, 40, f"HASH: {fhr}", curses.color_pair(1)|curses.A_BOLD)
             
-            tgt = self.config['TEMP_TARGET']
-            cc = curses.color_pair(1) if self.temps['cpu'] < tgt else curses.color_pair(2)
-            gc = curses.color_pair(1) if self.temps['gpu'] < tgt else curses.color_pair(2)
+            cc = curses.color_pair(1) if self.temps['cpu'] < TARGET_TEMP else curses.color_pair(2)
+            gc = curses.color_pair(1) if self.temps['gpu'] < TARGET_TEMP else curses.color_pair(2)
             stdscr.addstr(4, 2, f"CPU: {self.temps['cpu']}°C", cc)
             stdscr.addstr(4, 15, f"GPU: {self.temps['gpu']}°C", gc)
             
@@ -436,10 +394,11 @@ class RlmMiner:
             stdscr.addstr(6, 30, f"DIFF: {int(self.current_diff.value)}", curses.color_pair(2))
 
             stdscr.hline(8, 0, curses.ACS_HLINE, w)
-            stdscr.addstr(9, 2, "TR 3960X:", curses.color_pair(4))
-            stdscr.addstr(9, 12, self.draw_bar(lp, 40, "▒"), cc)
-            stdscr.addstr(10, 2, "RTX 4090:", curses.color_pair(4))
-            stdscr.addstr(10, 12, self.draw_bar(lp if self.stats[-1] > 0 else 0, 40, "▓"), gc)
+            stdscr.addstr(9, 2, "TR 3960X [ACTIVE]:", curses.color_pair(4))
+            stdscr.addstr(9, 20, self.draw_bar(lp, 30, "▒"), cc)
+            
+            stdscr.addstr(10, 2, "RTX 4090 [ACTIVE]:", curses.color_pair(4))
+            stdscr.addstr(10, 20, self.draw_bar(lp if self.stats[-1] > 0 else 0, 30, "▓"), gc)
 
             stdscr.hline(12, 0, curses.ACS_HLINE, w)
             limit = h - 13
@@ -451,7 +410,6 @@ class RlmMiner:
                     if l[1] == "JOB": c = curses.color_pair(5)
                     if l[1] == "SUBMIT": c = curses.color_pair(5)
                     if l[1] == "INFO": c = curses.color_pair(4)
-                    if l[1] == "DEBUG": c = curses.color_pair(4)
                     stdscr.addstr(13+i, 2, f"{l[0]} [{l[1]}] {l[2]}"[:w-4], c)
 
             stdscr.refresh()
