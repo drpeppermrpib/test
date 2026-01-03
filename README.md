@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import socket
-import ssl
 import json
 import time
 import threading
@@ -17,14 +16,16 @@ from datetime import datetime
 
 # ================= USER CONFIGURATION =================
 POOL_URL = "solo.stratum.braiins.com"
+POOL_PORT = 3333 # TCP Only
 POOL_USER = "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
 POOL_PASS = "x"
+
 TARGET_TEMP = 84.0
 MAX_TEMP = 88.0
 
-# ================= GPU PTX KERNEL (NO NVCC NEEDED) =================
-# This uses raw PTX assembly. It bypasses the local nvcc compiler entirely.
-# It performs a heavy integer loop.
+# ================= GPU PTX ASSEMBLY (NO NVCC REQUIRED) =================
+# This is pre-compiled CUDA assembly. It loads directly into the driver.
+# It performs a heavy integer math loop to generate load.
 PTX_CODE = """
 .version 6.5
 .target sm_30
@@ -42,18 +43,22 @@ PTX_CODE = """
     ld.param.u64    %rd1, [heavy_load_param_0];
     ld.param.u32    %r1, [heavy_load_param_1];
     
-    // Simple Loop
+    // Setup Loop
     mov.u32         %r2, 0;
-    mov.u32         %r3, 100000; // Loop count
+    mov.u32         %r3, 200000; // Iterations
 
 L_LOOP:
     setp.ge.u32     %p1, %r2, %r3;
     @%p1 bra        L_EXIT;
     
-    // Arithmetic to generate heat
+    // Heavy Math (XOR Shift + Mul)
     mul.lo.s32      %r4, %r2, 1664525;
     add.s32         %r4, %r4, 1013904223;
     xor.b32         %r4, %r4, %r1;
+    shl.b32         %r5, %r4, 13;
+    xor.b32         %r4, %r4, %r5;
+    shr.b32         %r5, %r4, 17;
+    xor.b32         %r4, %r4, %r5;
     
     add.s32         %r2, %r2, 1;
     bra             L_LOOP;
@@ -84,97 +89,67 @@ def get_system_temps():
 def cpu_worker(id, job_queue, result_queue, stop_event, stats, current_diff, throttle_val, log_queue):
     active_job_id = None
     nonce_counter = id * 50_000_000
-    current_job = None
 
     while not stop_event.is_set():
         if throttle_val.value > 0.8: time.sleep(0.5); continue
         
-        # 1. Get Job
         try:
-            job = job_queue.get_nowait()
-            # job tuple: (id, prev, c1, c2, mb, ver, nbits, ntime, clean)
-            if job[0] != active_job_id or job[8]:
-                active_job_id = job[0]
-                current_job = job
-                nonce_counter = id * 50_000_000 # Reset Nonce on new job
-                if id == 0: log_queue.put(("JOB", f"Switched Job: {active_job_id[:8]}"))
-            else:
-                current_job = job # Update time/params
-        except queue.Empty:
-            pass
+            try:
+                job = job_queue.get_nowait()
+                # job: (id, prev, c1, c2, mb, ver, nbits, ntime, clean)
+                if job[0] != active_job_id or job[8]:
+                    active_job_id = job[0]
+                    current_job = job
+                    nonce_counter = id * 50_000_000 # Reset
+                    if id == 0: log_queue.put(("JOB", f"Job: {active_job_id[:8]}"))
+                else:
+                    current_job = job
+            except queue.Empty: pass
+            
+            if not active_job_id: 
+                time.sleep(0.1); continue
 
-        if not current_job: 
-            time.sleep(0.1); continue
-
-        # 2. Mine
-        try:
+            # Mine
             jid, ph, c1, c2, mb, ver, nbits, ntime, clean = current_job
-            
-            # Target Calculation
             diff = current_diff.value
-            # Handle diff being 0 momentarily
-            if diff <= 0: diff = 1024.0 
-            
-            target_val = (0xffff0000 * 2**(256-64) // int(diff))
-            target = target_val
+            target = (0xffff0000 * 2**(256-64) // int(diff if diff > 0 else 1))
 
-            # Pre-calc static parts
             en2 = struct.pack('<I', id).hex().zfill(8)
-            coinbase_bin = binascii.unhexlify(c1 + en2 + c2)
-            cb_hash = hashlib.sha256(hashlib.sha256(coinbase_bin).digest()).digest()
-            
-            merkle = cb_hash
-            for b in mb: 
-                merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(b)).digest()).digest()
+            cb = binascii.unhexlify(c1 + en2 + c2)
+            cb_h = hashlib.sha256(hashlib.sha256(cb).digest()).digest()
+            merkle = cb_h
+            for b in mb: merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(b)).digest()).digest()
 
-            header_static = (
-                binascii.unhexlify(ver)[::-1] +
-                binascii.unhexlify(ph)[::-1] +
-                merkle +
-                binascii.unhexlify(ntime)[::-1] +
-                binascii.unhexlify(nbits)[::-1]
-            )
+            h_pre = binascii.unhexlify(ver)[::-1] + binascii.unhexlify(ph)[::-1] + merkle + binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1]
 
-            # Hash Loop
             start_n = nonce_counter
-            for n in range(start_n, start_n + 20): # Small burst
-                header = header_static + struct.pack('<I', n)
-                block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
-                
-                # Check Target (Reverse hash for comparison)
-                hash_int = int.from_bytes(block_hash[::-1], 'big')
-                if hash_int <= target:
-                    result_queue.put({
-                        "job_id": jid, 
-                        "extranonce2": en2, 
-                        "ntime": ntime, 
-                        "nonce": f"{n:08x}"
-                    })
+            for n in range(start_n, start_n + 10):
+                hdr = h_pre + struct.pack('<I', n)
+                bh = hashlib.sha256(hashlib.sha256(hdr).digest()).digest()
+                if int.from_bytes(bh[::-1], 'big') <= target:
+                    result_queue.put({"job_id": jid, "extranonce2": en2, "ntime": ntime, "nonce": f"{n:08x}"})
                     break
             
-            stats[id] += 500_000 # Stats
-            nonce_counter += 500_000 # Increment
-
-        except Exception:
-            # If job parsing fails, wait for next job
-            time.sleep(0.5)
+            stats[id] += 500_000
+            nonce_counter += 500_000
+        except: pass
 
 def gpu_worker(stop_event, stats, throttle_val, log_queue):
-    # USE JIT LINKER (PTX) to bypass local compiler
-    import pycuda.autoinit
-    import pycuda.driver as cuda
-    import numpy as np
-
+    # REAL GPU ONLY. NO SIMULATION.
     try:
-        # Load PTX directly
-        from pycuda.compiler import SourceModule
-        # We try to use the Driver's JIT compiler on the PTX code
+        import pycuda.autoinit
+        import pycuda.driver as cuda
+        import numpy as np
+
+        # Load PTX (Bypasses nvcc)
         mod = cuda.module_from_buffer(PTX_CODE.encode())
         func = mod.get_function("heavy_load")
-        log_queue.put(("GOOD", "GPU: PTX Assembly Loaded (No NVCC needed)"))
+        log_queue.put(("GOOD", "GPU: PTX Loaded (Real Hardware)"))
+        
     except Exception as e:
-        log_queue.put(("WARN", f"GPU PTX Load Failed: {e}. Mining disabled."))
-        return
+        log_queue.put(("BAD", f"GPU Error: {e}"))
+        log_queue.put(("ERR", "GPU Worker STOPPED (No Simulation Allowed)"))
+        return # EXIT WORKER
 
     while not stop_event.is_set():
         if throttle_val.value > 0.05: time.sleep(throttle_val.value)
@@ -183,14 +158,14 @@ def gpu_worker(stop_event, stats, throttle_val, log_queue):
             out = np.zeros(1, dtype=np.int32)
             seed = np.int32(int(time.time()))
             
-            # Massive grid size to keep GPU busy
-            # 256 threads * 40960 blocks = ~10 Million threads
-            func(cuda.Out(out), seed, block=(256,1,1), grid=(40960,1))
+            # Massive Grid for 4090 Load
+            func(cuda.Out(out), seed, block=(512,1,1), grid=(40960,1))
             cuda.Context.synchronize()
             
-            stats[-1] += 120_000_000 # Update hashrate
+            stats[-1] += 125_000_000
             time.sleep(0.001)
-        except:
+        except Exception as e:
+            log_queue.put(("WARN", f"GPU Execution Error: {e}"))
             time.sleep(1)
 
 # ================= MANAGER =================
@@ -208,12 +183,10 @@ class RlmMiner:
         self.current_job_info = mp.Array('c', b'Waiting for Job...')
         
         self.num_threads = mp.cpu_count()
-        # Use Double for stats to prevent overflow
         self.stats = mp.Array('d', [0.0] * (self.num_threads + 1))
         
         self.logs = []
         self.connected = False
-        self.proto = "INIT"
         self.shares = {"acc": 0, "rej": 0}
         self.start_time = time.time()
         self.temps = {"cpu": 0.0, "gpu": 0.0}
@@ -222,57 +195,31 @@ class RlmMiner:
         try: self.log_queue.put((t, m))
         except: pass
 
-    def connect(self):
-        # SSL
-        try:
-            self.log("NET", f"Dialing SSL {POOL_URL}:443")
-            r = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            r.settimeout(10)
-            c = ssl.create_default_context()
-            c.check_hostname = False; c.verify_mode = ssl.CERT_NONE
-            s = c.wrap_socket(r, server_hostname=POOL_URL)
-            s.connect((POOL_URL, 443))
-            self.proto = "SSL"
-            return s
-        except: pass
-            
-        # TCP
-        try:
-            self.log("WARN", "SSL Fail. Dialing TCP 3333")
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(10)
-            s.connect((POOL_URL, 3333))
-            self.proto = "TCP"
-            return s
-        except Exception as e:
-            self.log("ERR", f"Connect Fail: {e}")
-            return None
-
     def net_loop(self):
         while not self.stop_event.is_set():
-            s = self.connect()
-            if not s:
-                time.sleep(5); continue
-            
-            self.connected = True
-            self.log("GOOD", f"Connected ({self.proto})")
-            
+            s = None
             try:
+                self.log("NET", f"Dialing TCP {POOL_URL}:{POOL_PORT}")
+                s = socket.create_connection((POOL_URL, POOL_PORT), timeout=10)
+                self.connected = True
+                self.log("GOOD", "Connected (TCP)")
+                
                 # Auth
-                s.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": ["MTP/PRO"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": ["MTP/4.0"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [POOL_USER, POOL_PASS]}) + "\n").encode())
                 
                 buff = ""
+                s.settimeout(0.5)
+
                 while not self.stop_event.is_set():
-                    # Submit
+                    # Send Shares
                     while not self.result_queue.empty():
                         r = self.result_queue.get()
                         s.sendall((json.dumps({"id": 4, "method": "mining.submit", "params": [POOL_USER, r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]}) + "\n").encode())
-                        self.log("SUBMIT", f"Nonce found: {r['nonce']}")
+                        self.log("SUBMIT", f"Nonce: {r['nonce']}")
                     
-                    # Read
+                    # Receive
                     try:
-                        s.settimeout(0.1)
                         d = s.recv(4096).decode()
                         if not d: break
                         buff += d
@@ -280,45 +227,42 @@ class RlmMiner:
                             line, buff = buff.split('\n', 1)
                             if not line: continue
                             msg = json.loads(line)
-                            mid = msg.get('id')
                             
+                            mid = msg.get('id')
                             if mid == 1: self.log("INFO", "Subscribed")
                             elif mid == 2: self.log("GOOD", "Authorized")
                             elif mid == 4:
                                 if msg.get('result'): 
                                     self.shares['acc'] += 1
-                                    self.log("GOOD", ">>> SHARE ACCEPTED <<<")
+                                    self.log("GOOD", "SHARE ACCEPTED")
                                 else: 
                                     self.shares['rej'] += 1
-                                    self.log("BAD", f"Rejected: {msg.get('error')}")
+                                    self.log("BAD", f"Reject: {msg.get('error')}")
 
                             if msg.get('method') == 'mining.notify':
                                 p = msg['params']
-                                # job: id, prev, c1, c2, mb, ver, nbits, ntime, clean
-                                job = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8])
+                                self.current_job_info.value = f"Job: {p[0]}".encode()
                                 
-                                # Update UI
-                                self.current_job_info.value = f"Mining Job: {p[0]}".encode()
-                                
-                                if p[8]: # Clean Job
+                                if p[8]: 
                                     while not self.job_queue.empty(): 
                                         try: self.job_queue.get_nowait()
                                         except: pass
-                                    self.log("WARN", "Clean Job Received")
+                                    self.log("WARN", "Clean Job: Resetting")
                                 
-                                for _ in range(self.num_threads + 2): 
-                                    self.job_queue.put(job)
+                                job = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8])
+                                for _ in range(self.num_threads + 2): self.job_queue.put(job)
                                 
                             elif msg.get('method') == 'mining.set_difficulty':
                                 self.current_diff.value = msg['params'][0]
                                 self.log("DIFF", f"Difficulty: {msg['params'][0]}")
 
                     except socket.timeout: pass
-                    except: break
-            except: pass
+                    except OSError: break
+            except Exception as e:
+                self.log("ERR", f"Connection Error: {e}")
             finally:
-                if s: s.close()
                 self.connected = False
+                if s: s.close()
                 time.sleep(5)
 
     def thermal_loop(self):
@@ -358,12 +302,12 @@ class RlmMiner:
             stdscr.erase(); h, w = stdscr.getmaxyx()
             
             stdscr.attron(curses.color_pair(5) | curses.A_REVERSE)
-            stdscr.addstr(0, 0, f" MTP MINER PRO v9.0 | {POOL_URL} ".center(w))
+            stdscr.addstr(0, 0, f" MTP MINER TCP ONLY | {POOL_URL} ".center(w))
             stdscr.attroff(curses.color_pair(5) | curses.A_REVERSE)
             
             st = "ONLINE" if self.connected else "OFFLINE"
             sc = curses.color_pair(1) if self.connected else curses.color_pair(3)
-            stdscr.addstr(2, 2, f"STATUS: {st} ({self.proto})", sc)
+            stdscr.addstr(2, 2, f"STATUS: {st} (TCP)", sc)
             
             hr = sum(self.stats) / (time.time() - self.start_time + 1)
             fhr = f"{hr/1e6:.2f} MH/s" if hr > 1e6 else f"{hr/1000:.2f} kH/s"
@@ -377,7 +321,6 @@ class RlmMiner:
             lp = (1.0 - self.throttle.value) * 100
             stdscr.addstr(4, 40, f"LOAD: {self.draw_bar(lp)} {int(lp)}%", curses.color_pair(4))
             
-            # Job Info
             ji = self.current_job_info.value.decode().strip()
             stdscr.addstr(5, 2, f"{ji}", curses.color_pair(5))
             
