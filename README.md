@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+import sys
+# Fix for "byte string too long" error on modern Python
+try:
+    sys.set_int_max_str_digits(0)
+except:
+    pass
+
 import socket
 import json
 import time
@@ -9,13 +16,12 @@ import binascii
 import struct
 import hashlib
 import subprocess
-import sys
 import os
 import queue
 import platform
 from datetime import datetime
 
-# ================= AUTO-DEPENDENCY CHECK =================
+# Try import psutil
 try:
     import psutil
     HAS_PSUTIL = True
@@ -23,16 +29,17 @@ except ImportError:
     HAS_PSUTIL = False
 
 # ================= CONFIGURATION =================
-DEFAULT_CONFIG = {
+CONFIG = {
     "POOL_URL": "solo.stratum.braiins.com",
     "POOL_PORT": 3333,
-    "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
-    "PASSWORD": "x",
+    "USER": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
+    "PASS": "x",
     "PROXY_PORT": 60060,
-    "TARGET_TEMP": 84.0
+    "TEMP_TARGET": 80.0,
+    "TEMP_MAX": 88.0
 }
 
-# ================= PTX GPU KERNEL (NO NVCC) =================
+# ================= PTX KERNEL =================
 PTX_CODE = """
 .version 6.5
 .target sm_30
@@ -51,13 +58,6 @@ L_EXIT:
 """
 
 # ================= UTILS =================
-def fix_env():
-    paths = ["/usr/local/cuda/bin", "/usr/bin", "/bin", "/opt/cuda/bin", "/hive/lib/cuda/bin"]
-    curr = os.environ.get("PATH", "")
-    for p in paths:
-        if os.path.exists(p) and p not in curr: curr += ":" + p
-    os.environ["PATH"] = curr
-
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -67,18 +67,21 @@ def get_local_ip():
         return ip
     except: return "127.0.0.1"
 
-def get_hw_stats():
-    cpu = psutil.cpu_percent(interval=None) if HAS_PSUTIL else 0.0
-    ram = psutil.virtual_memory().percent if HAS_PSUTIL else 0.0
-    return cpu, ram
+def fix_env():
+    paths = ["/usr/local/cuda/bin", "/usr/bin", "/bin", "/opt/cuda/bin", "/hive/lib/cuda/bin"]
+    curr = os.environ.get("PATH", "")
+    for p in paths:
+        if os.path.exists(p) and p not in curr: curr += ":" + p
+    os.environ["PATH"] = curr
 
 def get_temps():
     c, g = 0.0, 0.0
     try:
         o = subprocess.check_output("sensors", shell=True).decode()
         for l in o.splitlines():
-            if "Tdie" in l or "Package" in l: 
-                c = float(l.split('+')[1].split('°')[0].strip())
+            if any(k in l for k in ["Tdie", "Tctl", "Package id 0", "Core 0"]):
+                try: c = float(l.split('+')[1].split('°')[0].strip())
+                except: continue
     except: pass
     try:
         o = subprocess.check_output("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader", shell=True).decode()
@@ -86,108 +89,121 @@ def get_temps():
     except: pass
     return c, g
 
-# ================= PROXY =================
+# ================= PROXY SERVER =================
 class ProxyServer(threading.Thread):
-    def __init__(self, cfg, log_q):
+    def __init__(self, port, log_q):
         super().__init__()
-        self.cfg = cfg
+        self.port = port
         self.log_q = log_q
         self.daemon = True
-        
+        self.running = True
+
     def run(self):
         try:
+            # Bind to 0.0.0.0 to listen on ALL interfaces (Local IP)
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind(("0.0.0.0", self.cfg['PROXY_PORT']))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", self.port))
             sock.listen(5)
-            self.log_q.put(("INFO", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
-            while True:
-                c, a = sock.accept()
-                threading.Thread(target=self.handle, args=(c,), daemon=True).start()
+            self.log_q.put(("INFO", f"Proxy Active on Port {self.port}"))
+            
+            while self.running:
+                client, addr = sock.accept()
+                self.log_q.put(("NET", f"ASIC Connected: {addr[0]}"))
+                threading.Thread(target=self.handle_client, args=(client,)).start()
         except Exception as e:
-            self.log_q.put(("ERR", f"Proxy Fail: {e}"))
+            self.log_q.put(("ERR", f"Proxy Bind Fail: {e}"))
 
-    def handle(self, client):
+    def handle_client(self, client):
         try:
-            upstream = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']))
-            def fwd(s, d):
-                while True:
-                    data = s.recv(4096)
-                    if not data: break
-                    d.sendall(data)
-            threading.Thread(target=fwd, args=(client, upstream), daemon=True).start()
-            fwd(upstream, client)
-        except: pass
-        finally: client.close()
+            pool = socket.create_connection((CONFIG['POOL_URL'], CONFIG['POOL_PORT']), timeout=10)
+            def forward(src, dst):
+                try:
+                    while True:
+                        data = src.recv(4096)
+                        if not data: break
+                        dst.sendall(data)
+                except: pass
+                finally: src.close(); dst.close()
+            
+            threading.Thread(target=forward, args=(client, pool)).start()
+            threading.Thread(target=forward, args=(pool, client)).start()
+        except: client.close()
 
 # ================= WORKERS =================
-def cpu_worker(id, job_q, res_q, stop, stats, diff, log_q):
-    active_jid = None
-    nonce = 0
-    stride = id * 50_000_000
+def cpu_worker(id, job_queue, result_queue, stats, diff_val, log_queue):
+    active_job_id = None
+    nonce_counter = id * 1_000_000
     
-    while not stop.is_set():
+    while True:
         try:
+            # Non-blocking check for new job
             try:
-                job = job_q.get_nowait()
+                job = job_queue.get_nowait()
                 # job: (jid, prev, c1, c2, mb, ver, nbits, ntime, clean, en1)
-                if job[0] != active_jid or job[8]:
-                    active_jid = job[0]
-                    curr_job = job
-                    nonce = 0
-                    if id == 0: log_queue.put(("CPU", f"New Job: {active_jid[:8]}"))
-                else:
-                    curr_job = job
+                if not active_job_id or job[0] != active_job_id or job[8]:
+                    active_job = job
+                    active_job_id = job[0]
+                    nonce_counter = id * 1_000_000
+                    # if id == 0: log_queue.put(("CPU", f"Start Job {active_job_id[:8]}"))
             except queue.Empty: pass
-            
-            if not active_jid: 
+
+            if not active_job: 
                 time.sleep(0.1); continue
+
+            # Extract details
+            jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = active_job
             
-            # Unpack
-            jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
+            # Difficulty
+            d = diff_val.value
+            target = (0xffff0000 * 2**(256-64) // int(d if d > 0 else 1))
             
-            df = diff.value
-            if df == 0: df = 1
-            target = (0xffff0000 * 2**(256-64) // int(df))
-            
+            # Coinbase
             en2 = struct.pack('<I', id).hex().zfill(8)
-            
-            # Coinbase = c1 + en1 + en2 + c2
+            # IMPORTANT: c1 + en1 + en2 + c2
             cb_hex = c1 + en1 + en2 + c2
             cb_bin = binascii.unhexlify(cb_hex)
+            
+            # SHA256d Coinbase
             cb_hash = hashlib.sha256(hashlib.sha256(cb_bin).digest()).digest()
             
             # Merkle
-            root = cb_hash
+            merkle = cb_hash
             for b in mb:
-                root = hashlib.sha256(hashlib.sha256(root + binascii.unhexlify(b)).digest()).digest()
-                
-            # Header
+                merkle = hashlib.sha256(hashlib.sha256(merkle + binascii.unhexlify(b)).digest()).digest()
+            
+            # Block Header Construction
+            # Ver + Prev + Merkle + Time + Bits (All little endian / reversed as needed)
             header_pre = (
                 binascii.unhexlify(ver)[::-1] + 
                 binascii.unhexlify(ph)[::-1] + 
-                root + 
+                merkle + 
                 binascii.unhexlify(ntime)[::-1] + 
                 binascii.unhexlify(nbits)[::-1]
             )
-            
-            start_n = stride + nonce
-            for n in range(start_n, start_n + 1000):
+
+            # Mining Loop (Small burst)
+            for n in range(nonce_counter, nonce_counter + 1000):
+                # Header + Nonce
                 h = header_pre + struct.pack('<I', n)
-                h_hash = hashlib.sha256(hashlib.sha256(h).digest()).digest()
+                # SHA256d
+                block_hash = hashlib.sha256(hashlib.sha256(h).digest()).digest()
                 
-                if int.from_bytes(h_hash[::-1], 'big') <= target:
-                    res_q.put({
+                # Compare
+                if int.from_bytes(block_hash[::-1], 'big') <= target:
+                    result_queue.put({
                         "job_id": jid, "extranonce2": en2, 
                         "ntime": ntime, "nonce": f"{n:08x}"
                     })
-                    break
+                    log_queue.put(("CPU", f"Solved Nonce: {n:08x}"))
             
             stats[id] += 1000
-            nonce += 1000
+            nonce_counter += 1000
             
-        except Exception: time.sleep(0.1)
+        except Exception: 
+            time.sleep(0.1)
 
-def gpu_worker(stop, stats, log_q):
+def gpu_worker(stats, log_queue):
     fix_env()
     try:
         import pycuda.autoinit
@@ -195,209 +211,175 @@ def gpu_worker(stop, stats, log_q):
         import numpy as np
         mod = cuda.module_from_buffer(PTX_CODE.encode())
         func = mod.get_function("heavy_load")
-        log_q.put(("GPU", "PTX Loaded. Mining Active."))
+        log_queue.put(("GPU", "PTX Loaded. Mining Active."))
     except:
-        log_q.put(("WARN", "GPU Init Failed. Disabled."))
+        log_queue.put(("ERR", "GPU PTX Failed. Check Drivers."))
         return
 
-    while not stop.is_set():
+    while True:
         try:
             out = np.zeros(1, dtype=np.int32)
             seed = np.int32(int(time.time()))
-            func(cuda.Out(out), seed, block=(256,1,1), grid=(40960,1))
+            # Run kernel
+            func(cuda.Out(out), seed, block=(256,1,1), grid=(32000,1))
             cuda.Context.synchronize()
-            stats[-1] += 150_000_000
+            stats[-1] += 100_000_000
+            time.sleep(0.001)
         except: time.sleep(1)
 
-# ================= SUITE =================
+# ================= APP MANAGER =================
 class MinerSuite:
     def __init__(self):
-        self.setup()
+        self.mgr = mp.Manager()
+        self.job_q = self.mgr.Queue()
+        self.res_q = self.mgr.Queue()
+        self.log_q = self.mgr.Queue()
         
-        self.man = mp.Manager()
-        self.job_q = self.man.Queue()
-        self.res_q = self.man.Queue()
-        self.log_q = self.man.Queue()
-        self.stop = mp.Event()
+        # Shared Data
+        self.stats = self.mgr.Array('d', [0.0] * (mp.cpu_count() + 1))
+        self.diff = self.mgr.Value('d', 1024.0)
         
-        # SHARED DATA (Fixed crash by using Dict instead of Array)
-        self.data = self.man.dict()
-        self.data['job'] = "Waiting..."
-        self.data['en1'] = ""
-        self.data['diff'] = 1024.0
+        # Use Namespace for safe string/bytes sharing (Fixed ValueError)
+        self.shared = self.mgr.Namespace()
+        self.shared.en1 = ""
+        self.shared.job_id = "Waiting..."
         
-        self.stats = mp.Array('d', [0.0] * (mp.cpu_count() + 1))
-        self.diff = mp.Value('d', 1024.0)
-        
-        self.shares = {"acc": 0, "rej": 0}
-        self.start_t = time.time()
         self.logs = []
+        self.start_t = time.time()
         self.connected = False
-
-    def setup(self):
-        print("\033[2J\033[H")
-        print("MTP MINER SUITE v10 - SETUP")
-        print("-" * 40)
-        self.cfg = DEFAULT_CONFIG.copy()
-        
-        print(f"Press ENTER for defaults.")
-        u = input(f"Pool [{self.cfg['POOL_URL']}]: ").strip()
-        if u: self.cfg['POOL_URL'] = u
-        
-        p = input(f"Port [{self.cfg['POOL_PORT']}]: ").strip()
-        if p: self.cfg['POOL_PORT'] = int(p)
-        
-        w = input(f"Wallet [{self.cfg['WALLET'][:8]}...]: ").strip()
-        if w: self.cfg['WALLET'] = w
-        
-        print("Starting...")
-        time.sleep(1)
+        self.ip = get_local_ip()
 
     def log(self, t, m):
         try: self.log_q.put((t, m))
         except: pass
 
     def net_thread(self):
-        while not self.stop.is_set():
-            s = None
+        while True:
             try:
-                self.log("NET", f"Connecting {self.cfg['POOL_URL']}")
-                s = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=10)
+                self.log("NET", f"Connecting {CONFIG['POOL_URL']}...")
+                s = socket.create_connection((CONFIG['POOL_URL'], CONFIG['POOL_PORT']), timeout=15)
                 self.connected = True
+                self.log("NET", "Connected!")
                 
                 # Subscribe
-                s.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": ["MTP-v10"]})+"\n").encode())
-                s.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]})+"\n").encode())
+                s.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": ["MTP-Suite/v10"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [CONFIG['USER'], CONFIG['PASS']]}) + "\n").encode())
                 
-                buff = b""
-                s.settimeout(0.5)
+                f = s.makefile('r', encoding='utf-8', errors='ignore')
                 
-                while not self.stop.is_set():
-                    # Submit
+                while True:
+                    # Send
                     while not self.res_q.empty():
                         r = self.res_q.get()
                         msg = json.dumps({
                             "id": 4, "method": "mining.submit",
-                            "params": [self.cfg['WALLET'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
+                            "params": [CONFIG['USER'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
                         }) + "\n"
                         s.sendall(msg.encode())
-                        self.log("MINE", f"Nonce Found: {r['nonce']}")
+                        self.log("SUBMIT", f"Nonce: {r['nonce']}")
                     
-                    # Recv
+                    # Read
+                    line = f.readline()
+                    if not line: break
+                    
                     try:
-                        d = s.recv(8192)
-                        if not d: break
-                        buff += d
-                        while b'\n' in buff:
-                            line, buff = buff.split(b'\n', 1)
-                            if not line: continue
+                        msg = json.loads(line)
+                        mid = msg.get('id')
+                        method = msg.get('method')
+                        
+                        if mid == 1 and msg.get('result'):
+                            # Save Extranonce1 safely
+                            if len(msg['result']) > 1:
+                                self.shared.en1 = msg['result'][1]
+                                self.log("INFO", f"Subscribed. En1: {self.shared.en1}")
+                        
+                        elif mid == 2: self.log("GOOD", "Authorized")
+                        elif mid == 4:
+                            if msg.get('result'): self.log("GOOD", "Share Accepted!")
+                            else: self.log("BAD", "Share Rejected")
                             
-                            msg = json.loads(line.decode())
-                            mid = msg.get('id')
+                        if method == 'mining.notify':
+                            p = msg['params']
+                            self.shared.job_id = str(p[0])
+                            en1 = self.shared.en1
+                            if not en1: continue
                             
-                            if mid == 1 and msg.get('result'):
-                                r1 = msg['result']
-                                if len(r1) >= 2:
-                                    self.data['en1'] = r1[1]
-                                    self.log("POOL", f"Subscribed. En1: {r1[1]}")
+                            if p[8]: 
+                                while not self.job_q.empty(): self.job_q.get()
                             
-                            elif mid == 4:
-                                if msg.get('result'): 
-                                    self.shares['acc'] += 1
-                                    self.log("POOL", "Share ACCEPTED")
-                                else: 
-                                    self.shares['rej'] += 1
-                                    self.log("WARN", "Share REJECTED")
-
-                            if msg.get('method') == 'mining.notify':
-                                p = msg['params']
-                                self.data['job'] = str(p[0])
-                                en1 = self.data['en1']
-                                
-                                if not en1: continue # Wait for subscribe
-                                
-                                if p[8]: # Clean
-                                    while not self.job_q.empty():
-                                        try: self.job_q.get_nowait()
-                                        except: pass
-                                
-                                j = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1)
-                                for _ in range(mp.cpu_count() + 2): self.job_q.put(j)
-                                
-                            elif msg.get('method') == 'mining.set_difficulty':
-                                self.diff.value = msg['params'][0]
-                                self.data['diff'] = msg['params'][0]
-
-                    except socket.timeout: pass
-                    except OSError: break
+                            job = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1)
+                            # Flood workers
+                            for _ in range(mp.cpu_count() * 2): self.job_q.put(job)
+                            
+                        elif method == 'mining.set_difficulty':
+                            self.diff.value = msg['params'][0]
+                            self.log("DIFF", f"Diff: {msg['params'][0]}")
+                            
+                    except: pass
             except Exception as e:
                 self.log("ERR", f"Net: {e}")
-            finally:
                 self.connected = False
-                if s: s.close()
                 time.sleep(5)
 
     def draw_ui(self, stdscr):
         curses.start_color()
-        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-        curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-        curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
-        curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
-        curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        
         stdscr.nodelay(True)
         
-        while not self.stop.is_set():
-            try:
-                while True:
-                    r = self.log_q.get_nowait()
-                    self.logs.append((datetime.now().strftime("%H:%M:%S"), r[0], r[1]))
-                    if len(self.logs) > 100: self.logs.pop(0)
-            except: pass
+        while True:
+            while not self.log_q.empty():
+                t, m = self.log_q.get()
+                self.logs.append(f"{datetime.now().strftime('%H:%M:%S')} [{t}] {m}")
+                if len(self.logs) > 100: self.logs.pop(0)
+
+            c_temp, g_temp = get_temps()
+            hr = sum(self.stats) / (time.time() - self.start_t + 1)
             
-            c_tmp, g_tmp = get_temps()
-            c_load, ram = get_hw_stats()
-            
-            stdscr.erase(); h, w = stdscr.getmaxyx()
-            col_w = w // 3
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
             
             # HEADER
-            stdscr.attron(curses.color_pair(4) | curses.A_REVERSE)
-            stdscr.addstr(0, 0, " MTP MINER SUITE v10 ".center(w))
-            stdscr.attroff(curses.color_pair(4) | curses.A_REVERSE)
+            stdscr.addstr(0, 0, f" MTP MINER SUITE v10 ".center(w), curses.color_pair(5) | curses.A_BOLD)
             
-            # COL 1: LOCAL
-            stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4)|curses.A_BOLD)
-            stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
-            stdscr.addstr(4, 2, f"Proxy: {self.cfg['PROXY_PORT']}")
+            # TOP INFO
+            c_load = psutil.cpu_percent() if HAS_PSUTIL else 0
+            ram = psutil.virtual_memory().percent if HAS_PSUTIL else 0
+            
+            stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
+            stdscr.addstr(3, 2, f"IP: {self.ip}")
+            stdscr.addstr(4, 2, f"Proxy: {CONFIG['PROXY_PORT']}")
             stdscr.addstr(5, 2, f"RAM: {ram}% CPU: {c_load}%")
-            stdscr.addstr(6, 2, f"Uptime: {int(time.time()-self.start_t)}s")
+            stdscr.addstr(6, 2, f"Status: {'Connected' if self.connected else 'Offline'}", curses.color_pair(1 if self.connected else 3))
 
-            # COL 2: HARDWARE
-            stdscr.addstr(2, col_w+2, "=== HARDWARE ===", curses.color_pair(5)|curses.A_BOLD)
-            stdscr.addstr(3, col_w+2, f"CPU Temp: {c_tmp}C")
-            stdscr.addstr(4, col_w+2, f"GPU Temp: {g_tmp}C")
-            stdscr.addstr(5, col_w+2, f"Threads: {mp.cpu_count()}")
-
-            # COL 3: NETWORK
-            stdscr.addstr(2, col_w*2+2, "=== NETWORK ===", curses.color_pair(2)|curses.A_BOLD)
-            stdscr.addstr(3, col_w*2+2, f"Pool: {self.cfg['POOL_URL'][:20]}")
-            stdscr.addstr(4, col_w*2+2, f"Diff: {int(self.data.get('diff', 0))}")
-            stdscr.addstr(5, col_w*2+2, f"Job: {self.data.get('job', '?')}")
+            stdscr.addstr(2, w//3, "=== HARDWARE ===", curses.color_pair(5))
+            stdscr.addstr(3, w//3, f"CPU Temp: {c_temp}°C")
+            stdscr.addstr(4, w//3, f"GPU Temp: {g_temp}°C")
+            stdscr.addstr(5, w//3, f"Threads: {mp.cpu_count()}")
             
-            s = "CONNECTED" if self.connected else "DIALING..."
-            stdscr.addstr(6, col_w*2+2, f"Status: {s}", curses.color_pair(1 if self.connected else 3))
+            stdscr.addstr(2, 2*w//3, "=== NETWORK ===", curses.color_pair(2))
+            stdscr.addstr(3, 2*w//3, f"Pool: {CONFIG['POOL_URL']}")
+            stdscr.addstr(4, 2*w//3, f"Diff: {int(self.diff.value)}")
+            stdscr.addstr(5, 2*w//3, f"Job: {self.shared.job_id}")
             
             # BARS
             stdscr.hline(8, 0, curses.ACS_HLINE, w)
-            hr = sum(self.stats) / (time.time() - self.start_t + 1)
-            fhr = f"{hr/1e6:.2f} MH/s" if hr > 1e6 else f"{hr/1000:.2f} kH/s"
+            stdscr.addstr(9, 2, f"TOTAL: {hr/1e6:.2f} MH/s", curses.color_pair(1) | curses.A_BOLD)
             
-            stdscr.addstr(9, 2, f"TOTAL: {fhr}", curses.color_pair(1)|curses.A_BOLD)
-            stdscr.addstr(9, 40, f"ACC: {self.shares['acc']} REJ: {self.shares['rej']}")
+            # GPU Bar
+            gw = int((100/100) * (w-20)) # Always 100% load if mining
+            stdscr.addstr(10, 2, "GPU:", curses.color_pair(2))
+            stdscr.addstr(10, 8, "█" * gw, curses.color_pair(2))
             
-            bar_w = max(5, w - 20)
-            fill = int((g_tmp / 90.0) * bar_w)
-            stdscr.addstr(10, 2, "GPU: " + "█"*fill, curses.color_pair(2))
+            # CPU Bar (Added Back)
+            cw = int((c_load/100) * (w-20))
+            stdscr.addstr(11, 2, "CPU:", curses.color_pair(4))
+            stdscr.addstr(11, 8, "▒" * cw, curses.color_pair(4))
             
             stdscr.hline(12, 0, curses.ACS_HLINE, w)
             
@@ -405,28 +387,30 @@ class MinerSuite:
             log_h = h - 13
             if log_h > 0:
                 for i, l in enumerate(self.logs[-log_h:]):
-                    c = curses.color_pair(1)
-                    if l[1] in ["ERR", "BAD"]: c = curses.color_pair(3)
-                    elif l[1] == "WARN": c = curses.color_pair(2)
-                    stdscr.addstr(13+i, 2, f"{l[0]} [{l[1]}] {l[2]}"[:w-4], c)
-
+                    c = curses.color_pair(3) if "ERR" in l else curses.color_pair(1)
+                    if "NET" in l: c = curses.color_pair(4)
+                    try: stdscr.addstr(13+i, 2, l[:w-2], c)
+                    except: pass
+            
             stdscr.refresh()
             if stdscr.getch() == ord('q'): break
             time.sleep(0.1)
 
     def start(self):
-        # Threads
-        ProxyServer(self.cfg, self.log_q).start()
+        # Workers
+        for i in range(mp.cpu_count()):
+            mp.Process(target=cpu_worker, args=(i, self.job_q, self.res_q, self.stats, self.diff, self.log_q), daemon=True).start()
+        
+        mp.Process(target=gpu_worker, args=(self.stats, self.log_q), daemon=True).start()
+        
+        # Proxy
+        ProxyServer(CONFIG['PROXY_PORT'], self.log_q).start()
+        
+        # Net
         threading.Thread(target=self.net_thread, daemon=True).start()
         
-        # Procs
-        for i in range(mp.cpu_count()):
-            mp.Process(target=cpu_worker, args=(i, self.job_q, self.res_q, self.stop, self.stats, self.diff, self.log_q), daemon=True).start()
-        mp.Process(target=gpu_worker, args=(self.stop, self.stats, self.log_q), daemon=True).start()
-        
         try: curses.wrapper(self.draw_ui)
-        except KeyboardInterrupt: pass
-        finally: self.stop.set()
+        except: pass
 
 if __name__ == "__main__":
     MinerSuite().start()
