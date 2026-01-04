@@ -94,9 +94,9 @@ def get_hw_stats():
 
 # ================= PROXY =================
 class ProxyServer(threading.Thread):
-    def __init__(self, port, log_q):
+    def __init__(self, cfg, log_q):
         super().__init__()
-        self.port = port
+        self.cfg = cfg
         self.log_q = log_q
         self.daemon = True
         
@@ -104,19 +104,20 @@ class ProxyServer(threading.Thread):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", self.port))
+            sock.bind(("0.0.0.0", self.cfg['PROXY_PORT']))
             sock.listen(5)
-            self.log_q.put(("INFO", f"Proxy Listening on Port {self.port}"))
+            self.log_q.put(("INFO", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
             while True:
                 c, a = sock.accept()
-                self.log_q.put(("NET", f"Proxy Client: {a[0]}"))
+                self.log_q.put(("NET", f"Proxy Client Connected: {a[0]}"))
                 threading.Thread(target=self.handle, args=(c,), daemon=True).start()
         except Exception as e:
             self.log_q.put(("ERR", f"Proxy Error: {e}"))
 
     def handle(self, client):
         try:
-            upstream = socket.create_connection((DEFAULT_CONFIG['POOL_URL'], DEFAULT_CONFIG['POOL_PORT']), timeout=10)
+            # FIX: Use self.cfg instead of DEFAULT_CONFIG
+            upstream = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=10)
             def fwd(src, dst):
                 try:
                     while True:
@@ -151,15 +152,16 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
             if not active_jid: 
                 time.sleep(0.1); continue
             
-            # Unpack Job
             jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
             
-            # Sanity Check
-            if not en1 or not c1 or not c2:
-                time.sleep(0.5); continue
+            if not en1 or not c1:
+                time.sleep(0.1); continue
 
             df = diff.value
             pool_target = (0xffff0000 * 2**(256-64) // int(df if df > 0 else 1))
+            
+            # Difficulty 1 Target (For stats)
+            diff1 = 0xffff0000 * 2**(256-64)
             
             en2 = struct.pack('<I', id).hex().zfill(8)
             cb_bin = binascii.unhexlify(c1 + en1 + en2 + c2)
@@ -176,19 +178,28 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
                 binascii.unhexlify(nbits)[::-1]
             )
             
-            # Scan
             for n in range(nonce, nonce + 3000):
+                # Little Endian Pack for Hash
                 h = header_pre + struct.pack('<I', n)
                 h_hash = hashlib.sha256(hashlib.sha256(h).digest()).digest()
                 val = int.from_bytes(h_hash[::-1], 'big')
                 
+                # FIX: Send the nonce exactly as packed (Little Endian Hex)
+                # This matches what the pool expects for Stratum V1
+                nonce_hex = struct.pack('<I', n).hex()
+
                 if val <= pool_target:
                     res_q.put({
                         "job_id": jid, "extranonce2": en2, 
-                        "ntime": ntime, "nonce": f"{n:08x}"
+                        "ntime": ntime, "nonce": nonce_hex
                     })
-                    log_queue.put(("GOOD", f"** NONCE: {n:08x} **"))
+                    log_queue.put(("GOOD", f"** SHARE FOUND! {nonce_hex} **"))
                     break
+                
+                # Check for "Near Misses" (Diff > 32) just to log activity
+                if val <= (diff1 // 32):
+                    if id == 0 and (n % 100 == 0):
+                        log_queue.put(("INFO", f"Valid Share (Diff > 32)"))
 
             stats[id] += 3000
             nonce += 3000
@@ -244,12 +255,16 @@ class MinerSuite:
 
     def run_setup(self):
         os.system('clear')
-        print("MTP MINER SUITE v10 - BETA 6")
+        print("MTP MINER SUITE v10 - BETA 7")
         print("-" * 30)
         self.cfg = DEFAULT_CONFIG.copy()
+        
+        # Simple menu, press enter for default
         print(f"Pool: {self.cfg['POOL_URL']}")
-        print(f"Throttle Start: {self.cfg['THROTTLE_START']}C")
+        print(f"Proxy Port: {self.cfg['PROXY_PORT']}")
         print("Press ENTER to start...")
+        # try: input()
+        # except: pass
         time.sleep(1)
 
     def log(self, t, m):
@@ -275,43 +290,36 @@ class MinerSuite:
                 self.log("NET", f"Dialing {self.cfg['POOL_URL']}...")
                 s = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=300)
                 
-                # VITAL: Enable TCP Keep-Alive to prevent idle disconnects
+                # TCP Keepalive
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 
-                # Linux specific keepalive tuning (optional but helps)
-                if hasattr(socket, 'TCP_KEEPIDLE'):
-                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
-
                 self.connected = True
-                self.log("NET", "Connected! Handshaking...")
+                self.log("NET", "Connected! Subscribing...")
                 
-                # Subscribe + Suggest Difficulty (Try to get easier jobs)
+                # Handshake & BEG for lower difficulty
                 s.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": ["MTP-v10"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
-                s.sendall((json.dumps({"id": 3, "method": "mining.suggest_difficulty", "params": [32]}) + "\n").encode())
+                s.sendall((json.dumps({"id": 3, "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
 
                 buff = b""
                 
                 while not self.stop.is_set():
-                    # Submit Shares
+                    # Submit
                     while not self.res_q.empty():
                         r = self.res_q.get()
+                        # Corrected Submit Params
                         msg = json.dumps({
                             "id": 4, "method": "mining.submit",
                             "params": [self.cfg['WALLET'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
                         }) + "\n"
                         s.sendall(msg.encode())
-                        self.log("SUBMIT", f"Found Nonce: {r['nonce']}")
+                        self.log("SUBMIT", f"Sent Nonce: {r['nonce']}")
 
                     # Receive
                     try:
                         s.settimeout(0.1)
                         d = s.recv(8192)
-                        if not d: 
-                            self.log("WARN", "Pool closed connection.")
-                            break
+                        if not d: break
                         buff += d
                         
                         while b'\n' in buff:
@@ -325,13 +333,13 @@ class MinerSuite:
                                     r = msg.get('result', [])
                                     if len(r) > 1:
                                         self.data['en1'] = r[1]
-                                        self.log("POOL", f"Subscribed. En1: {r[1]}")
+                                        self.log("POOL", f"En1: {r[1]}")
                                 elif mid == 2: self.log("GOOD", "Authorized!")
                                 elif mid == 4:
-                                    if msg.get('result'): 
+                                    if msg.get('result'):
                                         self.shares['acc'] += 1
                                         self.log("GOOD", "Share ACCEPTED!")
-                                    else: 
+                                    else:
                                         self.shares['rej'] += 1
                                         self.log("BAD", f"Rejected: {msg.get('error')}")
 
@@ -442,7 +450,7 @@ class MinerSuite:
             time.sleep(0.1)
 
     def start(self):
-        ProxyServer(self.cfg['PROXY_PORT'], self.log_q).start()
+        ProxyServer(self.cfg, self.log_q).start()
         threading.Thread(target=self.net_thread, daemon=True).start()
         threading.Thread(target=self.thermal_thread, daemon=True).start()
         
