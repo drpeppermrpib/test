@@ -92,45 +92,72 @@ def get_hw_stats():
     r = psutil.virtual_memory().percent if HAS_PSUTIL else 0.0
     return c, r
 
-# ================= PROXY =================
+# ================= SMART PROXY =================
 class ProxyServer(threading.Thread):
-    def __init__(self, cfg, log_q):
+    def __init__(self, port, log_q, shares_dict):
         super().__init__()
-        self.cfg = cfg
+        self.port = port
         self.log_q = log_q
+        self.shares = shares_dict
         self.daemon = True
         
     def run(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", self.cfg['PROXY_PORT']))
+            sock.bind(("0.0.0.0", self.port))
             sock.listen(5)
-            self.log_q.put(("INFO", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
+            self.log_q.put(("INFO", f"Proxy Active on Port {self.port}"))
             while True:
                 c, a = sock.accept()
-                self.log_q.put(("NET", f"Proxy Client Connected: {a[0]}"))
+                self.log_q.put(("NET", f"ASIC Connected: {a[0]}"))
                 threading.Thread(target=self.handle, args=(c,), daemon=True).start()
         except Exception as e:
             self.log_q.put(("ERR", f"Proxy Error: {e}"))
 
     def handle(self, client):
+        upstream = None
         try:
-            # FIX: Use self.cfg instead of DEFAULT_CONFIG
-            upstream = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=10)
-            def fwd(src, dst):
+            # FIX: Infinite timeout + KeepAlive for ASICs
+            upstream = socket.create_connection((DEFAULT_CONFIG['POOL_URL'], DEFAULT_CONFIG['POOL_PORT']))
+            upstream.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            
+            # Client -> Pool (Snoop for Submits)
+            def client_to_pool():
                 try:
                     while True:
-                        d = src.recv(4096)
-                        if not d: break
-                        dst.sendall(d)
+                        data = client.recv(4096)
+                        if not data: break
+                        upstream.sendall(data)
+                        # Snoop
+                        if b'mining.submit' in data:
+                            # self.log_q.put(("PROXY", "ASIC Submitting Share..."))
+                            pass
                 except: pass
-            t1 = threading.Thread(target=fwd, args=(client, upstream), daemon=True)
-            t2 = threading.Thread(target=fwd, args=(upstream, client), daemon=True)
+
+            # Pool -> Client (Snoop for Accepts)
+            def pool_to_client():
+                try:
+                    while True:
+                        data = upstream.recv(4096)
+                        if not data: break
+                        client.sendall(data)
+                        # Snoop for Result: True
+                        # Note: This is a loose check, but effective for UI counting
+                        if b'"result":true' in data or b'"result": true' in data:
+                            self.shares['acc'] += 1
+                            # self.log_q.put(("PROXY", "ASIC Share Accepted!"))
+                except: pass
+
+            t1 = threading.Thread(target=client_to_pool, daemon=True)
+            t2 = threading.Thread(target=pool_to_client, daemon=True)
             t1.start(); t2.start()
             t1.join(); t2.join()
+
         except: pass
-        finally: client.close()
+        finally: 
+            if upstream: upstream.close()
+            client.close()
 
 # ================= WORKERS =================
 def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
@@ -154,14 +181,8 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
             
             jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
             
-            if not en1 or not c1:
-                time.sleep(0.1); continue
-
             df = diff.value
             pool_target = (0xffff0000 * 2**(256-64) // int(df if df > 0 else 1))
-            
-            # Difficulty 1 Target (For stats)
-            diff1 = 0xffff0000 * 2**(256-64)
             
             en2 = struct.pack('<I', id).hex().zfill(8)
             cb_bin = binascii.unhexlify(c1 + en1 + en2 + c2)
@@ -179,27 +200,17 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
             )
             
             for n in range(nonce, nonce + 3000):
-                # Little Endian Pack for Hash
                 h = header_pre + struct.pack('<I', n)
                 h_hash = hashlib.sha256(hashlib.sha256(h).digest()).digest()
                 val = int.from_bytes(h_hash[::-1], 'big')
                 
-                # FIX: Send the nonce exactly as packed (Little Endian Hex)
-                # This matches what the pool expects for Stratum V1
-                nonce_hex = struct.pack('<I', n).hex()
-
                 if val <= pool_target:
                     res_q.put({
                         "job_id": jid, "extranonce2": en2, 
-                        "ntime": ntime, "nonce": nonce_hex
+                        "ntime": ntime, "nonce": f"{n:08x}"
                     })
-                    log_queue.put(("GOOD", f"** SHARE FOUND! {nonce_hex} **"))
+                    log_queue.put(("CPU", f"NONCE FOUND: {n:08x}"))
                     break
-                
-                # Check for "Near Misses" (Diff > 32) just to log activity
-                if val <= (diff1 // 32):
-                    if id == 0 and (n % 100 == 0):
-                        log_queue.put(("INFO", f"Valid Share (Diff > 32)"))
 
             stats[id] += 3000
             nonce += 3000
@@ -248,23 +259,23 @@ class MinerSuite:
         self.stats = mp.Array('d', [0.0] * (mp.cpu_count() + 1))
         self.diff = mp.Value('d', 1024.0)
         self.throttle = mp.Value('d', 0.0)
-        self.shares = {"acc": 0, "rej": 0}
+        self.shares = self.man.dict() # Changed to dict for proxy updates
+        self.shares['acc'] = 0
+        self.shares['rej'] = 0
+        
         self.start_t = time.time()
         self.logs = []
         self.connected = False
+        self.req_id = 10 # Start IDs at 10
 
     def run_setup(self):
         os.system('clear')
         print("MTP MINER SUITE v10 - BETA 7")
         print("-" * 30)
         self.cfg = DEFAULT_CONFIG.copy()
-        
-        # Simple menu, press enter for default
         print(f"Pool: {self.cfg['POOL_URL']}")
         print(f"Proxy Port: {self.cfg['PROXY_PORT']}")
         print("Press ENTER to start...")
-        # try: input()
-        # except: pass
         time.sleep(1)
 
     def log(self, t, m):
@@ -289,31 +300,31 @@ class MinerSuite:
             try:
                 self.log("NET", f"Dialing {self.cfg['POOL_URL']}...")
                 s = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=300)
-                
-                # TCP Keepalive
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 
                 self.connected = True
-                self.log("NET", "Connected! Subscribing...")
+                self.log("NET", "Connected!")
                 
-                # Handshake & BEG for lower difficulty
+                # Handshake
                 s.sendall((json.dumps({"id": 1, "method": "mining.subscribe", "params": ["MTP-v10"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": 2, "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
-                s.sendall((json.dumps({"id": 3, "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
-
+                
                 buff = b""
                 
                 while not self.stop.is_set():
-                    # Submit
+                    # Submit Shares (FIX: Unique IDs)
                     while not self.res_q.empty():
                         r = self.res_q.get()
-                        # Corrected Submit Params
+                        current_id = self.req_id
+                        self.req_id += 1 # Increment
+                        
                         msg = json.dumps({
-                            "id": 4, "method": "mining.submit",
+                            "id": current_id, 
+                            "method": "mining.submit",
                             "params": [self.cfg['WALLET'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
                         }) + "\n"
                         s.sendall(msg.encode())
-                        self.log("SUBMIT", f"Sent Nonce: {r['nonce']}")
+                        self.log("SUBMIT", f"ID:{current_id} Nonce:{r['nonce']}")
 
                     # Receive
                     try:
@@ -329,26 +340,30 @@ class MinerSuite:
                                 msg = json.loads(line.decode())
                                 mid = msg.get('id')
                                 
+                                # Process Sub/Auth
                                 if mid == 1:
                                     r = msg.get('result', [])
                                     if len(r) > 1:
                                         self.data['en1'] = r[1]
                                         self.log("POOL", f"En1: {r[1]}")
                                 elif mid == 2: self.log("GOOD", "Authorized!")
-                                elif mid == 4:
-                                    if msg.get('result'):
+                                
+                                # Process Share Responses (ID >= 10)
+                                elif mid and mid >= 10:
+                                    if msg.get('result'): 
                                         self.shares['acc'] += 1
-                                        self.log("GOOD", "Share ACCEPTED!")
-                                    else:
+                                        self.log("GOOD", f"Share ID:{mid} ACCEPTED!")
+                                    else: 
                                         self.shares['rej'] += 1
-                                        self.log("BAD", f"Rejected: {msg.get('error')}")
+                                        self.log("BAD", f"Share ID:{mid} REJECTED: {msg.get('error')}")
 
+                                # Notifications
                                 if msg.get('method') == 'mining.notify':
                                     p = msg['params']
                                     self.data['job'] = str(p[0])
                                     en1 = self.data['en1']
                                     if en1:
-                                        if p[8]: # Clean
+                                        if p[8]: 
                                             while not self.job_q.empty(): 
                                                 try: self.job_q.get_nowait()
                                                 except: pass
@@ -424,7 +439,10 @@ class MinerSuite:
             fhr = f"{hr/1e6:.2f} MH/s" if hr > 1e6 else f"{hr/1000:.2f} kH/s"
             
             stdscr.addstr(9, 2, f"TOTAL: {fhr}", curses.color_pair(1)|curses.A_BOLD)
-            stdscr.addstr(9, 40, f"ACC: {self.shares['acc']}  REJ: {self.shares['rej']}", curses.color_pair(2))
+            # Safe access to dict for UI
+            acc = self.shares.get('acc', 0)
+            rej = self.shares.get('rej', 0)
+            stdscr.addstr(9, 40, f"ACC: {acc}  REJ: {rej}", curses.color_pair(2))
             
             bar_w = max(5, w - 20)
             gw = int((g_tmp / 90.0) * bar_w)
@@ -450,7 +468,8 @@ class MinerSuite:
             time.sleep(0.1)
 
     def start(self):
-        ProxyServer(self.cfg, self.log_q).start()
+        # Pass shares dict to proxy
+        ProxyServer(self.cfg['PROXY_PORT'], self.log_q, self.shares).start()
         threading.Thread(target=self.net_thread, daemon=True).start()
         threading.Thread(target=self.thermal_thread, daemon=True).start()
         
