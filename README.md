@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+KXT MINER SUITE v47 - FLUX + V19 ENGINE
+=======================================
+Base: Beta v20 (Realtime Flux, Proxy Stats, UI)
+Engine: v19/v45 (Correct Merkle/Endian/Submission)
+Config: 79C Throttle, 60s Bench
+"""
+
 import sys
 # FIX: Large integer string conversion limit
 try: sys.set_int_max_str_digits(0)
@@ -33,11 +41,12 @@ except ImportError:
 DEFAULT_CONFIG = {
     "POOL_URL": "solo.stratum.braiins.com",
     "POOL_PORT": 3333,
+    # Local worker name
     "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig_local",
     "PASSWORD": "x",
     "PROXY_PORT": 60060,
     "THROTTLE_START": 79.0, # Requested 79C
-    "THROTTLE_MAX": 88.0,
+    "THROTTLE_MAX": 85.0,
     "BENCH_DURATION": 60,   # Requested 60s
     "STATS_URL": "https://solo.braiins.com/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
 }
@@ -71,6 +80,7 @@ def get_local_ip():
     except: return "127.0.0.1"
 
 def get_cst_time():
+    # Central Time is UTC-6
     utc = datetime.now(timezone.utc)
     cst = utc - timedelta(hours=6)
     return cst.strftime("%H:%M:%S")
@@ -97,7 +107,6 @@ def get_hw_stats():
     return c, r
 
 def fix_env():
-    # Helper for GPU worker
     try: os.environ['PATH'] += ':/usr/local/cuda/bin'
     except: pass
 
@@ -120,7 +129,7 @@ class PoolStats(threading.Thread):
                 self.data['api_status'] = "Offline"
             time.sleep(60)
 
-# ================= PROXY =================
+# ================= PROXY (AUTO-NAMER + LIVE TX/RX) =================
 class ProxyServer(threading.Thread):
     def __init__(self, cfg, log_q, proxy_stats):
         super().__init__()
@@ -165,7 +174,6 @@ class ProxyServer(threading.Thread):
                         buff += data
                         while b'\n' in buff:
                             line, buff = buff.split(b'\n', 1)
-                            
                             try:
                                 obj = json.loads(line)
                                 if obj.get('method') == 'mining.authorize':
@@ -174,10 +182,8 @@ class ProxyServer(threading.Thread):
                                         base_wallet = self.cfg['WALLET'].split('.')[0]
                                         obj['params'][0] = f"{base_wallet}.asic_{ip_id}"
                                         line = json.dumps(obj).encode()
-                                
                                 elif obj.get('method') == 'mining.submit':
                                     self.stats['submitted'] += 1
-
                             except: pass
                             pool.sendall(line + b'\n')
                     except: break
@@ -204,7 +210,7 @@ class ProxyServer(threading.Thread):
             if client: client.close()
             if pool: pool.close()
 
-# ================= CPU MINER (V19 ENGINE INJECTED) =================
+# ================= CPU MINER (v19 ENGINE INJECTED) =================
 def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
     active_jid = None
     nonce = id * 100_000_000
@@ -225,7 +231,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
                 time.sleep(0.1); continue
             
             # --- V19 LOGIC STARTS HERE ---
-            jid, prev, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
+            jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
             
             # 1. Random Extranonce2
             en2_bin = os.urandom(4)
@@ -244,7 +250,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
             # 4. Block Header (Endian Flip V19)
             header = (
                 binascii.unhexlify(ver)[::-1] +
-                binascii.unhexlify(prev)[::-1] +
+                binascii.unhexlify(ph)[::-1] +
                 merkle_root +
                 binascii.unhexlify(ntime)[::-1] +
                 binascii.unhexlify(nbits)[::-1]
@@ -258,7 +264,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
                 block_hash = hashlib.sha256(hashlib.sha256(header + nonce_bin).digest()).digest()
                 
                 if block_hash.endswith(target):
-                    # Found share
+                    # Found share (V19 Submission Format)
                     res_q.put({
                         "job_id": jid, 
                         "extranonce2": en2, 
@@ -297,14 +303,13 @@ def gpu_worker(stop, stats, throttle, log_q):
             time.sleep(0.001)
         except: time.sleep(1)
 
-# ================= BENCHMARK (REQUESTED) =================
+# ================= BENCHMARK (60s) =================
 def run_benchmark_sequence():
     os.system('clear')
-    print("=== KXT v20/v19 HYBRID BENCHMARK ===")
+    print("=== KXT v47 HYBRID BENCHMARK ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
     
     stop = mp.Event()
-    throttle = mp.Value('d', 0.0)
     
     procs = []
     # CPU
@@ -336,7 +341,6 @@ def cpu_bench_dummy(stop):
         _ = [random.random() * random.random() for _ in range(1000)]
 
 def gpu_bench_dummy(stop):
-    # Try using real CUDA load if available, else sleep
     try:
         import pycuda.autoinit
         import pycuda.driver as cuda
@@ -349,11 +353,10 @@ def gpu_bench_dummy(stop):
             cuda.Context.synchronize()
     except: time.sleep(0.1)
 
-# ================= APP MANAGER =================
+# ================= APP MANAGER (V20 BASE) =================
 class MinerSuite:
     def __init__(self):
-        run_benchmark_sequence() # 1. Run Bench
-        
+        run_benchmark_sequence() # Add Benchmark
         self.run_setup()
         self.man = mp.Manager()
         self.job_q = self.man.Queue()
@@ -393,7 +396,7 @@ class MinerSuite:
     def run_setup(self):
         os.system('clear')
         self.cfg = DEFAULT_CONFIG.copy()
-        print("Starting Suite...")
+        print("Starting KXT v47...")
         time.sleep(1)
 
     def log(self, t, m):
@@ -405,7 +408,7 @@ class MinerSuite:
         return self.msg_id
 
     def thermal_thread(self):
-        # 79C GOVERNOR
+        # 79C GOVERNOR (Requested)
         while not self.stop.is_set():
             c, g = get_temps()
             mx = max(c, g)
@@ -430,7 +433,7 @@ class MinerSuite:
                 
                 self.local_stats['submitted'] += 1
                 
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v46-Hybrid"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v47"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
 
@@ -525,7 +528,6 @@ class MinerSuite:
             c_tmp, g_tmp = get_temps()
             c_load, ram = get_hw_stats()
             
-            # Calculate Real-Time Fluctuation
             current_total = 0.0
             for i in range(len(self.stats)):
                 delta = self.stats[i] - self.last_stats[i]
@@ -540,7 +542,7 @@ class MinerSuite:
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
             
-            stdscr.addstr(0, 0, f" KXT MINER v46 - HYBRID ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f" KXT MINER v47 - FLUX ".center(w), curses.color_pair(5)|curses.A_BOLD)
             
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
