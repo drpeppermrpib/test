@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-KXT MINER SUITE v47 - FLUX + V19 ENGINE
-=======================================
-Base: Beta v20 (Realtime Flux, Proxy Stats, UI)
-Engine: v19/v45 (Correct Merkle/Endian/Submission)
-Config: 79C Throttle, 60s Bench
-"""
-
 import sys
 # FIX: Large integer string conversion limit
 try: sys.set_int_max_str_digits(0)
@@ -41,13 +33,12 @@ except ImportError:
 DEFAULT_CONFIG = {
     "POOL_URL": "solo.stratum.braiins.com",
     "POOL_PORT": 3333,
-    # Local worker name
     "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig_local",
     "PASSWORD": "x",
     "PROXY_PORT": 60060,
-    "THROTTLE_START": 79.0, # Requested 79C
-    "THROTTLE_MAX": 85.0,
-    "BENCH_DURATION": 60,   # Requested 60s
+    "THROTTLE_START": 79.0, 
+    "THROTTLE_MAX": 88.0,
+    "BENCH_DURATION": 60,
     "STATS_URL": "https://solo.braiins.com/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
 }
 
@@ -80,13 +71,11 @@ def get_local_ip():
     except: return "127.0.0.1"
 
 def get_cst_time():
-    # Central Time is UTC-6
     utc = datetime.now(timezone.utc)
     cst = utc - timedelta(hours=6)
     return cst.strftime("%H:%M:%S")
 
 def get_temps():
-    # Original v20 Sensor Logic
     c, g = 0.0, 0.0
     try:
         o = subprocess.check_output("sensors", shell=True).decode()
@@ -129,7 +118,7 @@ class PoolStats(threading.Thread):
                 self.data['api_status'] = "Offline"
             time.sleep(60)
 
-# ================= PROXY (AUTO-NAMER + LIVE TX/RX) =================
+# ================= PROXY =================
 class ProxyServer(threading.Thread):
     def __init__(self, cfg, log_q, proxy_stats):
         super().__init__()
@@ -149,10 +138,8 @@ class ProxyServer(threading.Thread):
                 c, a = sock.accept()
                 try: ip_id = a[0].split('.')[-1]
                 except: ip_id = "00"
-                
                 self.log_q.put(("NET", f"Proxy: ASIC_{ip_id} Connected"))
                 self.stats['submitted'] += 1
-                
                 threading.Thread(target=self.handle, args=(c, ip_id), daemon=True).start()
         except Exception as e:
             self.log_q.put(("ERR", f"Proxy Error: {e}"))
@@ -170,7 +157,6 @@ class ProxyServer(threading.Thread):
                     try:
                         data = client.recv(4096)
                         if not data: break
-                        
                         buff += data
                         while b'\n' in buff:
                             line, buff = buff.split(b'\n', 1)
@@ -210,7 +196,7 @@ class ProxyServer(threading.Thread):
             if client: client.close()
             if pool: pool.close()
 
-# ================= CPU MINER (v19 ENGINE INJECTED) =================
+# ================= CPU MINER (v19 ENGINE + JOB ID FIX) =================
 def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
     active_jid = None
     nonce = id * 100_000_000
@@ -218,53 +204,57 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
     while not stop.is_set():
         if throttle.value > 0.0: time.sleep(throttle.value)
 
+        # FIXED JOB SWITCHING LOGIC
         try:
-            try:
-                job = job_q.get_nowait()
-                if not active_jid or job[0] != active_jid or job[8]:
-                    active_jid = job[0]
-                    curr_job = job
-                    nonce = id * 100_000_000 
-            except queue.Empty: pass
+            # Check for new job (Non-blocking)
+            # If a new job exists, we MUST switch to it immediately
+            if not job_q.empty():
+                try:
+                    new_job = job_q.get_nowait()
+                    # If job ID changed OR clean_jobs=True
+                    if active_jid != new_job[0] or new_job[8]:
+                        active_jid = new_job[0]
+                        curr_job = new_job
+                        # Reset Nonce for new job
+                        nonce = id * 100_000_000
+                        # log_q.put(("INFO", f"Worker {id} Switched to {active_jid[:8]}"))
+                except queue.Empty: pass
+        except: pass
             
-            if not active_jid: 
-                time.sleep(0.1); continue
+        if not active_jid: 
+            time.sleep(0.1); continue
             
-            # --- V19 LOGIC STARTS HERE ---
-            jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
+        # --- V19 LOGIC ---
+        try:
+            jid, prev, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
             
-            # 1. Random Extranonce2
             en2_bin = os.urandom(4)
             en2 = binascii.hexlify(en2_bin).decode()
             
-            # 2. Coinbase
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
             coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
             
-            # 3. Merkle Root
             merkle_root = coinbase_hash
             for branch in mb:
                 branch_bin = binascii.unhexlify(branch)
                 merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + branch_bin).digest()).digest()
                 
-            # 4. Block Header (Endian Flip V19)
             header = (
                 binascii.unhexlify(ver)[::-1] +
-                binascii.unhexlify(ph)[::-1] +
+                binascii.unhexlify(prev)[::-1] +
                 merkle_root +
                 binascii.unhexlify(ntime)[::-1] +
                 binascii.unhexlify(nbits)[::-1]
             )
             
-            # 5. Search
-            target = b'\x00\x00' # Simple diff check for speed
+            target = b'\x00\x00'
             
-            for n in range(nonce, nonce + 5000):
+            # Small batch size to check for new jobs frequently
+            for n in range(nonce, nonce + 2000):
                 nonce_bin = struct.pack('<I', n)
                 block_hash = hashlib.sha256(hashlib.sha256(header + nonce_bin).digest()).digest()
                 
                 if block_hash.endswith(target):
-                    # Found share (V19 Submission Format)
                     res_q.put({
                         "job_id": jid, 
                         "extranonce2": en2, 
@@ -273,9 +263,8 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
                     })
                     break
 
-            # Update live stats for fluctuation
-            stats[id] += 5000
-            nonce += 5000
+            stats[id] += 2000
+            nonce += 2000
             
         except Exception: time.sleep(0.1)
 
@@ -299,24 +288,22 @@ def gpu_worker(stop, stats, throttle, log_q):
             seed = np.int32(int(time.time()))
             func(cuda.Out(out), seed, block=(256,1,1), grid=(65535,1))
             cuda.Context.synchronize()
-            stats[-1] += 120_000_000 # Fluctuation Base
+            stats[-1] += 120_000_000
             time.sleep(0.001)
         except: time.sleep(1)
 
-# ================= BENCHMARK (60s) =================
+# ================= BENCHMARK =================
 def run_benchmark_sequence():
     os.system('clear')
-    print("=== KXT v47 HYBRID BENCHMARK ===")
+    print("=== KXT v47 SYSTEM AUDIT ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
     
     stop = mp.Event()
     
     procs = []
-    # CPU
     for _ in range(mp.cpu_count()):
         p = mp.Process(target=cpu_bench_dummy, args=(stop,))
         p.start(); procs.append(p)
-    # GPU
     gp = mp.Process(target=gpu_bench_dummy, args=(stop,))
     gp.start(); procs.append(gp)
     
@@ -353,10 +340,11 @@ def gpu_bench_dummy(stop):
             cuda.Context.synchronize()
     except: time.sleep(0.1)
 
-# ================= APP MANAGER (V20 BASE) =================
+# ================= APP MANAGER =================
 class MinerSuite:
     def __init__(self):
-        run_benchmark_sequence() # Add Benchmark
+        run_benchmark_sequence()
+        
         self.run_setup()
         self.man = mp.Manager()
         self.job_q = self.man.Queue()
@@ -379,7 +367,6 @@ class MinerSuite:
         self.local_stats['submitted'] = 0
         
         self.stats = mp.Array('d', [0.0] * (mp.cpu_count() + 1))
-        # Previous stats for calculation delta
         self.last_stats = [0.0] * (mp.cpu_count() + 1)
         
         self.diff = mp.Value('d', 1024.0)
@@ -390,13 +377,12 @@ class MinerSuite:
         self.connected = False
         self.msg_id = 1
         
-        # Fluctuation Tracking
         self.current_hashrate = 0.0
 
     def run_setup(self):
         os.system('clear')
         self.cfg = DEFAULT_CONFIG.copy()
-        print("Starting KXT v47...")
+        print("Starting Suite...")
         time.sleep(1)
 
     def log(self, t, m):
@@ -408,7 +394,6 @@ class MinerSuite:
         return self.msg_id
 
     def thermal_thread(self):
-        # 79C GOVERNOR (Requested)
         while not self.stop.is_set():
             c, g = get_temps()
             mx = max(c, g)
@@ -433,14 +418,14 @@ class MinerSuite:
                 
                 self.local_stats['submitted'] += 1
                 
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v47"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v47-Fix"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
 
                 buff = b""
                 
                 while not self.stop.is_set():
-                    # TX: Submit (Using v19 format)
+                    # TX: Submit
                     while not self.res_q.empty():
                         r = self.res_q.get()
                         msg = json.dumps({
@@ -483,11 +468,13 @@ class MinerSuite:
                                     self.data['job'] = str(p[0])
                                     en1 = self.data['en1']
                                     if en1:
+                                        # FIX: Flush queue if clean_jobs=True
                                         if p[8]: 
                                             while not self.job_q.empty(): 
                                                 try: self.job_q.get_nowait()
                                                 except: pass
                                         j = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1)
+                                        # Flood queue so workers pick it up immediately
                                         for _ in range(mp.cpu_count() * 2): self.job_q.put(j)
                                         self.log("RX", f"New Job: {p[0]}")
                                 
@@ -534,7 +521,7 @@ class MinerSuite:
                 current_total += delta
                 self.last_stats[i] = self.stats[i]
             
-            self.current_hashrate = (self.current_hashrate * 0.7) + (current_total * 0.3 * 10) # x10 for 0.1s refresh
+            self.current_hashrate = (self.current_hashrate * 0.7) + (current_total * 0.3 * 10)
             
             hr_disp = self.current_hashrate
             fhr = f"{hr_disp/1e6:.2f} MH/s" if hr_disp > 1e6 else f"{hr_disp/1000:.2f} kH/s"
@@ -542,7 +529,7 @@ class MinerSuite:
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
             
-            stdscr.addstr(0, 0, f" KXT MINER v47 - FLUX ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f" MTP MINER SUITE v20 ".center(w), curses.color_pair(5)|curses.A_BOLD)
             
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
@@ -580,6 +567,7 @@ class MinerSuite:
                     if "ERR" in l[1]: c = curses.color_pair(3)
                     elif "WARN" in l[1]: c = curses.color_pair(2)
                     elif "TX" in l[1]: c = curses.color_pair(5)
+                    elif "RX" in l[1]: c = curses.color_pair(4)
                     try: stdscr.addstr(13+i, 2, f"{l[0]} [{l[1]}] {l[2]}"[:w-4], c)
                     except: pass
             
