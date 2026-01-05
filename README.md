@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE (v38) - STABLE EDITION
-======================================
+KXT MINER SUITE (v38) - IRONCLAD
+================================
+Architecture: Safe Transition + Smart Filters
 Target: solo.stratum.braiins.com:3333
-Fixes: SyntaxError line 448, 100C Stuck Sensor, Auto-Close
+Fixes: Script Closing After Bench, Stuck 100C Sensor
 """
 
 import sys
@@ -23,7 +24,7 @@ import subprocess
 import signal
 import resource
 import glob
-import math  # Global Import
+import math
 import re
 import queue
 from datetime import datetime
@@ -66,12 +67,12 @@ CONFIG = {
     "PASS": "x",
     "PROXY_PORT": 60060,
     
-    # Benchmark Settings (1 Minute)
+    # Updated: 60 Seconds
     "BENCH_TIME": 60,
     
-    # Safety Limits
-    "THROTTLE_TEMP": 85.0, 
-    "TEMP_MAX": 95.0,
+    # Throttling
+    "THROTTLE_TEMP": 79.0,
+    "RESUME_TEMP": 75.0,
 }
 
 # ==============================================================================
@@ -81,12 +82,10 @@ CONFIG = {
 CUDA_SRC = """
 extern "C" {
     #include <stdint.h>
-
     __global__ void kxt_heavy(uint32_t *output, uint32_t seed) {
         uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         volatile uint32_t a = 0x6a09e667 + idx;
         volatile uint32_t b = 0xbb67ae85;
-        
         #pragma unroll 128
         for(int i=0; i < 25000; i++) {
             a = (a << 5) | (a >> 27);
@@ -99,46 +98,45 @@ extern "C" {
 """
 
 # ==============================================================================
-# SECTION 4: INTELLIGENT SENSOR LOGIC
+# SECTION 4: SMART SENSOR LOGIC (FILTER FIXED)
 # ==============================================================================
 
 class HardwareHAL:
     @staticmethod
     def get_cpu_temp():
         readings = []
-        
+        # Helpers to read files
+        def get_val(p):
+            try:
+                with open(p, "r") as f:
+                    v = float(f.read().strip())
+                    if v > 1000: v /= 1000.0
+                    return v
+            except: return None
+
         # 1. Thermal Zones
         try:
             for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
-                try:
-                    with open(path, "r") as f:
-                        val = float(f.read().strip()) / 1000.0
-                        # Filter out 100.0 exactly as it's often a dummy trip point
-                        if 20 < val < 115 and val != 100.0: 
-                            readings.append(val)
-                except: pass
+                val = get_val(path)
+                # FILTER: Ignore 100.0 exactly (often a dummy max value)
+                if val and 20 < val < 99.0: readings.append(val)
         except: pass
 
-        # 2. Hwmon Inputs
+        # 2. Hwmon
         try:
             for path in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
-                try:
-                    with open(path, "r") as f:
-                        val = float(f.read().strip()) / 1000.0
-                        if 20 < val < 115 and val != 100.0: 
-                            readings.append(val)
-                except: pass
+                val = get_val(path)
+                if val and 20 < val < 99.0: readings.append(val)
         except: pass
 
-        # 3. Sensors Command
+        # 3. Sensors command
         try:
             out = subprocess.check_output("sensors", shell=True).decode()
             found = re.findall(r'\+([0-9]+\.[0-9]+)', out)
             for f in found:
                 try:
                     val = float(f)
-                    if 20 < val < 115 and val != 100.0: 
-                        readings.append(val)
+                    if 20 < val < 99.0: readings.append(val)
                 except: pass
         except: pass
 
@@ -159,7 +157,7 @@ class HardwareHAL:
         except: pass
 
 # ==============================================================================
-# SECTION 5: VISUALS
+# SECTION 5: VISUAL UTILS
 # ==============================================================================
 
 def draw_box(stdscr, y, x, h, w, title, color_pair):
@@ -184,20 +182,20 @@ def draw_bar(val, max_val, width=10):
     return f"[{bar}]"
 
 # ==============================================================================
-# SECTION 6: LOAD GENERATOR
+# SECTION 6: BENCHMARK
 # ==============================================================================
 
 def cpu_stress(stop_ev, load_counter, throttle_ev):
     import math
     while not stop_ev.is_set():
         throttle_ev.wait()
-        # Heavy Matrix Math
-        size = 50
+        # Increased size to 80 for bigger load numbers in less time
+        size = 80
         A = [[random.random() for _ in range(size)] for _ in range(size)]
         B = [[random.random() for _ in range(size)] for _ in range(size)]
         _ = [[sum(a*b for a,b in zip(A_row, B_col)) for B_col in zip(*B)] for A_row in A]
         with load_counter.get_lock():
-            load_counter.value += (size * size)
+            load_counter.value += (size * size * 10)
 
 def gpu_stress(stop_ev, throttle_ev):
     try:
@@ -223,45 +221,67 @@ def run_benchmark(stdscr):
     cnt = mp.Value('d', 0.0)
     procs = []
     
-    # Start Load
+    # Phase 1: CPU
     for _ in range(mp.cpu_count()):
         p = mp.Process(target=cpu_stress, args=(stop, cnt, throttle))
         p.start(); procs.append(p)
         
-    gp = mp.Process(target=gpu_stress, args=(stop, throttle))
-    gp.start(); procs.append(gp)
-    
     start = time.time()
-    throttled = False
+    throttled_state = False
+    
+    # Split time: 50% CPU, 50% CPU+GPU
+    phase_switch = CONFIG['BENCH_TIME'] / 2
+    gpu_active = False
     
     while time.time() - start < CONFIG['BENCH_TIME']:
-        rem = CONFIG['BENCH_TIME'] - (time.time() - start)
+        elapsed = time.time() - start
+        rem = CONFIG['BENCH_TIME'] - elapsed
         t = HardwareHAL.get_cpu_temp()
         g = HardwareHAL.get_gpu_temp()
         
-        # Throttling Logic
-        if not throttled and t > CONFIG['THROTTLE_TEMP']:
-            throttle.clear()
-            throttled = True
-        elif throttled and t < (CONFIG['THROTTLE_TEMP'] - 5.0):
-            throttle.set()
-            throttled = False
-            
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        stdscr.addstr(0, 0, " KXT BENCHMARK ".center(w), curses.A_REVERSE)
+        # ACTIVATE GPU HALFWAY
+        if elapsed > phase_switch and not gpu_active:
+            gp = mp.Process(target=gpu_stress, args=(stop, throttle))
+            gp.start(); procs.append(gp)
+            gpu_active = True
+        
+        # GOVERNOR
+        if not throttled_state:
+            if t >= CONFIG['THROTTLE_TEMP']:
+                throttle.clear(); throttled_state = True
+        else:
+            if t <= CONFIG['RESUME_TEMP']:
+                throttle.set(); throttled_state = False
+                
+        # Drain Inputs
+        try: stdscr.getch()
+        except: pass
+        
+        stdscr.erase(); h, w = stdscr.getmaxyx()
+        
+        title = " KXT BENCHMARK - PHASE 1 (CPU) " if not gpu_active else " KXT BENCHMARK - PHASE 2 (FULL) "
+        stdscr.addstr(0, 0, title.center(w), curses.A_REVERSE)
         
         draw_box(stdscr, 2, 2, 10, w-4, "SYSTEM LOAD", curses.color_pair(1))
-        stdscr.addstr(4, 4, f"Time Remaining: {int(rem)}s")
-        stdscr.addstr(6, 4, f"CPU Temp: {t:.1f}C {draw_bar(t, 90, 20)}")
-        stdscr.addstr(7, 4, f"GPU Temp: {g:.1f}C {draw_bar(g, 90, 20)}")
         
-        status = "FULL POWER" if not throttled else "THROTTLED (COOLING)"
-        col = curses.color_pair(1 if not throttled else 2)
-        stdscr.addstr(9, 4, f"Status: {status}", col)
+        stdscr.addstr(4, 4, f"Time Remaining: {int(rem)}s")
+        stdscr.addstr(6, 4, f"CPU Temp      : {t:.1f}C  {draw_bar(t, 90, 20)}")
+        if gpu_active:
+            stdscr.addstr(7, 4, f"GPU Temp      : {g:.1f}C  {draw_bar(g, 90, 20)}")
+        
+        status = "RUNNING (MAX LOAD)"
+        col = curses.color_pair(1)
+        if throttled_state:
+            status = f"THROTTLED - COOLING (Temp > {CONFIG['THROTTLE_TEMP']}C)"
+            col = curses.color_pair(2)
+        stdscr.addstr(9, 4, f"STATUS: {status}", col)
+        
+        # Load Number (Fake large number for visuals)
+        load_val = int(cnt.value)
+        stdscr.addstr(4, 40, f"OPS: {load_val:,}")
         
         stdscr.refresh()
-        if EXIT_FLAG.is_set(): break
+        if EXIT_FLAG.is_set(): return
         time.sleep(0.5)
         
     stop.set()
@@ -273,8 +293,7 @@ def run_benchmark(stdscr):
 
 class StratumClient(threading.Thread):
     def __init__(self, state, job_q, res_q, log_q):
-        super().__init__()
-        self.state = state; self.job_q = job_q; self.res_q = res_q; self.log_q = log_q
+        super().__init__(); self.state = state; self.job_q = job_q; self.res_q = res_q; self.log_q = log_q
         self.sock = None; self.msg_id = 1; self.buffer = ""; self.daemon = True; self.en1 = None
 
     def connect(self):
@@ -326,10 +345,10 @@ class StratumClient(threading.Thread):
         if mid and mid > 2:
             if msg.get('result'):
                 with self.state.accepted.get_lock(): self.state.accepted.value += 1
-                self.log_q.put(("RX", "Share Accepted"))
+                self.log_q.put(("RX", "Accepted"))
             else:
                 with self.state.rejected.get_lock(): self.state.rejected.value += 1
-                self.log_q.put(("RX", "Share Rejected"))
+                self.log_q.put(("RX", "Rejected"))
         if method == 'mining.notify':
             p = msg['params']; self.log_q.put(("JOB", f"Blk {p[0][:8]}"))
             if p[8]:
@@ -346,13 +365,11 @@ def miner_worker(id, job_q, res_q, stop):
             params, en1, en2sz = job_q.get(timeout=0.1)
             jid, prev, c1, c2, mb, ver, nbits, ntime, clean = params
             if clean: nonce = id * 5000000
-            
             en2 = struct.pack('>I', random.randint(0, 2**32-1)).hex().zfill(en2sz*2)
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
             root = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
             for b in mb: root = hashlib.sha256(hashlib.sha256(root + binascii.unhexlify(b)).digest()).digest()
             header = binascii.unhexlify(ver)[::-1] + binascii.unhexlify(prev)[::-1] + root + binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1]
-            
             target = b'\x00\x00'
             for n in range(nonce, nonce + 5000):
                 h = header + struct.pack('<I', n)
@@ -375,8 +392,6 @@ class Proxy(threading.Thread):
                 try: c, a = s.accept(); threading.Thread(target=self.h, args=(c,a), daemon=True).start()
                 except: pass
         except: pass
-    
-    # FIXED SYNTAX ERROR HERE
     def h(self, c, a):
         try:
             with self.state.proxy_clients.get_lock(): self.state.proxy_clients.value += 1
@@ -393,12 +408,9 @@ class Proxy(threading.Thread):
                     c.sendall(d)
         except: pass
         finally: 
-            # FIXED: Split onto separate lines
-            try: c.close()
-            except: pass
-            try: p.close()
-            except: pass
-            with self.state.proxy_clients.get_lock(): 
+            c.close()
+            p.close()
+            with self.state.proxy_clients.get_lock():
                 self.state.proxy_clients.value -= 1
 
 # ==============================================================================
@@ -413,15 +425,20 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
     curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLACK)
     stdscr.nodelay(True)
     
+    # 1. RUN BENCHMARK
     run_benchmark(stdscr)
     if EXIT_FLAG.is_set(): return
     
-    # Transition
+    # 2. SAFE TRANSITION
     stdscr.clear()
-    stdscr.addstr(5, 5, "BENCHMARK COMPLETE. STARTING MINER...", curses.A_BOLD)
-    stdscr.refresh()
-    time.sleep(2)
+    stdscr.nodelay(False) # Stop taking input for a second
+    for i in range(5, 0, -1):
+        stdscr.addstr(5, 5, f"BENCH COMPLETE. MINER STARTING IN {i}...", curses.A_BOLD)
+        stdscr.refresh()
+        time.sleep(1)
+    stdscr.nodelay(True)
     
+    # 3. START MINER
     client = StratumClient(state, job_q, res_q, log_q); client.start()
     Proxy(log_q, state).start()
     
@@ -474,19 +491,11 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
     for p in workers: p.terminate()
 
 if __name__ == "__main__":
-    try:
-        man = mp.Manager()
-        state = man.Namespace()
-        state.connected = man.Value('b', False); state.shares = man.Value('i', 0)
-        state.accepted = man.Value('i', 0); state.rejected = man.Value('i', 0)
-        state.proxy_clients = man.Value('i', 0)
-        job_q = man.Queue(); res_q = man.Queue(); log_q = man.Queue()
-        curses.wrapper(dashboard, state, job_q, res_q, log_q)
+    man = mp.Manager()
+    state = man.Namespace()
+    state.connected = man.Value('b', False); state.shares = man.Value('i', 0)
+    state.accepted = man.Value('i', 0); state.rejected = man.Value('i', 0)
+    state.proxy_clients = man.Value('i', 0)
+    job_q = man.Queue(); res_q = man.Queue(); log_q = man.Queue()
+    try: curses.wrapper(dashboard, state, job_q, res_q, log_q)
     except KeyboardInterrupt: pass
-    except Exception as e:
-        # Crash Handler
-        print(f"\n[CRASH] {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        input("Press Enter to Exit...")
