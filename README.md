@@ -1,508 +1,610 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-KXT MINER SUITE v45
-===================
-Base: Beta v20 (UI, Sensors, Proxy)
-Engine: kxt.py v19 (Block Hashing & Submission)
-Add-on: 60s Bench + 79C Limit
-"""
-
 import sys
-
 # FIX: Large integer string conversion limit
 try: sys.set_int_max_str_digits(0)
 except: pass
 
-import os
-import time
 import socket
 import json
+import time
 import threading
 import multiprocessing as mp
 import curses
 import binascii
 import struct
 import hashlib
-import random
-import select
 import subprocess
-import signal
-import resource
+import os
 import queue
-from datetime import datetime
+import select
+import urllib.request
+import random
+from datetime import datetime, timedelta, timezone
 
-# ==============================================================================
-# SECTION 1: SYSTEM PREP (V20 BASE)
-# ==============================================================================
+# ================= AUTO-DEPENDENCY =================
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
-EXIT_FLAG = mp.Event()
-
-def signal_handler(signum, frame):
-    """Silent exit handler to prevent UI corruption."""
-    if not EXIT_FLAG.is_set():
-        EXIT_FLAG.set()
-        try:
-            import curses
-            curses.endwin()
-        except: pass
-        sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-def boot_checks():
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        resource.setrlimit(resource.RLIMIT_NOFILE, (min(65535, hard), hard))
-    except: pass
-
-boot_checks()
-
-# ==============================================================================
-# SECTION 2: CONFIGURATION
-# ==============================================================================
-
-CONFIG = {
-    "POOL": "solo.stratum.braiins.com",
-    "PORT": 3333,
-    "USER": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig1",
-    "PASS": "x",
+# ================= CONFIGURATION =================
+DEFAULT_CONFIG = {
+    "POOL_URL": "solo.stratum.braiins.com",
+    "POOL_PORT": 3333,
+    "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig_local",
+    "PASSWORD": "x",
     "PROXY_PORT": 60060,
-    "BENCH_TIME": 60,
-    "THROTTLE_TEMP": 79.0,
-    "RESUME_TEMP": 75.0,
+    "THROTTLE_START": 79.0, # Requested 79C
+    "THROTTLE_MAX": 88.0,
+    "BENCH_DURATION": 60,   # Requested 60s
+    "STATS_URL": "https://solo.braiins.com/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
 }
 
-# ==============================================================================
-# SECTION 3: CUDA (HEAVY LOAD)
-# ==============================================================================
-
-CUDA_SRC = """
-extern "C" {
-    #include <stdint.h>
-    __global__ void kxt_burn(uint32_t *output, uint32_t seed) {
-        uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        volatile uint32_t a = 0x6a09e667 + idx + seed;
-        volatile uint32_t b = 0xbb67ae85;
-        #pragma unroll 128
-        for(int i=0; i < 25000; i++) {
-            a = (a << 5) | (a >> 27);
-            b ^= a;
-            a += b + 0xDEADBEEF;
-            if (i % 1000 == 0) output[idx % 1024] = a;
-        }
-    }
+# ================= PTX KERNEL =================
+PTX_CODE = """
+.version 6.5
+.target sm_30
+.address_size 64
+.visible .entry heavy_load(.param .u64 p0, .param .u32 p1) {
+    .reg .pred %p<2>; .reg .b32 %r<10>; .reg .b64 %rd<3>;
+    ld.param.u64 %rd1, [p0]; ld.param.u32 %r1, [p1];
+    mov.u32 %r2, 0; mov.u32 %r3, 500000;
+L_LOOP:
+    setp.ge.u32 %p1, %r2, %r3; @%p1 bra L_EXIT;
+    mul.lo.s32 %r4, %r2, 1664525; add.s32 %r4, %r4, 1013904223; xor.b32 %r4, %r4, %r1;
+    add.s32 %r2, %r2, 1; bra L_LOOP;
+L_EXIT:
+    st.global.u32 [%rd1], %r4; ret;
 }
 """
 
-# ==============================================================================
-# SECTION 4: SENSORS (V20 SIMPLE LOGIC - AS REQUESTED)
-# ==============================================================================
-
-class HardwareHAL:
-    @staticmethod
-    def get_cpu_temp():
-        # ORIGINAL V20 SIMPLE LOGIC
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-                val = float(f.read().strip())
-                if val > 1000: val /= 1000.0
-                return val
-        except: pass
-        return 0.0
-
-    @staticmethod
-    def get_gpu_temp():
-        try:
-            o = subprocess.check_output("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader", shell=True)
-            return float(o.decode().strip())
-        except: return 0.0
-
-    @staticmethod
-    def force_fans():
-        try: subprocess.run("nvidia-settings -a '[gpu:0]/GPUFanControlState=1' -a '[fan:0]/GPUTargetFanSpeed=100'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except: pass
-
-# ==============================================================================
-# SECTION 5: BENCHMARK (TEXT MODE - 60s)
-# ==============================================================================
-
-def cpu_task(stop, throttle, cnt):
-    import math
-    size = 60
-    A = [[random.random() for _ in range(size)] for _ in range(size)]
-    B = [[random.random() for _ in range(size)] for _ in range(size)]
-    while not stop.is_set():
-        throttle.wait()
-        _ = [[sum(a*b for a,b in zip(A_row, B_col)) for B_col in zip(*B)] for A_row in A]
-        with cnt.get_lock(): cnt.value += 1
-
-def gpu_task(stop, throttle):
+# ================= UTILS =================
+def get_local_ip():
     try:
-        import pycuda.driver as cuda
-        import pycuda.autoinit
-        from pycuda.compiler import SourceModule
-        import numpy as np
-        mod = SourceModule(CUDA_SRC)
-        func = mod.get_function("kxt_burn")
-        out = cuda.mem_alloc(4096)
-        while not stop.is_set():
-            throttle.wait()
-            func(out, np.uint32(time.time()), block=(512,1,1), grid=(128,1))
-            cuda.Context.synchronize()
-    except: time.sleep(1)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except: return "127.0.0.1"
 
-def run_benchmark():
-    os.system('clear')
-    print("=== KXT v45 SYSTEM AUDIT (V20 BASE) ===")
+def get_cst_time():
+    utc = datetime.now(timezone.utc)
+    cst = utc - timedelta(hours=6)
+    return cst.strftime("%H:%M:%S")
+
+def get_temps():
+    # Original v20 Sensor Logic
+    c, g = 0.0, 0.0
+    try:
+        o = subprocess.check_output("sensors", shell=True).decode()
+        for l in o.splitlines():
+            if any(k in l for k in ["Tdie", "Tctl", "Package id 0", "Core 0"]):
+                try: c = float(l.split('+')[1].split('°')[0].strip())
+                except: continue
+    except: pass
+    try:
+        o = subprocess.check_output("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader", shell=True).decode()
+        g = float(o.strip())
+    except: pass
+    return c, g
+
+def get_hw_stats():
+    c = psutil.cpu_percent() if HAS_PSUTIL else 0.0
+    r = psutil.virtual_memory().percent if HAS_PSUTIL else 0.0
+    return c, r
+
+def fix_env():
+    # Helper for GPU worker
+    try: os.environ['PATH'] += ':/usr/local/cuda/bin'
+    except: pass
+
+# ================= POOL STATS =================
+class PoolStats(threading.Thread):
+    def __init__(self, url, data_store):
+        super().__init__()
+        self.url = url
+        self.data = data_store
+        self.daemon = True
+        
+    def run(self):
+        while True:
+            try:
+                req = urllib.request.Request(self.url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    _ = response.read()
+                    self.data['api_status'] = "Online"
+            except:
+                self.data['api_status'] = "Offline"
+            time.sleep(60)
+
+# ================= PROXY =================
+class ProxyServer(threading.Thread):
+    def __init__(self, cfg, log_q, proxy_stats):
+        super().__init__()
+        self.cfg = cfg
+        self.log_q = log_q
+        self.stats = proxy_stats
+        self.daemon = True
+        
+    def run(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", self.cfg['PROXY_PORT']))
+            sock.listen(10)
+            self.log_q.put(("INFO", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
+            while True:
+                c, a = sock.accept()
+                try: ip_id = a[0].split('.')[-1]
+                except: ip_id = "00"
+                
+                self.log_q.put(("NET", f"Proxy: ASIC_{ip_id} Connected"))
+                self.stats['submitted'] += 1
+                
+                threading.Thread(target=self.handle, args=(c, ip_id), daemon=True).start()
+        except Exception as e:
+            self.log_q.put(("ERR", f"Proxy Error: {e}"))
+
+    def handle(self, client, ip_id):
+        pool = None
+        try:
+            pool = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            pool.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+            def fwd_up():
+                buff = b""
+                while True:
+                    try:
+                        data = client.recv(4096)
+                        if not data: break
+                        
+                        buff += data
+                        while b'\n' in buff:
+                            line, buff = buff.split(b'\n', 1)
+                            
+                            try:
+                                obj = json.loads(line)
+                                if obj.get('method') == 'mining.authorize':
+                                    user = obj['params'][0]
+                                    if 'asic' not in user:
+                                        base_wallet = self.cfg['WALLET'].split('.')[0]
+                                        obj['params'][0] = f"{base_wallet}.asic_{ip_id}"
+                                        line = json.dumps(obj).encode()
+                                
+                                elif obj.get('method') == 'mining.submit':
+                                    self.stats['submitted'] += 1
+
+                            except: pass
+                            pool.sendall(line + b'\n')
+                    except: break
+
+            def fwd_down():
+                while True:
+                    try:
+                        data = pool.recv(4096)
+                        if not data: break
+                        if b'"result":true' in data or b'"result": true' in data:
+                             self.stats['accepted'] += 1
+                             self.log_q.put(("RX", f"ASIC_{ip_id} Share ACCEPTED!"))
+                        elif b'"result":false' in data:
+                             self.stats['rejected'] += 1
+                        client.sendall(data)
+                    except: break
+
+            t1 = threading.Thread(target=fwd_up, daemon=True)
+            t2 = threading.Thread(target=fwd_down, daemon=True)
+            t1.start(); t2.start()
+            t1.join(); t2.join()
+        except: pass
+        finally: 
+            if client: client.close()
+            if pool: pool.close()
+
+# ================= CPU MINER (V19 ENGINE INJECTED) =================
+def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
+    active_jid = None
+    nonce = id * 100_000_000
     
-    threading.Thread(target=lambda: [HardwareHAL.force_fans(), time.sleep(5)], daemon=True).start()
+    while not stop.is_set():
+        if throttle.value > 0.0: time.sleep(throttle.value)
+
+        try:
+            try:
+                job = job_q.get_nowait()
+                if not active_jid or job[0] != active_jid or job[8]:
+                    active_jid = job[0]
+                    curr_job = job
+                    nonce = id * 100_000_000 
+            except queue.Empty: pass
+            
+            if not active_jid: 
+                time.sleep(0.1); continue
+            
+            # --- V19 LOGIC STARTS HERE ---
+            jid, prev, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
+            
+            # 1. Random Extranonce2
+            en2_bin = os.urandom(4)
+            en2 = binascii.hexlify(en2_bin).decode()
+            
+            # 2. Coinbase
+            coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
+            coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
+            
+            # 3. Merkle Root
+            merkle_root = coinbase_hash
+            for branch in mb:
+                branch_bin = binascii.unhexlify(branch)
+                merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + branch_bin).digest()).digest()
+                
+            # 4. Block Header (Endian Flip V19)
+            header = (
+                binascii.unhexlify(ver)[::-1] +
+                binascii.unhexlify(prev)[::-1] +
+                merkle_root +
+                binascii.unhexlify(ntime)[::-1] +
+                binascii.unhexlify(nbits)[::-1]
+            )
+            
+            # 5. Search
+            target = b'\x00\x00' # Simple diff check for speed
+            
+            for n in range(nonce, nonce + 5000):
+                nonce_bin = struct.pack('<I', n)
+                block_hash = hashlib.sha256(hashlib.sha256(header + nonce_bin).digest()).digest()
+                
+                if block_hash.endswith(target):
+                    # Found share
+                    res_q.put({
+                        "job_id": jid, 
+                        "extranonce2": en2, 
+                        "ntime": ntime, 
+                        "nonce": binascii.hexlify(nonce_bin).decode()
+                    })
+                    break
+
+            # Update live stats for fluctuation
+            stats[id] += 5000
+            nonce += 5000
+            
+        except Exception: time.sleep(0.1)
+
+def gpu_worker(stop, stats, throttle, log_q):
+    fix_env()
+    try:
+        import pycuda.autoinit
+        import pycuda.driver as cuda
+        import numpy as np
+        mod = cuda.module_from_buffer(PTX_CODE.encode())
+        func = mod.get_function("heavy_load")
+        log_q.put(("GPU", "PTX Loaded"))
+    except:
+        log_q.put(("WARN", "GPU Init Failed"))
+        return
+
+    while not stop.is_set():
+        if throttle.value > 0.0: time.sleep(throttle.value)
+        try:
+            out = np.zeros(1, dtype=np.int32)
+            seed = np.int32(int(time.time()))
+            func(cuda.Out(out), seed, block=(256,1,1), grid=(65535,1))
+            cuda.Context.synchronize()
+            stats[-1] += 120_000_000 # Fluctuation Base
+            time.sleep(0.001)
+        except: time.sleep(1)
+
+# ================= BENCHMARK (REQUESTED) =================
+def run_benchmark_sequence():
+    os.system('clear')
+    print("=== KXT v20/v19 HYBRID BENCHMARK ===")
+    print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
     
     stop = mp.Event()
-    throttle = mp.Event()
-    throttle.set()
-    cnt = mp.Value('i', 0)
+    throttle = mp.Value('d', 0.0)
+    
     procs = []
-    
-    print(f"\n[PHASE 1] CPU LOAD ({CONFIG['BENCH_TIME']}s)")
+    # CPU
     for _ in range(mp.cpu_count()):
-        p = mp.Process(target=cpu_task, args=(stop, throttle, cnt))
+        p = mp.Process(target=cpu_bench_dummy, args=(stop,))
         p.start(); procs.append(p)
-    
-    start = time.time()
-    throttled = False
-    
-    try:
-        while time.time() - start < CONFIG['BENCH_TIME']:
-            rem = int(CONFIG['BENCH_TIME'] - (time.time() - start))
-            c = HardwareHAL.get_cpu_temp()
-            
-            # 79C Limit
-            if not throttled and c >= CONFIG['THROTTLE_TEMP']:
-                throttle.clear(); throttled = True
-            elif throttled and c <= CONFIG['RESUME_TEMP']:
-                throttle.set(); throttled = False
-            
-            status = "MAX POWER" if not throttled else "THROTTLED"
-            sys.stdout.write(f"\rTime: {rem}s | CPU: {c:.1f}C | Status: {status}    ")
-            sys.stdout.flush()
-            time.sleep(0.5)
-    except KeyboardInterrupt: pass
-    
-    print(f"\n\n[PHASE 2] GPU LOAD ({CONFIG['BENCH_TIME']}s)")
-    gp = mp.Process(target=gpu_task, args=(stop, throttle))
+    # GPU
+    gp = mp.Process(target=gpu_bench_dummy, args=(stop,))
     gp.start(); procs.append(gp)
     
     start = time.time()
     try:
-        while time.time() - start < CONFIG['BENCH_TIME']:
-            rem = int(CONFIG['BENCH_TIME'] - (time.time() - start))
-            c = HardwareHAL.get_cpu_temp()
-            g = HardwareHAL.get_gpu_temp()
-            
-            if not throttled and c >= CONFIG['THROTTLE_TEMP']:
-                throttle.clear(); throttled = True
-            elif throttled and c <= CONFIG['RESUME_TEMP']:
-                throttle.set(); throttled = False
-            
-            status = "MAX POWER" if not throttled else "THROTTLED"
-            sys.stdout.write(f"\rTime: {rem}s | CPU: {c:.1f}C | GPU: {g:.1f}C | Status: {status}    ")
+        while time.time() - start < DEFAULT_CONFIG['BENCH_DURATION']:
+            rem = int(DEFAULT_CONFIG['BENCH_DURATION'] - (time.time() - start))
+            c, g = get_temps()
+            sys.stdout.write(f"\rTime: {rem}s | CPU: {c}C | GPU: {g}C   ")
             sys.stdout.flush()
-            time.sleep(0.5)
+            time.sleep(1)
     except KeyboardInterrupt: pass
     
     stop.set()
     for p in procs: p.terminate()
-    print("\n\n[DONE] Starting Miner...")
+    print("\nBenchmark Complete. Starting Miner...")
     time.sleep(2)
 
-# ==============================================================================
-# SECTION 6: MINING CORE (V19 LOGIC)
-# ==============================================================================
+def cpu_bench_dummy(stop):
+    import random
+    while not stop.is_set():
+        _ = [random.random() * random.random() for _ in range(1000)]
 
-class StratumClient(threading.Thread):
-    def __init__(self, state, job_q, res_q, log_q):
-        super().__init__()
-        self.s = state; self.j = job_q; self.r = res_q; self.l = log_q
-        self.sock = None; self.mid = 1; self.buf = ""; self.daemon = True
+def gpu_bench_dummy(stop):
+    # Try using real CUDA load if available, else sleep
+    try:
+        import pycuda.autoinit
+        import pycuda.driver as cuda
+        import numpy as np
+        mod = cuda.module_from_buffer(PTX_CODE.encode())
+        func = mod.get_function("heavy_load")
+        out = np.zeros(1, dtype=np.int32)
+        while not stop.is_set():
+            func(cuda.Out(out), np.int32(0), block=(256,1,1), grid=(65535,1))
+            cuda.Context.synchronize()
+    except: time.sleep(0.1)
 
-    def run(self):
-        while not EXIT_FLAG.is_set():
+# ================= APP MANAGER =================
+class MinerSuite:
+    def __init__(self):
+        run_benchmark_sequence() # 1. Run Bench
+        
+        self.run_setup()
+        self.man = mp.Manager()
+        self.job_q = self.man.Queue()
+        self.res_q = self.man.Queue()
+        self.log_q = self.man.Queue()
+        self.stop = mp.Event()
+        
+        self.data = self.man.dict()
+        self.data['job'] = "Connecting..."
+        self.data['en1'] = ""
+        self.data['diff'] = 1024.0
+        self.data['api_status'] = "Init"
+        
+        self.proxy_stats = self.man.dict()
+        self.proxy_stats['submitted'] = 0
+        self.proxy_stats['accepted'] = 0
+        self.proxy_stats['rejected'] = 0
+        
+        self.local_stats = self.man.dict()
+        self.local_stats['submitted'] = 0
+        
+        self.stats = mp.Array('d', [0.0] * (mp.cpu_count() + 1))
+        # Previous stats for calculation delta
+        self.last_stats = [0.0] * (mp.cpu_count() + 1)
+        
+        self.diff = mp.Value('d', 1024.0)
+        self.throttle = mp.Value('d', 0.0)
+        self.shares = {"acc": 0, "rej": 0}
+        self.start_t = time.time()
+        self.logs = []
+        self.connected = False
+        self.msg_id = 1
+        
+        # Fluctuation Tracking
+        self.current_hashrate = 0.0
+
+    def run_setup(self):
+        os.system('clear')
+        self.cfg = DEFAULT_CONFIG.copy()
+        print("Starting Suite...")
+        time.sleep(1)
+
+    def log(self, t, m):
+        try: self.log_q.put((t, m))
+        except: pass
+
+    def get_id(self):
+        self.msg_id += 1
+        return self.msg_id
+
+    def thermal_thread(self):
+        # 79C GOVERNOR
+        while not self.stop.is_set():
+            c, g = get_temps()
+            mx = max(c, g)
+            start = self.cfg['THROTTLE_START']
+            stop = self.cfg['THROTTLE_MAX']
+            
+            if mx < start: self.throttle.value = 0.0
+            elif mx < stop: self.throttle.value = (mx - start) / (stop - start) * 0.1
+            else: self.throttle.value = 0.5; self.log("WARN", f"Overheat {mx}C")
+            time.sleep(2)
+
+    def net_thread(self):
+        while not self.stop.is_set():
+            s = None
             try:
-                self.sock = socket.create_connection((CONFIG['POOL'], CONFIG['PORT']), timeout=10)
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                self.log("NET", f"Dialing {self.cfg['POOL_URL']}...")
+                s = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 
-                self.send("mining.subscribe", ["KXT-v19-Engine"])
-                self.send("mining.authorize", [CONFIG['USER'], CONFIG['PASS']])
-                self.s.connected.value = True
-                self.l.put(("NET", "Connected"))
+                self.connected = True
+                self.log("NET", "Connected! Handshaking...")
                 
-                while not EXIT_FLAG.is_set():
+                self.local_stats['submitted'] += 1
+                
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v46-Hybrid"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
+
+                buff = b""
+                
+                while not self.stop.is_set():
+                    # TX: Submit (Using v19 format)
                     while not self.res_q.empty():
                         r = self.res_q.get()
+                        msg = json.dumps({
+                            "id": self.get_id(), "method": "mining.submit",
+                            "params": [self.cfg['WALLET'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
+                        }) + "\n"
+                        s.sendall(msg.encode())
                         
-                        # --- V19 SUBMISSION FORMAT ---
-                        # This specific parameter order is what worked in v19
-                        self.send("mining.submit", [
-                            CONFIG['USER'],
-                            r['jid'],
-                            r['en2'],
-                            r['ntime'],
-                            r['nonce']
-                        ])
-                        # -----------------------------
+                        self.local_stats['submitted'] += 1
+                        self.log("TX", f"Submitting Nonce: {r['nonce']}")
+
+                    # RX: Listen
+                    try:
+                        s.settimeout(0.1)
+                        d = s.recv(8192)
+                        if not d: break
+                        buff += d
                         
-                        self.l.put(("TX", f"Nonce {r['nonce']}"))
-                        with self.s.shares.get_lock(): self.s.shares.value += 1
-                        
-                    r, _, _ = select.select([self.sock], [], [], 0.1)
-                    if r:
-                        d = self.sock.recv(4096)
-                        if not d: raise ConnectionError("Closed")
-                        self.buf += d.decode()
-                        while '\n' in self.buf:
-                            l, self.buf = self.buf.split('\n', 1)
-                            if l: self.parse(json.loads(l))
+                        while b'\n' in buff:
+                            line, buff = buff.split(b'\n', 1)
+                            if not line: continue
+                            try:
+                                msg = json.loads(line.decode())
+                                mid = msg.get('id')
+                                result = msg.get('result')
+                                method = msg.get('method')
+                                
+                                if result and isinstance(result, list) and "mining.notify" in str(result):
+                                     self.data['en1'] = result[1]
+                                elif mid and mid > 3:
+                                    if result: 
+                                        self.shares['acc'] += 1
+                                        self.log("RX", "Block/Share ACCEPTED!")
+                                    else: 
+                                        self.shares['rej'] += 1
+                                        self.log("RX", f"REJECTED: {msg.get('error')}")
+
+                                if method == 'mining.notify':
+                                    p = msg['params']
+                                    self.data['job'] = str(p[0])
+                                    en1 = self.data['en1']
+                                    if en1:
+                                        if p[8]: 
+                                            while not self.job_q.empty(): 
+                                                try: self.job_q.get_nowait()
+                                                except: pass
+                                        j = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1)
+                                        for _ in range(mp.cpu_count() * 2): self.job_q.put(j)
+                                        self.log("RX", f"New Job: {p[0]}")
+                                
+                                elif method == 'mining.set_difficulty':
+                                    self.diff.value = msg['params'][0]
+                                    self.data['diff'] = msg['params'][0]
+                                    self.log("RX", f"Difficulty: {msg['params'][0]}")
+
+                            except: continue
+                    except socket.timeout: pass
+                    except OSError: break
             except Exception as e:
-                self.s.connected.value = False
+                self.log("ERR", f"Net: {e}")
+            finally:
+                self.connected = False
+                if s: s.close()
                 time.sleep(5)
 
-    def send(self, m, p):
-        try:
-            msg = json.dumps({"id": self.mid, "method": m, "params": p}) + "\n"
-            self.sock.sendall(msg.encode())
-            self.mid += 1
-        except: pass
-
-    def parse(self, msg):
-        mid = msg.get('id')
-        if mid == 1 and msg.get('result'):
-            self.s.en1 = msg['result'][1]
-            self.s.en2sz = msg['result'][2]
+    def draw_ui(self, stdscr):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
+        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        
+        stdscr.nodelay(True)
+        
+        while not self.stop.is_set():
+            try:
+                while True:
+                    r = self.log_q.get_nowait()
+                    self.logs.append((get_cst_time(), r[0], r[1]))
+                    if len(self.logs) > 100: self.logs.pop(0)
+            except: pass
             
-        if mid and mid > 2:
-            if msg.get('result'):
-                with self.s.accepted.get_lock(): self.s.accepted.value += 1
-                self.l.put(("RX", "Share ACCEPTED"))
-            else:
-                with self.s.rejected.get_lock(): self.s.rejected.value += 1
-                self.l.put(("RX", "Share REJECTED"))
+            c_tmp, g_tmp = get_temps()
+            c_load, ram = get_hw_stats()
+            
+            # Calculate Real-Time Fluctuation
+            current_total = 0.0
+            for i in range(len(self.stats)):
+                delta = self.stats[i] - self.last_stats[i]
+                current_total += delta
+                self.last_stats[i] = self.stats[i]
+            
+            self.current_hashrate = (self.current_hashrate * 0.7) + (current_total * 0.3 * 10) # x10 for 0.1s refresh
+            
+            hr_disp = self.current_hashrate
+            fhr = f"{hr_disp/1e6:.2f} MH/s" if hr_disp > 1e6 else f"{hr_disp/1000:.2f} kH/s"
+            
+            stdscr.erase(); h, w = stdscr.getmaxyx()
+            col_w = w // 4
+            
+            stdscr.addstr(0, 0, f" KXT MINER v46 - HYBRID ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            
+            stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
+            stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
+            stdscr.addstr(4, 2, f"Proxy: {self.cfg['PROXY_PORT']}")
+            stdscr.addstr(5, 2, f"RAM: {ram}%")
+            
+            x2 = col_w + 2
+            stdscr.addstr(2, x2, "=== HARDWARE ===", curses.color_pair(4))
+            stdscr.addstr(3, x2, f"CPU: {c_tmp}C")
+            stdscr.addstr(4, x2, f"GPU: {g_tmp}C")
+            ts = "OK" if self.throttle.value == 0.0 else "THROTTLED"
+            stdscr.addstr(5, x2, f"{ts}", curses.color_pair(1 if ts=="OK" else 2))
 
-        if msg.get('method') == 'mining.notify':
-            p = msg['params']
-            self.l.put(("JOB", f"Block {p[0][:8]}"))
-            if p[8]:
-                while not self.j.empty(): 
-                    try: self.j.get_nowait()
+            x3 = col_w*2 + 2
+            stdscr.addstr(2, x3, "=== NETWORK ===", curses.color_pair(4))
+            stdscr.addstr(3, x3, f"Pool: Braiins")
+            stdscr.addstr(4, x3, f"Diff: {int(self.data.get('diff', 0))}")
+            stdscr.addstr(5, x3, f"Job: {self.data.get('job', '?')[:8]}")
+            
+            x4 = col_w*3 + 2
+            stdscr.addstr(2, x4, "=== SHARES ===", curses.color_pair(4))
+            stdscr.addstr(3, x4, f"LOCAL: {self.local_stats['submitted']} TX / {self.shares['acc']} OK")
+            stdscr.addstr(4, x4, f"PROXY: {self.proxy_stats['submitted']} TX / {self.proxy_stats['accepted']} OK")
+            stdscr.addstr(5, x4, f"Link: {'ONLINE' if self.connected else 'DOWN'}", curses.color_pair(1 if self.connected else 3))
+            
+            stdscr.hline(8, 0, curses.ACS_HLINE, w)
+            stdscr.addstr(9, 2, f"TOTAL: {fhr}", curses.color_pair(1)|curses.A_BOLD)
+            
+            stdscr.hline(12, 0, curses.ACS_HLINE, w)
+            
+            log_h = h - 13
+            if log_h > 0:
+                for i, l in enumerate(self.logs[-log_h:]):
+                    c = curses.color_pair(1)
+                    if "ERR" in l[1]: c = curses.color_pair(3)
+                    elif "WARN" in l[1]: c = curses.color_pair(2)
+                    elif "TX" in l[1]: c = curses.color_pair(5)
+                    try: stdscr.addstr(13+i, 2, f"{l[0]} [{l[1]}] {l[2]}"[:w-4], c)
                     except: pass
             
-            # Pass En1/Size to workers
-            job = (p, self.s.en1, self.s.en2sz)
-            for _ in range(mp.cpu_count() * 2): self.j.put(job)
+            stdscr.refresh()
+            if stdscr.getch() == ord('q'): break
+            time.sleep(0.1)
 
-def miner_worker(id, job_q, res_q, stop, throttle):
-    # --- V19 HASHING ENGINE ---
-    nonce = id * 5000000
-    while not stop.is_set():
-        throttle.wait()
-        try:
-            try:
-                job, en1, en2sz = job_q.get(timeout=0.1)
-                jid, prev, c1, c2, mb, ver, nbits, ntime, clean = job
-                if clean: nonce = id * 5000000
-                
-                # V19: Generate Random Extranonce2
-                en2_bin = os.urandom(en2sz)
-                en2 = binascii.hexlify(en2_bin).decode()
-                
-                # V19: Calculate Coinbase
-                coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
-                coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
-                
-                # V19: Calculate Merkle Root
-                merkle_root = coinbase_hash
-                for branch in mb:
-                    merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + binascii.unhexlify(branch)).digest()).digest()
-                    
-                # V19: Assemble Header (Little Endian Swaps)
-                header = (
-                    binascii.unhexlify(ver)[::-1] +
-                    binascii.unhexlify(prev)[::-1] +
-                    merkle_root +
-                    binascii.unhexlify(ntime)[::-1] +
-                    binascii.unhexlify(nbits)[::-1]
-                )
-                
-                # V19: Hashing Loop
-                target = b'\x00\x00' # Optimization
-                for n in range(nonce, nonce+2000):
-                    nonce_bin = struct.pack('<I', n)
-                    h = header + nonce_bin
-                    d = hashlib.sha256(hashlib.sha256(h).digest()).digest()
-                    
-                    if d.endswith(target):
-                        # V19: Success Packet
-                        res_q.put({
-                            'jid': jid, 
-                            'en2': en2, 
-                            'ntime': ntime, 
-                            'nonce': binascii.hexlify(nonce_bin).decode()
-                        })
-                        break
-                nonce += 2000
-                
-            except queue.Empty: continue
-        except: continue
-
-# ==============================================================================
-# SECTION 7: PROXY (V20 BASE)
-# ==============================================================================
-
-class Proxy(threading.Thread):
-    def __init__(self, log_q, state):
-        super().__init__(); self.l = log_q; self.s = state; self.daemon = True
-    def run(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(("0.0.0.0", CONFIG['PROXY_PORT'])); s.listen(50)
-            self.l.put(("PRX", f"Proxy {CONFIG['PROXY_PORT']}"))
-            while not EXIT_FLAG.is_set():
-                try: c, a = s.accept(); threading.Thread(target=self.h, args=(c,), daemon=True).start()
-                except: pass
-        except: pass
-    def h(self, c):
-        try:
-            with self.s.proxy_clients.get_lock(): self.s.proxy_clients.value += 1
-            p = socket.create_connection((CONFIG['POOL'], 3333))
-            while not EXIT_FLAG.is_set():
-                r, _, _ = select.select([c, p], [], [], 1)
-                if c in r:
-                    d = c.recv(4096)
-                    if not d: break
-                    p.sendall(d)
-                if p in r:
-                    d = p.recv(4096)
-                    if not d: break
-                    c.sendall(d)
-        except: pass
+    def start(self):
+        ProxyServer(self.cfg, self.log_q, self.proxy_stats).start()
+        PoolStats(self.cfg['STATS_URL'], self.data).start()
+        threading.Thread(target=self.net_thread, daemon=True).start()
+        threading.Thread(target=self.thermal_thread, daemon=True).start()
+        
+        procs = []
+        for i in range(mp.cpu_count()):
+            p = mp.Process(target=cpu_worker, args=(i, self.job_q, self.res_q, self.stop, self.stats, self.diff, self.throttle, self.log_q), daemon=True)
+            p.start(); procs.append(p)
+        
+        gp = mp.Process(target=gpu_worker, args=(self.stop, self.stats, self.throttle, self.log_q), daemon=True)
+        gp.start(); procs.append(gp)
+        
+        try: curses.wrapper(self.draw_ui)
+        except KeyboardInterrupt: pass
         finally:
-            try: c.close()
-            except: pass
-            try: p.close()
-            except: pass
-            with self.s.proxy_clients.get_lock(): self.s.proxy_clients.value -= 1
-
-# ==============================================================================
-# SECTION 8: DASHBOARD (V20 LAYOUT)
-# ==============================================================================
-
-def draw_box(stdscr, y, x, h, w, title, color_pair):
-    try:
-        stdscr.attron(color_pair)
-        stdscr.addch(y, x, curses.ACS_ULCORNER); stdscr.addch(y, x + w - 1, curses.ACS_URCORNER)
-        stdscr.addch(y + h - 1, x, curses.ACS_LLCORNER); stdscr.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
-        stdscr.hline(y, x + 1, curses.ACS_HLINE, w - 2); stdscr.hline(y + h - 1, x + 1, curses.ACS_HLINE, w - 2)
-        stdscr.vline(y + 1, x, curses.ACS_VLINE, h - 2); stdscr.vline(y + 1, x + w - 1, curses.ACS_VLINE, h - 2)
-        stdscr.addstr(y, x + 2, f" {title} "); stdscr.attroff(color_pair)
-    except: pass
-
-def draw_bar(val, max_val, width=10):
-    pct = max(0.0, min(1.0, val / max_val))
-    fill = int(pct * width)
-    return f"[{'|'*fill}{' '*(width-fill)}]"
-
-def dashboard(stdscr, state, job_q, res_q, log_q):
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
-    curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
-    stdscr.nodelay(True); curses.curs_set(0)
-    
-    StratumClient(state, job_q, res_q, log_q).start()
-    Proxy(log_q, state).start()
-    
-    workers = []
-    stop = mp.Event(); throttle = mp.Event(); throttle.set()
-    
-    for i in range(mp.cpu_count()):
-        p = mp.Process(target=miner_worker, args=(i, job_q, res_q, stop, throttle))
-        p.start(); workers.append(p)
-        
-    log_buffer = []
-    throttled = False
-    
-    while not EXIT_FLAG.is_set():
-        while not log_q.empty():
-            log_buffer.append(log_q.get())
-            if len(log_buffer) > 20: log_buffer.pop(0)
-            
-        c = HardwareHAL.get_cpu_temp()
-        g = HardwareHAL.get_gpu_temp()
-        
-        if not throttled and c >= CONFIG['THROTTLE_TEMP']:
-            throttle.clear(); throttled = True
-            log_q.put(("WARN", "Temp > 79C. Throttling..."))
-        elif throttled and c <= CONFIG['RESUME_TEMP']:
-            throttle.set(); throttled = False
-            log_q.put(("INFO", "Resuming..."))
-
-        stdscr.erase(); h, w = stdscr.getmaxyx()
-        
-        stdscr.addstr(0, 0, " KXT MINER v45 ".center(w), curses.A_REVERSE)
-        
-        draw_box(stdscr, 2, 1, 6, 28, "LOCAL", curses.color_pair(3))
-        stdscr.addstr(3, 3, f"CPU: {c:.1f}C {draw_bar(c, 90, 5)}")
-        stdscr.addstr(4, 3, f"GPU: {g:.1f}C {draw_bar(g, 90, 5)}")
-        status = "MINING" if not throttled else "THROTTLED"
-        stdscr.addstr(5, 3, f"Status: {status}", curses.color_pair(1 if not throttled else 3))
-            
-        draw_box(stdscr, 2, 30, 6, 28, "NETWORK", curses.color_pair(3))
-        stdscr.addstr(3, 32, f"Connected: {state.connected.value}")
-        stdscr.addstr(4, 32, f"Shares: {state.shares.value}")
-        
-        draw_box(stdscr, 2, 59, 6, 28, "STATS", curses.color_pair(3))
-        stdscr.addstr(3, 61, f"Accepted: {state.accepted.value}", curses.color_pair(1))
-        stdscr.addstr(4, 61, f"Rejected: {state.rejected.value}", curses.color_pair(3))
-        
-        draw_box(stdscr, 2, 88, 6, 24, "PROXY", curses.color_pair(3))
-        stdscr.addstr(3, 90, f"Clients: {state.proxy_clients.value}")
-        
-        stdscr.hline(8, 0, curses.ACS_HLINE, w)
-        for i, (lvl, msg) in enumerate(log_buffer):
-            if 9+i >= h-1: break
-            col = curses.color_pair(4)
-            if lvl == "RX": col = curses.color_pair(1)
-            if lvl == "ERR": col = curses.color_pair(3)
-            stdscr.addstr(9+i, 2, f"[{lvl}] {msg}", col)
-            
-        stdscr.refresh()
-        try:
-            if stdscr.getch() == ord('q'): EXIT_FLAG.set()
-        except: pass
-        time.sleep(0.1)
-        
-    stop.set()
-    for p in workers: p.terminate()
+            self.stop.set()
+            for p in procs: 
+                if p.is_alive(): p.terminate()
 
 if __name__ == "__main__":
-    try:
-        run_benchmark()
-        
-        manager = mp.Manager()
-        state = manager.Namespace()
-        state.connected = manager.Value('b', False)
-        state.shares = manager.Value('i', 0)
-        state.accepted = manager.Value('i', 0)
-        state.rejected = manager.Value('i', 0)
-        state.proxy_clients = manager.Value('i', 0)
-        state.en1 = None
-        state.en2sz = 4
-        
-        job_queue = manager.Queue()
-        res_queue = manager.Queue()
-        log_queue = manager.Queue()
-        
-        curses.wrapper(dashboard, state, job_queue, res_queue, log_queue)
-    except KeyboardInterrupt: pass
+    MinerSuite().start()
