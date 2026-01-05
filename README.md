@@ -188,7 +188,7 @@ def run_benchmark(duration=120):
         stop_event.set()
         for p in procs: p.terminate()
         print("\n\nBenchmark Complete.")
-        time.sleep(2)
+        time.sleep(120)
 
 # ================= WORKERS =================
 def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, best_diff):
