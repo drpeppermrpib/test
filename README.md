@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE (v37) - STABLE THROTTLE
-=======================================
-Architecture: Thermal Governor (79C) + Heavy Load
+KXT MINER SUITE (v38) - STABLE EDITION
+======================================
 Target: solo.stratum.braiins.com:3333
-Fixes: SyntaxError on line 448, Python 3.10 Compatibility
+Fixes: SyntaxError line 448, 100C Stuck Sensor, Auto-Close
 """
 
 import sys
@@ -24,7 +23,7 @@ import subprocess
 import signal
 import resource
 import glob
-import math
+import math  # Global Import
 import re
 import queue
 from datetime import datetime
@@ -66,9 +65,13 @@ CONFIG = {
     "USER": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig1",
     "PASS": "x",
     "PROXY_PORT": 60060,
-    "BENCH_TIME": 300,
-    "THROTTLE_TEMP": 79.0,
-    "RESUME_TEMP": 75.0,
+    
+    # Benchmark Settings (1 Minute)
+    "BENCH_TIME": 60,
+    
+    # Safety Limits
+    "THROTTLE_TEMP": 85.0, 
+    "TEMP_MAX": 95.0,
 }
 
 # ==============================================================================
@@ -96,38 +99,46 @@ extern "C" {
 """
 
 # ==============================================================================
-# SECTION 4: SENSORS
+# SECTION 4: INTELLIGENT SENSOR LOGIC
 # ==============================================================================
 
 class HardwareHAL:
     @staticmethod
     def get_cpu_temp():
         readings = []
+        
+        # 1. Thermal Zones
         try:
             for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
                 try:
                     with open(path, "r") as f:
                         val = float(f.read().strip()) / 1000.0
-                        if 20 < val < 115: readings.append(val)
+                        # Filter out 100.0 exactly as it's often a dummy trip point
+                        if 20 < val < 115 and val != 100.0: 
+                            readings.append(val)
                 except: pass
         except: pass
 
+        # 2. Hwmon Inputs
         try:
             for path in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
                 try:
                     with open(path, "r") as f:
                         val = float(f.read().strip()) / 1000.0
-                        if 20 < val < 115: readings.append(val)
+                        if 20 < val < 115 and val != 100.0: 
+                            readings.append(val)
                 except: pass
         except: pass
 
+        # 3. Sensors Command
         try:
             out = subprocess.check_output("sensors", shell=True).decode()
             found = re.findall(r'\+([0-9]+\.[0-9]+)', out)
             for f in found:
                 try:
                     val = float(f)
-                    if 20 < val < 115: readings.append(val)
+                    if 20 < val < 115 and val != 100.0: 
+                        readings.append(val)
                 except: pass
         except: pass
 
@@ -148,7 +159,7 @@ class HardwareHAL:
         except: pass
 
 # ==============================================================================
-# SECTION 5: VISUAL UTILS
+# SECTION 5: VISUALS
 # ==============================================================================
 
 def draw_box(stdscr, y, x, h, w, title, color_pair):
@@ -173,13 +184,14 @@ def draw_bar(val, max_val, width=10):
     return f"[{bar}]"
 
 # ==============================================================================
-# SECTION 6: BENCHMARK
+# SECTION 6: LOAD GENERATOR
 # ==============================================================================
 
 def cpu_stress(stop_ev, load_counter, throttle_ev):
     import math
     while not stop_ev.is_set():
         throttle_ev.wait()
+        # Heavy Matrix Math
         size = 50
         A = [[random.random() for _ in range(size)] for _ in range(size)]
         B = [[random.random() for _ in range(size)] for _ in range(size)]
@@ -208,94 +220,48 @@ def run_benchmark(stdscr):
     stop = mp.Event()
     throttle = mp.Event()
     throttle.set()
-    
     cnt = mp.Value('d', 0.0)
     procs = []
     
+    # Start Load
     for _ in range(mp.cpu_count()):
         p = mp.Process(target=cpu_stress, args=(stop, cnt, throttle))
-        p.start()
-        procs.append(p)
+        p.start(); procs.append(p)
         
+    gp = mp.Process(target=gpu_stress, args=(stop, throttle))
+    gp.start(); procs.append(gp)
+    
     start = time.time()
-    throttled_state = False
+    throttled = False
     
     while time.time() - start < CONFIG['BENCH_TIME']:
         rem = CONFIG['BENCH_TIME'] - (time.time() - start)
         t = HardwareHAL.get_cpu_temp()
-        
-        if not throttled_state:
-            if t >= CONFIG['THROTTLE_TEMP']:
-                throttle.clear()
-                throttled_state = True
-        else:
-            if t <= CONFIG['RESUME_TEMP']:
-                throttle.set()
-                throttled_state = False
-                
-        try: stdscr.getch()
-        except: pass
-        
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        
-        stdscr.addstr(0, 0, " KXT GOVERNOR BENCHMARK ".center(w), curses.A_REVERSE)
-        draw_box(stdscr, 2, 2, 8, w-4, "CPU STRESS TEST", curses.color_pair(1))
-        
-        stdscr.addstr(4, 4, f"Time Remaining: {int(rem)}s")
-        stdscr.addstr(6, 4, f"CPU Die Temp  : {t:.1f}C  {draw_bar(t, 90, 20)}")
-        
-        status = "RUNNING (MAX LOAD)"
-        col = curses.color_pair(1)
-        if throttled_state:
-            status = f"THROTTLED (TEMP > {CONFIG['THROTTLE_TEMP']}C) - COOLING"
-            col = curses.color_pair(2)
-            
-        stdscr.addstr(8, 4, f"STATUS: {status}", col)
-        
-        stdscr.refresh()
-        if EXIT_FLAG.is_set(): return
-        time.sleep(0.5)
-        
-    gp = mp.Process(target=gpu_stress, args=(stop, throttle))
-    gp.start()
-    procs.append(gp)
-    
-    start = time.time()
-    while time.time() - start < CONFIG['BENCH_TIME']:
-        rem = CONFIG['BENCH_TIME'] - (time.time() - start)
-        c = HardwareHAL.get_cpu_temp()
         g = HardwareHAL.get_gpu_temp()
         
-        if not throttled_state:
-            if c >= CONFIG['THROTTLE_TEMP']:
-                throttle.clear()
-                throttled_state = True
-        else:
-            if c <= CONFIG['RESUME_TEMP']:
-                throttle.set()
-                throttled_state = False
-
-        try: stdscr.getch()
-        except: pass
-
+        # Throttling Logic
+        if not throttled and t > CONFIG['THROTTLE_TEMP']:
+            throttle.clear()
+            throttled = True
+        elif throttled and t < (CONFIG['THROTTLE_TEMP'] - 5.0):
+            throttle.set()
+            throttled = False
+            
         stdscr.erase()
-        stdscr.addstr(0, 0, " KXT GOVERNOR BENCHMARK ".center(w), curses.A_REVERSE)
-        draw_box(stdscr, 2, 2, 12, w-4, "SYSTEM MAX LOAD", curses.color_pair(3))
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, " KXT BENCHMARK ".center(w), curses.A_REVERSE)
         
+        draw_box(stdscr, 2, 2, 10, w-4, "SYSTEM LOAD", curses.color_pair(1))
         stdscr.addstr(4, 4, f"Time Remaining: {int(rem)}s")
-        stdscr.addstr(6, 4, f"CPU Temp: {c:.1f}C  {draw_bar(c, 90, 20)}")
-        stdscr.addstr(7, 4, f"GPU Temp: {g:.1f}C  {draw_bar(g, 90, 20)}")
+        stdscr.addstr(6, 4, f"CPU Temp: {t:.1f}C {draw_bar(t, 90, 20)}")
+        stdscr.addstr(7, 4, f"GPU Temp: {g:.1f}C {draw_bar(g, 90, 20)}")
         
-        status = "RUNNING"
-        col = curses.color_pair(1)
-        if throttled_state:
-            status = "THROTTLED - COOLING"
-            col = curses.color_pair(2)
-        stdscr.addstr(9, 4, f"STATUS: {status}", col)
+        status = "FULL POWER" if not throttled else "THROTTLED (COOLING)"
+        col = curses.color_pair(1 if not throttled else 2)
+        stdscr.addstr(9, 4, f"Status: {status}", col)
         
         stdscr.refresh()
-        if EXIT_FLAG.is_set(): return
+        if EXIT_FLAG.is_set(): break
         time.sleep(0.5)
         
     stop.set()
@@ -324,11 +290,10 @@ class StratumClient(threading.Thread):
         while not EXIT_FLAG.is_set():
             if not self.sock:
                 if self.connect():
-                    self.send("mining.subscribe", ["KXT-v37"])
+                    self.send("mining.subscribe", ["KXT-v38"])
                     self.send("mining.authorize", [CONFIG['USER'], CONFIG['PASS']])
                     self.log_q.put(("NET", "Connected"))
-                else:
-                    time.sleep(5); continue
+                else: time.sleep(5); continue
 
             try:
                 while not self.res_q.empty():
@@ -361,10 +326,10 @@ class StratumClient(threading.Thread):
         if mid and mid > 2:
             if msg.get('result'):
                 with self.state.accepted.get_lock(): self.state.accepted.value += 1
-                self.log_q.put(("RX", "Accepted"))
+                self.log_q.put(("RX", "Share Accepted"))
             else:
                 with self.state.rejected.get_lock(): self.state.rejected.value += 1
-                self.log_q.put(("RX", "Rejected"))
+                self.log_q.put(("RX", "Share Rejected"))
         if method == 'mining.notify':
             p = msg['params']; self.log_q.put(("JOB", f"Blk {p[0][:8]}"))
             if p[8]:
@@ -381,11 +346,13 @@ def miner_worker(id, job_q, res_q, stop):
             params, en1, en2sz = job_q.get(timeout=0.1)
             jid, prev, c1, c2, mb, ver, nbits, ntime, clean = params
             if clean: nonce = id * 5000000
+            
             en2 = struct.pack('>I', random.randint(0, 2**32-1)).hex().zfill(en2sz*2)
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
             root = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
             for b in mb: root = hashlib.sha256(hashlib.sha256(root + binascii.unhexlify(b)).digest()).digest()
             header = binascii.unhexlify(ver)[::-1] + binascii.unhexlify(prev)[::-1] + root + binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1]
+            
             target = b'\x00\x00'
             for n in range(nonce, nonce + 5000):
                 h = header + struct.pack('<I', n)
@@ -408,6 +375,8 @@ class Proxy(threading.Thread):
                 try: c, a = s.accept(); threading.Thread(target=self.h, args=(c,a), daemon=True).start()
                 except: pass
         except: pass
+    
+    # FIXED SYNTAX ERROR HERE
     def h(self, c, a):
         try:
             with self.state.proxy_clients.get_lock(): self.state.proxy_clients.value += 1
@@ -424,9 +393,12 @@ class Proxy(threading.Thread):
                     c.sendall(d)
         except: pass
         finally: 
-            c.close()
-            p.close()
-            with self.state.proxy_clients.get_lock():
+            # FIXED: Split onto separate lines
+            try: c.close()
+            except: pass
+            try: p.close()
+            except: pass
+            with self.state.proxy_clients.get_lock(): 
                 self.state.proxy_clients.value -= 1
 
 # ==============================================================================
@@ -444,6 +416,7 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
     run_benchmark(stdscr)
     if EXIT_FLAG.is_set(): return
     
+    # Transition
     stdscr.clear()
     stdscr.addstr(5, 5, "BENCHMARK COMPLETE. STARTING MINER...", curses.A_BOLD)
     stdscr.refresh()
@@ -467,7 +440,7 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
             if len(logs) > 20: logs.pop(0)
             
         stdscr.erase(); h, w = stdscr.getmaxyx()
-        stdscr.addstr(0, 0, " KXT MINER v37 ".center(w), curses.A_REVERSE)
+        stdscr.addstr(0, 0, " KXT MINER v38 ".center(w), curses.A_REVERSE)
         
         c = HardwareHAL.get_cpu_temp(); g = HardwareHAL.get_gpu_temp()
         
@@ -501,11 +474,19 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
     for p in workers: p.terminate()
 
 if __name__ == "__main__":
-    man = mp.Manager()
-    state = man.Namespace()
-    state.connected = man.Value('b', False); state.shares = man.Value('i', 0)
-    state.accepted = man.Value('i', 0); state.rejected = man.Value('i', 0)
-    state.proxy_clients = man.Value('i', 0)
-    job_q = man.Queue(); res_q = man.Queue(); log_q = man.Queue()
-    try: curses.wrapper(dashboard, state, job_q, res_q, log_q)
+    try:
+        man = mp.Manager()
+        state = man.Namespace()
+        state.connected = man.Value('b', False); state.shares = man.Value('i', 0)
+        state.accepted = man.Value('i', 0); state.rejected = man.Value('i', 0)
+        state.proxy_clients = man.Value('i', 0)
+        job_q = man.Queue(); res_q = man.Queue(); log_q = man.Queue()
+        curses.wrapper(dashboard, state, job_q, res_q, log_q)
     except KeyboardInterrupt: pass
+    except Exception as e:
+        # Crash Handler
+        print(f"\n[CRASH] {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        input("Press Enter to Exit...")
