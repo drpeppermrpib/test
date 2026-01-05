@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE (v35) - REDUX EDITION
-=====================================
-Architecture: "Find-Max-Temp" Sensor Logic + Boxed UI
+KXT MINER SUITE (v36) - SMART THROTTLE EDITION
+==============================================
+Architecture: "Find-Max-Temp" Sensor Logic + Boxed UI + Thermal Governor
 Target: solo.stratum.braiins.com:3333
-Fixes: 40C vs 67C Discrepancy, Broken Pipes, Visual Layout
+Fixes: CPU Overheat (>79C), Throttling Logic added
 """
 
 import sys
@@ -24,7 +24,7 @@ import subprocess
 import signal
 import resource
 import glob
-import math  # GLOBAL IMPORT (Critical)
+import math  # GLOBAL IMPORT
 import re
 from datetime import datetime
 
@@ -35,11 +35,11 @@ from datetime import datetime
 EXIT_FLAG = mp.Event()
 
 def signal_handler(signum, frame):
-    """Graceful Shutdown to prevent BrokenPipeError."""
+    """Graceful Shutdown."""
     if not EXIT_FLAG.is_set():
         EXIT_FLAG.set()
-        print("\n\r[KXT] Stopping Engines... (Please Wait)")
-        time.sleep(1.5) # Allow pipes to drain
+        print("\n\r[KXT] Stopping Engines... (Cooling Down)")
+        time.sleep(1.5)
         sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -76,8 +76,9 @@ CONFIG = {
     # Benchmark Settings (5 Mins)
     "BENCH_TIME": 300,
     
-    # Thresholds for Visual Bars
-    "TEMP_MAX": 90.0,
+    # Safety Limits
+    "THROTTLE_TEMP": 79.0, # Celsius
+    "TEMP_MAX": 90.0,      # For visual bar scaling
 }
 
 # ==============================================================================
@@ -90,18 +91,14 @@ extern "C" {
 
     __global__ void kxt_heavy(uint32_t *output, uint32_t seed) {
         uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-        
-        // Volatile registers prevents optimization
         volatile uint32_t a = 0x6a09e667 + idx;
         volatile uint32_t b = 0xbb67ae85;
         
-        // Extended loop for maximum heat
         #pragma unroll 128
         for(int i=0; i < 25000; i++) {
             a = (a << 5) | (a >> 27);
             b ^= a;
             a += b + 0xDEADBEEF;
-            // Memory write every 1000 ops to saturate VRAM bus
             if (i % 1000 == 0) output[idx % 1024] = a;
         }
     }
@@ -109,7 +106,7 @@ extern "C" {
 """
 
 # ==============================================================================
-# SECTION 4: "FIND MAX" SENSOR LOGIC (CRITICAL FIX)
+# SECTION 4: SENSOR LOGIC
 # ==============================================================================
 
 class HardwareHAL:
@@ -117,7 +114,7 @@ class HardwareHAL:
     def get_cpu_temp():
         readings = []
         
-        # Source 1: Thermal Zones (Kernel)
+        # Source 1: Thermal Zones
         try:
             for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
                 try:
@@ -127,7 +124,7 @@ class HardwareHAL:
                 except: pass
         except: pass
 
-        # Source 2: Hwmon Inputs (Motherboard Sensors)
+        # Source 2: Hwmon
         try:
             for path in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
                 try:
@@ -137,10 +134,9 @@ class HardwareHAL:
                 except: pass
         except: pass
 
-        # Source 3: LM-Sensors Output (Parsed)
+        # Source 3: LM-Sensors
         try:
             out = subprocess.check_output("sensors", shell=True).decode()
-            # Regex to find all temps like +67.0
             found = re.findall(r'\+([0-9]+\.[0-9]+)', out)
             for f in found:
                 try:
@@ -149,9 +145,8 @@ class HardwareHAL:
                 except: pass
         except: pass
 
-        # Return the HIGHEST temp found (The die temp)
-        if readings:
-            return max(readings)
+        # Return HIGHEST temp (Die Temp)
+        if readings: return max(readings)
         return 0.0
 
     @staticmethod
@@ -163,55 +158,53 @@ class HardwareHAL:
 
     @staticmethod
     def force_fans():
-        """Attempts to force 100% fan speed."""
         try:
             subprocess.run("nvidia-settings -a '[gpu:0]/GPUFanControlState=1' -a '[fan:0]/GPUTargetFanSpeed=100'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except: pass
 
 # ==============================================================================
-# SECTION 5: VISUAL UTILS (BOXES & BARS)
+# SECTION 5: VISUAL UTILS
 # ==============================================================================
 
 def draw_box(stdscr, y, x, h, w, title, color_pair):
-    """Draws a classic text-mode box."""
     try:
-        # Corners
         stdscr.attron(color_pair)
         stdscr.addch(y, x, curses.ACS_ULCORNER)
         stdscr.addch(y, x + w - 1, curses.ACS_URCORNER)
         stdscr.addch(y + h - 1, x, curses.ACS_LLCORNER)
         stdscr.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
         
-        # Borders
         stdscr.hline(y, x + 1, curses.ACS_HLINE, w - 2)
         stdscr.hline(y + h - 1, x + 1, curses.ACS_HLINE, w - 2)
         stdscr.vline(y + 1, x, curses.ACS_VLINE, h - 2)
         stdscr.vline(y + 1, x + w - 1, curses.ACS_VLINE, h - 2)
         
-        # Title
         stdscr.addstr(y, x + 2, f" {title} ")
         stdscr.attroff(color_pair)
     except: pass
 
 def draw_bar(val, max_val, width=10):
-    """Draws [|||||    ]"""
     pct = max(0.0, min(1.0, val / max_val))
     fill = int(pct * width)
     bar = "|" * fill + " " * (width - fill)
     return f"[{bar}]"
 
 # ==============================================================================
-# SECTION 6: BENCHMARK LOAD GENERATORS
+# SECTION 6: THROTTLED BENCHMARK
 # ==============================================================================
 
-def cpu_stress(stop_ev, load_counter):
-    import math # Local import for safety
+def cpu_stress(stop_ev, load_counter, throttle_flag):
+    import math
     while not stop_ev.is_set():
-        # Matrix Multiplication (High Heat)
+        # Check Governor
+        if throttle_flag.is_set():
+            time.sleep(0.2) # Cool down period
+            continue
+            
+        # Heavy Load
         size = 50
         A = [[random.random() for _ in range(size)] for _ in range(size)]
         B = [[random.random() for _ in range(size)] for _ in range(size)]
-        # This is pure Python math, very heavy on the interpreter loop
         result = [[sum(a*b for a,b in zip(A_row, B_col)) for B_col in zip(*B)] for A_row in A]
         
         with load_counter.get_lock():
@@ -231,20 +224,19 @@ def gpu_stress(stop_ev):
         while not stop_ev.is_set():
             func(out, np.uint32(time.time()), block=(512,1,1), grid=(65535,1))
             cuda.Context.synchronize()
-    except:
-        time.sleep(0.1)
+    except: time.sleep(0.1)
 
 def run_benchmark(stdscr):
-    # Fan thread
     threading.Thread(target=lambda: [HardwareHAL.force_fans(), time.sleep(15)], daemon=True).start()
     
     stop = mp.Event()
+    throttle_flag = mp.Event() # Shared flag for throttling
     cnt = mp.Value('d', 0.0)
     procs = []
     
     # Phase 1: CPU
     for _ in range(mp.cpu_count()):
-        p = mp.Process(target=cpu_stress, args=(stop, cnt))
+        p = mp.Process(target=cpu_stress, args=(stop, cnt, throttle_flag))
         p.start()
         procs.append(p)
         
@@ -252,8 +244,21 @@ def run_benchmark(stdscr):
     while time.time() - start < CONFIG['BENCH_TIME']:
         rem = CONFIG['BENCH_TIME'] - (time.time() - start)
         t = HardwareHAL.get_cpu_temp()
-        bar = draw_bar(t, CONFIG['TEMP_MAX'], 20)
         
+        # THROTTLE LOGIC
+        if t >= CONFIG['THROTTLE_TEMP']:
+            throttle_flag.set()
+            status_msg = "THROTTLED (TEMP > 79C)"
+            status_color = curses.color_pair(2)
+        elif t < (CONFIG['THROTTLE_TEMP'] - 2): # Hysteresis
+            throttle_flag.clear()
+            status_msg = "FULL POWER"
+            status_color = curses.color_pair(1)
+        else:
+             # Keep previous state if in between
+             status_msg = "THROTTLED (COOLING)" if throttle_flag.is_set() else "FULL POWER"
+             status_color = curses.color_pair(2) if throttle_flag.is_set() else curses.color_pair(1)
+
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         
@@ -261,8 +266,8 @@ def run_benchmark(stdscr):
         draw_box(stdscr, 2, 2, 8, w-4, "CPU SATURATION", curses.color_pair(1))
         
         stdscr.addstr(4, 4, f"Time Remaining: {int(rem)}s")
-        stdscr.addstr(6, 4, f"CPU Die Temp  : {t:.1f}C  {bar}")
-        stdscr.addstr(7, 4, f"Ops/Second    : {cnt.value:.0f}")
+        stdscr.addstr(6, 4, f"CPU Die Temp  : {t:.1f}C  {draw_bar(t, 90, 20)}")
+        stdscr.addstr(7, 4, f"Status        : {status_msg}", status_color)
         
         stdscr.refresh()
         if EXIT_FLAG.is_set(): return
@@ -279,12 +284,18 @@ def run_benchmark(stdscr):
         c = HardwareHAL.get_cpu_temp()
         g = HardwareHAL.get_gpu_temp()
         
+        # THROTTLE LOGIC CPU ONLY
+        if c >= CONFIG['THROTTLE_TEMP']:
+            throttle_flag.set()
+        elif c < (CONFIG['THROTTLE_TEMP'] - 2):
+            throttle_flag.clear()
+
         stdscr.erase()
         stdscr.addstr(0, 0, " KXT BENCHMARK - PHASE 2 ".center(w), curses.A_REVERSE)
         draw_box(stdscr, 2, 2, 10, w-4, "SYSTEM MAX LOAD", curses.color_pair(2))
         
         stdscr.addstr(4, 4, f"Time Remaining: {int(rem)}s")
-        stdscr.addstr(6, 4, f"CPU Temp: {c:.1f}C  {draw_bar(c, 90, 20)}")
+        stdscr.addstr(6, 4, f"CPU Temp: {c:.1f}C  {draw_bar(c, 90, 20)} [{'LIMIT' if throttle_flag.is_set() else 'OK'}]")
         stdscr.addstr(7, 4, f"GPU Temp: {g:.1f}C  {draw_bar(g, 90, 20)}")
         
         stdscr.refresh()
@@ -301,15 +312,8 @@ def run_benchmark(stdscr):
 class StratumClient(threading.Thread):
     def __init__(self, state, job_q, res_q, log_q):
         super().__init__()
-        self.state = state
-        self.job_q = job_q
-        self.res_q = res_q
-        self.log_q = log_q
-        self.sock = None
-        self.msg_id = 1
-        self.buffer = ""
-        self.daemon = True
-        self.en1 = None
+        self.state = state; self.job_q = job_q; self.res_q = res_q; self.log_q = log_q
+        self.sock = None; self.msg_id = 1; self.buffer = ""; self.daemon = True; self.en1 = None
 
     def connect(self):
         try:
@@ -324,24 +328,18 @@ class StratumClient(threading.Thread):
         while not EXIT_FLAG.is_set():
             if not self.sock:
                 if self.connect():
-                    self.send("mining.subscribe", ["KXT-v35"])
+                    self.send("mining.subscribe", ["KXT-v36"])
                     self.send("mining.authorize", [CONFIG['USER'], CONFIG['PASS']])
                     self.log_q.put(("NET", "Connected"))
-                else:
-                    time.sleep(5)
-                    continue
+                else: time.sleep(5); continue
 
             try:
-                # Transmit
                 while not self.res_q.empty():
                     r = self.res_q.get()
-                    self.send("mining.submit", [
-                        CONFIG['USER'], r['jid'], r['en2'], r['ntime'], r['nonce']
-                    ])
+                    self.send("mining.submit", [CONFIG['USER'], r['jid'], r['en2'], r['ntime'], r['nonce']])
                     self.log_q.put(("TX", f"Nonce {r['nonce']}"))
                     with self.state.shares.get_lock(): self.state.shares.value += 1
 
-                # Receive
                 r, _, _ = select.select([self.sock], [], [], 0.1)
                 if r:
                     d = self.sock.recv(4096)
@@ -364,12 +362,8 @@ class StratumClient(threading.Thread):
             except: pass
 
     def process(self, msg):
-        mid = msg.get('id')
-        method = msg.get('method')
-        
-        if mid == 1 and msg.get('result'):
-            self.en1 = msg['result'][1]
-            
+        mid = msg.get('id'); method = msg.get('method')
+        if mid == 1 and msg.get('result'): self.en1 = msg['result'][1]
         if mid and mid > 2:
             if msg.get('result'):
                 with self.state.accepted.get_lock(): self.state.accepted.value += 1
@@ -377,7 +371,6 @@ class StratumClient(threading.Thread):
             else:
                 with self.state.rejected.get_lock(): self.state.rejected.value += 1
                 self.log_q.put(("RX", "Share Rejected"))
-
         if method == 'mining.notify':
             p = msg['params']
             self.log_q.put(("JOB", f"Block {p[0][:8]}"))
@@ -385,10 +378,8 @@ class StratumClient(threading.Thread):
                 while not self.job_q.empty(): 
                     try: self.job_q.get_nowait()
                     except: pass
-            
             en1 = self.en1 if self.en1 else "00000000"
-            job = (p, en1, 4)
-            for _ in range(mp.cpu_count() * 2): self.job_q.put(job)
+            for _ in range(mp.cpu_count() * 2): self.job_q.put((p, en1, 4))
 
 def miner_worker(id, job_q, res_q, stop):
     nonce = id * 5000000
@@ -398,7 +389,6 @@ def miner_worker(id, job_q, res_q, stop):
             jid, prev, c1, c2, mb, ver, nbits, ntime, clean = params
             if clean: nonce = id * 5000000
             
-            # Hash logic simplified for brevity but functional
             en2 = struct.pack('>I', random.randint(0, 2**32-1)).hex().zfill(en2sz*2)
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
             cb_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
@@ -455,7 +445,7 @@ class Proxy(threading.Thread):
             with self.state.proxy_clients.get_lock(): self.state.proxy_clients.value -= 1
 
 # ==============================================================================
-# SECTION 8: DASHBOARD UI (BOXED)
+# SECTION 8: DASHBOARD UI
 # ==============================================================================
 
 def dashboard(stdscr, state, job_q, res_q, log_q):
@@ -466,11 +456,9 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
     curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLACK)
     stdscr.nodelay(True)
     
-    # Run Bench
     run_benchmark(stdscr)
     if EXIT_FLAG.is_set(): return
     
-    # Run Miner
     client = StratumClient(state, job_q, res_q, log_q)
     client.start()
     Proxy(log_q, state).start()
@@ -482,7 +470,7 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
         p.start()
         workers.append(p)
         
-    gp = mp.Process(target=gpu_stress, args=(stop,)) # Keep heat up
+    gp = mp.Process(target=gpu_stress, args=(stop,))
     gp.start()
     workers.append(gp)
     
@@ -495,31 +483,24 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
             
         stdscr.erase()
         h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, " KXT MINER v36 ".center(w), curses.A_REVERSE)
         
-        # Header
-        stdscr.addstr(0, 0, " KXT MINER v35 ".center(w), curses.A_REVERSE)
-        
-        # SENSORS
         c = HardwareHAL.get_cpu_temp()
         g = HardwareHAL.get_gpu_temp()
         
-        # COL 1: LOCAL
         draw_box(stdscr, 2, 1, 6, 28, "LOCAL", curses.color_pair(3))
         stdscr.addstr(3, 3, f"CPU: {c:.1f}C {draw_bar(c, 90, 5)}")
         stdscr.addstr(4, 3, f"GPU: {g:.1f}C {draw_bar(g, 90, 5)}")
         
-        # COL 2: NET
         draw_box(stdscr, 2, 30, 6, 28, "NETWORK", curses.color_pair(3))
         status = "ON" if state.connected.value else "OFF"
         stdscr.addstr(3, 32, f"Link: {status}")
         stdscr.addstr(4, 32, f"Shares: {state.shares.value}")
         
-        # COL 3: STATS
         draw_box(stdscr, 2, 59, 6, 28, "STATS", curses.color_pair(3))
         stdscr.addstr(3, 61, f"Acc: {state.accepted.value}")
         stdscr.addstr(4, 61, f"Rej: {state.rejected.value}")
         
-        # LOGS
         stdscr.hline(8, 0, '-', w)
         for i, (lvl, msg) in enumerate(logs):
             if 9+i >= h-1: break
@@ -529,7 +510,6 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
             stdscr.addstr(9+i, 2, f"[{datetime.now().strftime('%H:%M:%S')}] [{lvl}] {msg}", col)
             
         stdscr.refresh()
-        
         try:
             k = stdscr.getch()
             if k == ord('q'): EXIT_FLAG.set()
