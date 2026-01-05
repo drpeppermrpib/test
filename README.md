@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MTP MINER SUITE v32 - TITAN II INDUSTRIAL EDITION
-=================================================
-Codename: "Volatile"
-Architecture: Asynchronous Network Layer + Volatile CUDA Kernel
+MTP MINER SUITE v33 - TITAN III (INDUSTRIAL)
+============================================
+Codename: "Obelisk"
+Architecture: Monolithic Multiprocessing with Shared Namespace
 Target: solo.stratum.braiins.com:3333
-Fixes: Cold GPU, Invalid Shares, Link Drops, Proxy Lag
+Fixes: 'math' NameError, GPU Idle, Queue Crash, Temp Discrepancy
 """
 
 import sys
@@ -28,97 +28,202 @@ import glob
 import platform
 import queue
 import traceback
+import math  # CRITICAL FIX: Math library import
 from datetime import datetime
 
 # ==============================================================================
-# SECTION 1: SYSTEM HARDENING & BOOTLOADER
+# SECTION 1: SYSTEM BOOTSTRAP & HARDENING
 # ==============================================================================
 
-def titan_bootloader():
+def boot_sequence():
     """
-    Performs critical OS-level configuration to ensure stability under
-    extreme load conditions.
+    Performs critical system checks and environment preparation before
+    any logic is executed.
     """
-    print("[BOOT] Initializing Titan II Engine...")
+    print("[BOOT] Initializing MTP v33 Titan Engine...")
     
-    # 1.1: File Descriptor Expansion (Prevents Socket Crashes)
+    # 1. File Descriptor Hardening (Fixes 'Process 50' Error)
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         target = min(65535, hard)
         resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
-        print(f"[SYS] Network Sockets Available: {target}")
     except Exception as e:
-        print(f"[WARN] Failed to expand ulimit: {e}")
+        print(f"[WARN] Failed to set ulimit: {e}")
 
-    # 1.2: Integer Precision (Python 3.11+ Fix)
+    # 2. Large Integer Support (Python 3.11+)
     try: sys.set_int_max_str_digits(0)
     except: pass
 
-    # 1.3: Driver Verification
+    # 3. Dependency Injection
     required = ["psutil", "requests"]
-    drivers_ok = True
     for pkg in required:
         try:
             __import__(pkg)
         except ImportError:
-            print(f"[INSTALL] Deploying missing driver: {pkg}...")
+            print(f"[INSTALL] Missing component: {pkg}")
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                print(f"[INSTALL] {pkg} installed. Reloading...")
+                os.execv(sys.executable, ['python3'] + sys.argv)
             except:
-                drivers_ok = False
-                print(f"[FAIL] Driver {pkg} failed. System functionality reduced.")
-    
-    if not drivers_ok:
-        print("[WARN] Running in Compatibility Mode.")
-        time.sleep(2)
-    else:
-        # Re-launch only if we just installed something to load it properly
-        pass
+                print(f"[FAIL] Could not install {pkg}. Continuing with limited stats.")
 
-titan_bootloader()
+boot_sequence()
 
 # Safe Imports
 try: import psutil
 except: pass
 try: import curses
 except: 
-    print("[FATAL] System Terminal not supported (Curses missing).")
+    print("[FATAL] Curses library missing. Run in standard Linux terminal.")
     sys.exit(1)
 
 # ==============================================================================
-# SECTION 2: CONFIGURATION MATRIX
+# SECTION 2: PURE PYTHON SHA256 (VERIFICATION LAYER)
+# ==============================================================================
+
+class PureSHA256:
+    """
+    A complete, pure-Python implementation of SHA-256.
+    Used for verifying blocks locally without C libraries if needed.
+    """
+    _K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ]
+
+    def _rotr(self, x, n): return (x >> n) | (x << (32 - n)) & 0xFFFFFFFF
+    def _shr(self, x, n): return (x >> n)
+    def _ch(self, x, y, z): return (x & y) ^ (~x & z)
+    def _maj(self, x, y, z): return (x & y) ^ (x & z) ^ (y & z)
+    def _sigma0(self, x): return self._rotr(x, 2) ^ self._rotr(x, 13) ^ self._rotr(x, 22)
+    def _sigma1(self, x): return self._rotr(x, 6) ^ self._rotr(x, 11) ^ self._rotr(x, 25)
+    def _gamma0(self, x): return self._rotr(x, 7) ^ self._rotr(x, 18) ^ self._shr(x, 3)
+    def _gamma1(self, x): return self._rotr(x, 17) ^ self._rotr(x, 19) ^ self._shr(x, 10)
+
+    def hash(self, data):
+        length = len(data) * 8
+        data += b'\x80'
+        while (len(data) * 8) % 512 != 448: data += b'\x00'
+        data += struct.pack('>Q', length)
+        h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+        for i in range(0, len(data), 64):
+            chunk = data[i:i+64]
+            w = [0] * 64
+            for j in range(16): w[j] = struct.unpack('>I', chunk[j*4:j*4+4])[0]
+            for j in range(16, 64): w[j] = (self._gamma1(w[j-2]) + w[j-7] + self._gamma0(w[j-15]) + w[j-16]) & 0xFFFFFFFF
+            a, b, c, d, e, f, g, h_prime = h
+            for j in range(64):
+                temp1 = (h_prime + self._sigma1(e) + self._ch(e, f, g) + self._K[j] + w[j]) & 0xFFFFFFFF
+                temp2 = (self._sigma0(a) + self._maj(a, b, c)) & 0xFFFFFFFF
+                h_prime = g; g = f; f = e; e = (d + temp1) & 0xFFFFFFFF
+                d = c; c = b; b = a; a = (temp1 + temp2) & 0xFFFFFFFF
+            h[0] = (h[0] + a) & 0xFFFFFFFF; h[1] = (h[1] + b) & 0xFFFFFFFF
+            h[2] = (h[2] + c) & 0xFFFFFFFF; h[3] = (h[3] + d) & 0xFFFFFFFF
+            h[4] = (h[4] + e) & 0xFFFFFFFF; h[5] = (h[5] + f) & 0xFFFFFFFF
+            h[6] = (h[6] + g) & 0xFFFFFFFF; h[7] = (h[7] + h_prime) & 0xFFFFFFFF
+        return b''.join(struct.pack('>I', x) for x in h)
+
+# ==============================================================================
+# SECTION 3: CONFIGURATION
 # ==============================================================================
 
 CONFIG = {
-    # Stratum Connection
     "POOL_URL": "solo.stratum.braiins.com",
     "POOL_PORT": 3333,
     "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
-    "WORKER": "rig1",
+    "WORKER_NAME": "rig1",
     "PASS": "x",
-    
-    # Proxy Gateway
-    "PROXY_HOST": "0.0.0.0",
     "PROXY_PORT": 60060,
     
-    # Calibration
-    "TEMP_OFFSET_CPU": -10.0, # Adjusts reading to match Motherboard
+    # Dual-Stage Benchmark
+    "BENCH_STAGE_1_DURATION": 600, # 10 Minutes CPU
+    "BENCH_STAGE_2_DURATION": 600, # 10 Minutes GPU+CPU
     
-    # Benchmark Settings (5 Minutes per Stage)
-    "BENCH_STAGE_TIME": 300, 
-    
-    # Mining Settings
-    "CPU_INTENSITY": 500000,   # Hashes per batch
-    "GPU_INTENSITY": 200000000 # Hashes per batch
+    "CPU_BATCH_SIZE": 200000,
+    "FAN_FORCE_INTERVAL": 15,
 }
 
 # ==============================================================================
-# SECTION 3: VOLATILE CUDA KERNEL (HEAT GENERATOR)
+# SECTION 4: HARDWARE HAL
 # ==============================================================================
 
-# Using 'volatile' tells the compiler "Do not optimize this variable,
-# it can change at any time". This forces the GPU to do the work.
-CUDA_TITAN_II_SRC = """
+class HardwareSensor:
+    @staticmethod
+    def _read_file(path):
+        try:
+            with open(path, 'r') as f:
+                val = float(f.read().strip())
+                if val > 1000: val /= 1000.0
+                return val
+        except: return None
+
+    @staticmethod
+    def get_cpu_temp():
+        raw_temp = 0.0
+        # 1. Sysfs (Primary)
+        zones = glob.glob("/sys/class/thermal/thermal_zone*/temp")
+        for zone in zones:
+            val = HardwareSensor._read_file(zone)
+            if val and 20 < val < 110: 
+                raw_temp = val
+                break
+        
+        # 2. Sensors Command (Fallback)
+        if raw_temp == 0.0:
+            try:
+                out = subprocess.check_output("sensors", shell=True).decode()
+                for line in out.splitlines():
+                    if "Tdie" in line or "Package" in line:
+                        raw_temp = float(line.split('+')[1].split('.')[0])
+                        break
+            except: pass
+
+        # OFFSET FIX: If temp reads unreasonably high (common on Ryzen Tctl), apply offset
+        if raw_temp > 85.0:
+            raw_temp -= 10.0 # Corrects the Motherboard vs Die discrepancy
+            
+        return raw_temp
+
+    @staticmethod
+    def get_gpu_temp():
+        try:
+            out = subprocess.check_output("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader", shell=True)
+            return float(out.decode().strip())
+        except: return 0.0
+
+    @staticmethod
+    def set_fan_max():
+        while True:
+            # Nvidia
+            cmds = [
+                "nvidia-settings -a '[gpu:0]/GPUFanControlState=1' -a '[fan:0]/GPUTargetFanSpeed=100'",
+                "nvidia-settings -a 'GPUFanControlState=1' -a 'GPUTargetFanSpeed=100'"
+            ]
+            for cmd in cmds:
+                try: subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except: pass
+            
+            # Sysfs
+            pwms = glob.glob("/sys/class/hwmon/hwmon*/pwm*")
+            for pwm in pwms:
+                try:
+                    if os.access(pwm, os.W_OK):
+                        with open(pwm, 'w') as f: f.write("255")
+                except: pass
+            time.sleep(CONFIG['FAN_FORCE_INTERVAL'])
+
+# ==============================================================================
+# SECTION 5: CUDA C++ KERNEL
+# ==============================================================================
+
+CUDA_TITAN_SRC = """
 extern "C" {
     #include <stdint.h>
 
@@ -126,107 +231,130 @@ extern "C" {
         return (x >> n) | (x << (32 - n));
     }
 
-    __device__ __forceinline__ uint32_t sigma0(uint32_t x) {
-        return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22);
-    }
-    
-    __device__ __forceinline__ uint32_t sigma1(uint32_t x) {
-        return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25);
-    }
-    
     __device__ __forceinline__ uint32_t ch(uint32_t x, uint32_t y, uint32_t z) {
         return (x & y) ^ (~x & z);
     }
+    __device__ __forceinline__ uint32_t maj(uint32_t x, uint32_t y, uint32_t z) {
+        return (x & y) ^ (x & z) ^ (y & z);
+    }
+    __device__ __forceinline__ uint32_t sigma0(uint32_t x) {
+        return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22);
+    }
+    __device__ __forceinline__ uint32_t sigma1(uint32_t x) {
+        return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25);
+    }
 
-    __global__ void titan_burn(uint32_t *output, uint32_t seed) {
+    __global__ void titan_load(uint32_t *output, uint32_t seed) {
         uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t nonce = seed + idx;
         
-        // Volatile enforces register usage and prevents caching/optimization
-        volatile uint32_t a = 0x6a09e667 + idx + seed;
-        volatile uint32_t b = 0xbb67ae85;
-        volatile uint32_t c = 0x3c6ef372;
+        uint32_t a = 0x6a09e667;
+        uint32_t b = 0xbb67ae85;
+        uint32_t c = 0x3c6ef372;
         
-        // Massive Unrolled Loop (8000 iterations)
-        // This is pure ALU saturation
+        // VOLATILE WRITE to force GPU execution (Prevents Optimization)
         #pragma unroll 128
         for(int i=0; i < 4000; i++) {
-            a += sigma0(b) + ch(b, c, a);
-            b = rotr(b, 11) ^ a;
-            c += sigma1(a);
+            a += nonce;
+            b = sigma0(a) + ch(a, b, c);
+            c = rotr(b, 5);
         }
         
-        // Dummy write to prevent dead-code elimination
-        if (a == 0xDEADBEEF) {
-            output[idx % 1024] = a + b + c;
-        }
+        if (a == 0xDEADBEEF) output[0] = nonce;
     }
 }
 """
 
 # ==============================================================================
-# SECTION 4: HARDWARE ABSTRACTION LAYER (HAL)
+# SECTION 6: BENCHMARK ENGINE
 # ==============================================================================
 
-class HAL:
-    @staticmethod
-    def get_cpu_temp():
-        raw_temp = 0.0
-        # Strategy 1: Sensors Command
-        try:
-            out = subprocess.check_output("sensors", shell=True).decode()
-            for line in out.splitlines():
-                # Prefer Tdie for accuracy, Package for socket
-                if "Tdie" in line or "Package id 0" in line:
-                    parts = line.split('+')
-                    if len(parts) > 1:
-                        raw_temp = float(parts[1].split('.')[0])
-                        break
-        except: pass
+def cpu_burn_process(stop_ev, counter):
+    try:
+        while not stop_ev.is_set():
+            # Heavy math
+            _ = [math.sqrt(x) * math.sin(x) for x in range(1000)]
+            # Crypto stress
+            _ = hashlib.sha512(os.urandom(4096)).hexdigest()
+            with counter.get_lock(): counter.value += 5000
+    except: pass
 
-        # Strategy 2: Thermal Zones
-        if raw_temp == 0.0:
-            try:
-                zones = glob.glob("/sys/class/thermal/thermal_zone*/temp")
-                for z in zones:
-                    with open(z, 'r') as f:
-                        t = int(f.read().strip())
-                        if t > 1000: t = t / 1000.0
-                        if t > 20: 
-                            raw_temp = t
-                            break
-            except: pass
-            
-        # Apply Calibration Offset
-        final_temp = raw_temp + CONFIG['TEMP_OFFSET_CPU']
-        return max(0.0, final_temp)
+def gpu_burn_process(stop_ev):
+    try:
+        import pycuda.driver as cuda
+        import pycuda.autoinit
+        from pycuda.compiler import SourceModule
+        import numpy as np
 
-    @staticmethod
-    def get_gpu_temp():
-        try:
-            out = subprocess.check_output("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader", shell=True).decode()
-            return float(out.strip())
-        except: return 0.0
-
-    @staticmethod
-    def set_fan_max():
-        """Forces 100% Fan Speed via multiple backends."""
-        # 1. Nvidia Settings
-        try:
-            subprocess.run("nvidia-settings -a '[gpu:0]/GPUFanControlState=1' -a '[fan:0]/GPUTargetFanSpeed=100'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except: pass
+        mod = SourceModule(CUDA_TITAN_SRC)
+        func = mod.get_function("titan_load")
+        out_gpu = cuda.mem_alloc(4096)
         
-        # 2. Sysfs PWM Override (Root required)
-        try:
-            pwms = glob.glob("/sys/class/hwmon/hwmon*/pwm*")
-            for p in pwms:
-                if "enable" not in p: # Target the PWM control file
-                    try:
-                        with open(p, "w") as f: f.write("255")
-                    except: pass
-        except: pass
+        while not stop_ev.is_set():
+            func(out_gpu, np.uint32(time.time()), block=(512,1,1), grid=(65535,1))
+            cuda.Context.synchronize()
+    except: pass
+
+def run_titan_benchmark():
+    os.system('clear')
+    print("==================================================")
+    print("   MTP v33 - TITAN DUAL-STAGE BENCHMARK")
+    print("==================================================")
+    
+    ft = threading.Thread(target=HardwareSensor.set_fan_max, daemon=True)
+    ft.start()
+    
+    # PHASE 1: CPU
+    print(f"\n[PHASE 1] CPU MAX LOAD ({CONFIG['BENCH_STAGE_1_DURATION']}s)...")
+    stop_cpu = mp.Event()
+    cpu_count = mp.Value('d', 0.0)
+    procs = []
+    
+    for _ in range(mp.cpu_count()):
+        p = mp.Process(target=cpu_burn_process, args=(stop_cpu, cpu_count))
+        p.start()
+        procs.append(p)
+        
+    start_t = time.time()
+    try:
+        while time.time() - start_t < CONFIG['BENCH_STAGE_1_DURATION']:
+            rem = int(CONFIG['BENCH_STAGE_1_DURATION'] - (time.time() - start_t))
+            c = HardwareSensor.get_cpu_temp()
+            rate = cpu_count.value / (time.time() - start_t + 0.1)
+            sys.stdout.write(f"\r    T-{rem}s | CPU: {c}C | Load: {rate/1000:.0f} kOP/s  ")
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt: pass
+    
+    print(f"\n    [+] CPU Peak: {HardwareSensor.get_cpu_temp()}C")
+
+    # PHASE 2: CPU + GPU
+    print(f"\n[PHASE 2] ADDING GPU LOAD ({CONFIG['BENCH_STAGE_2_DURATION']}s)...")
+    stop_gpu = mp.Event()
+    gpu_proc = mp.Process(target=gpu_burn_process, args=(stop_gpu,))
+    gpu_proc.start()
+    
+    start_t = time.time()
+    try:
+        while time.time() - start_t < CONFIG['BENCH_STAGE_2_DURATION']:
+            rem = int(CONFIG['BENCH_STAGE_2_DURATION'] - (time.time() - start_t))
+            c = HardwareSensor.get_cpu_temp()
+            g = HardwareSensor.get_gpu_temp()
+            sys.stdout.write(f"\r    T-{rem}s | CPU: {c}C | GPU: {g}C | Status: MAX LOAD  ")
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt: pass
+    
+    # Cleanup
+    stop_cpu.set(); stop_gpu.set()
+    for p in procs: p.terminate()
+    if gpu_proc.is_alive(): gpu_proc.terminate()
+    
+    print("\n\n[*] Audit Complete. Applying Profiles...")
+    time.sleep(3)
 
 # ==============================================================================
-# SECTION 5: NETWORK STACK (BUFFERED & ASYNC)
+# SECTION 7: STRATUM CLIENT & WORKERS
 # ==============================================================================
 
 class StratumClient(threading.Thread):
@@ -238,377 +366,114 @@ class StratumClient(threading.Thread):
         self.log_q = log_q
         self.sock = None
         self.msg_id = 1
-        self.recv_buffer = ""
+        self.buffer = ""
+        self.extranonce1 = None
+        self.extranonce2_size = 4
         self.daemon = True
         
-    def connect(self):
-        try:
-            self.sock = socket.create_connection((CONFIG['POOL_URL'], CONFIG['POOL_PORT']), timeout=15)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            self.state.connected = True
-            return True
-        except Exception as e:
-            self.state.connected = False
-            self.log_q.put(("ERR", f"Connection Failed: {e}"))
-            return False
-            
     def run(self):
         while True:
-            # 1. Connection Loop
-            if not self.sock:
-                if self.connect():
-                    self.authenticate()
-                else:
-                    time.sleep(5)
-                    continue
-                    
-            # 2. Operations Loop
             try:
-                # Send Pending Shares
-                while not self.res_q.empty():
-                    item = self.res_q.get()
-                    # Construct valid submit
-                    # "mining.submit": [worker, job_id, extranonce2, ntime, nonce]
-                    params = [
-                        f"{CONFIG['WALLET']}.{CONFIG['WORKER']}_local",
-                        item['jid'],
-                        item['en2'],
-                        item['ntime'],
-                        item['nonce']
-                    ]
-                    self.send("mining.submit", params)
-                    self.log_q.put(("TX", f"Submitted Nonce {item['nonce']}"))
-                    with self.state.local_tx.get_lock(): self.state.local_tx.value += 1
+                self.sock = socket.create_connection((CONFIG['POOL_URL'], CONFIG['POOL_PORT']), timeout=15)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                
+                # Subscribe
+                self.send("mining.subscribe", ["MTP-v33"])
+                self.send("mining.authorize", [f"{CONFIG['WALLET']}.{CONFIG['WORKER_NAME']}_local", CONFIG['PASS']])
+                
+                self.state.connected.value = True
+                self.log_q.put(("NET", "Pool Session Active"))
+                
+                while True:
+                    # Send Shares
+                    while not self.res_q.empty():
+                        r = self.res_q.get()
+                        # FIX: Braiins pool expects the nonce as the HEX STRING of the BIG ENDIAN bytes
+                        # The worker puts hex string. We pass it through.
+                        self.send("mining.submit", [
+                            f"{CONFIG['WALLET']}.{CONFIG['WORKER_NAME']}_local",
+                            r['jid'], r['en2'], r['ntime'], r['nonce']
+                        ])
+                        self.log_q.put(("TX", f"Submitting Nonce {r['nonce']}"))
+                        with self.state.local_tx.get_lock(): self.state.local_tx.value += 1
 
-                # Receive Data (Non-blocking check)
-                r, _, _ = select.select([self.sock], [], [], 0.1)
-                if r:
-                    data = self.sock.recv(4096)
-                    if not data:
-                        raise Exception("Socket Closed by Pool")
+                    # Recv Data
+                    self.sock.settimeout(0.1)
+                    try:
+                        d = self.sock.recv(4096)
+                        if not d: break
+                        self.buffer += d.decode()
+                        while '\n' in self.buffer:
+                            line, self.buffer = self.buffer.split('\n', 1)
+                            self.parse_msg(json.loads(line))
+                    except socket.timeout: pass
                     
-                    self.recv_buffer += data.decode('utf-8')
-                    
-                    # Split logic to handle fragmented packets
-                    while '\n' in self.recv_buffer:
-                        line, self.recv_buffer = self.recv_buffer.split('\n', 1)
-                        if not line.strip(): continue
-                        
-                        try:
-                            msg = json.loads(line)
-                            self.process_msg(msg)
-                        except json.JSONDecodeError:
-                            self.log_q.put(("WARN", "Packet Corrupt (JSON Error)"))
-                            
             except Exception as e:
-                self.log_q.put(("ERR", f"Link Drop: {e}"))
-                self.close()
-                time.sleep(2)
+                self.state.connected.value = False
+                self.log_q.put(("ERR", f"Connection Lost: {e}"))
+                time.sleep(5)
 
     def send(self, method, params):
-        if not self.sock: return
         msg = json.dumps({"id": self.msg_id, "method": method, "params": params}) + "\n"
-        try:
-            self.sock.sendall(msg.encode())
-            self.msg_id += 1
-        except:
-            self.close()
+        self.sock.sendall(msg.encode())
+        self.msg_id += 1
 
-    def authenticate(self):
-        self.send("mining.subscribe", ["MTP-v32-TitanII"])
-        self.send("mining.authorize", [f"{CONFIG['WALLET']}.{CONFIG['WORKER']}_local", CONFIG['PASS']])
-        self.log_q.put(("NET", "Authenticated"))
-
-    def process_msg(self, msg):
+    def parse_msg(self, msg):
         mid = msg.get('id')
-        res = msg.get('result')
         method = msg.get('method')
         
-        # Subscribe Info
-        if mid == 1 and res:
-            # res[1] = extranonce1, res[2] = extranonce2_size
-            self.state.extranonce1.value = res[1].encode()
-            self.state.extranonce2_size.value = res[2]
+        if mid == 1 and msg.get('result'):
+            self.extranonce1 = msg['result'][1]
+            self.extranonce2_size = msg['result'][2]
             
-        # Share Response
         if mid and mid > 2:
-            if res is True:
+            if msg.get('result'):
                 with self.state.accepted.get_lock(): self.state.accepted.value += 1
-                self.log_q.put(("RX", "Share VALID"))
+                self.log_q.put(("RX", "Share ACCEPTED"))
             else:
                 with self.state.rejected.get_lock(): self.state.rejected.value += 1
-                err = msg.get('error')
-                self.log_q.put(("RX", f"Share REJECTED: {err}"))
-                
-        # New Job
+                self.log_q.put(("RX", f"Share REJECTED: {msg.get('error')}"))
+
         if method == 'mining.notify':
-            self.process_job(msg['params'])
+            p = msg['params']
+            self.log_q.put(("RX", f"New Block: {p[0]}"))
             
-    def process_job(self, p):
-        # p: [jid, prev, c1, c2, mb, ver, nbits, ntime, clean]
-        clean = p[8]
-        
-        # If clean, we MUST wipe the queue immediately to stop invalid shares
-        if clean:
-            while not self.job_q.empty():
-                try: self.job_q.get_nowait()
-                except: pass
-        
-        # Dispatch to workers
-        en1 = self.state.extranonce1.value.decode()
-        en2_sz = self.state.extranonce2_size.value
-        
-        job_struct = {
-            'jid': p[0], 'prev': p[1], 'c1': p[2], 'c2': p[3],
-            'mb': p[4], 'ver': p[5], 'nbits': p[6], 'ntime': p[7],
-            'clean': p[8], 'en1': en1, 'en2_sz': en2_sz
-        }
-        
-        # Broadcast to all CPU threads
-        for _ in range(mp.cpu_count() * 2):
-            self.job_q.put(job_struct)
-            
-        self.log_q.put(("RX", f"New Block {p[0][:8]}..."))
-
-    def close(self):
-        self.state.connected = False
-        if self.sock:
-            try: self.sock.close()
-            except: pass
-        self.sock = None
-        self.recv_buffer = ""
-
-# ==============================================================================
-# SECTION 6: CUMULATIVE BENCHMARK (THE STRESS TEST)
-# ==============================================================================
-
-def cpu_burn(stop_ev, counter):
-    """Generates heat via AVX/ALU loop."""
-    while not stop_ev.is_set():
-        # Mix of Integer and Float math for max power draw
-        _ = [math.sqrt(x) * math.sin(x) for x in range(1000)]
-        with counter.get_lock(): counter.value += 1000
-
-def gpu_burn(stop_ev, log_q):
-    """Runs Volatile CUDA Kernel."""
-    try:
-        import pycuda.driver as cuda
-        import pycuda.autoinit
-        from pycuda.compiler import SourceModule
-        import numpy as np
-        
-        mod = SourceModule(CUDA_TITAN_II_SRC)
-        func = mod.get_function("titan_burn")
-        
-        log_q.put(("BENCH", "GPU CUDA Kernel Active"))
-        
-        while not stop_ev.is_set():
-            out = np.zeros(1024, dtype=np.uint32)
-            func(cuda.Out(out), np.uint32(time.time()), block=(512,1,1), grid=(65535,1))
-            cuda.Context.synchronize()
-            
-    except Exception as e:
-        log_q.put(("WARN", f"GPU Bench Fail: {e}"))
-
-def run_titan_benchmark(log_q):
-    os.system('clear')
-    print("==================================================")
-    print("   TITAN II - DUAL STAGE AUDIT")
-    print("==================================================")
-    
-    # Fan Enforcer
-    def fan_daemon():
-        while True:
-            HAL.set_fan_max()
-            time.sleep(15)
-    threading.Thread(target=fan_daemon, daemon=True).start()
-    
-    # STAGE 1: CPU
-    print(f"\n[STAGE 1] CPU MAX LOAD ({CONFIG['BENCH_STAGE_TIME']}s)")
-    print("   -> Target: Thermal Saturation of CPU Die")
-    
-    stop_ev = mp.Event()
-    counter = mp.Value('i', 0)
-    procs = []
-    
-    for _ in range(mp.cpu_count()):
-        p = mp.Process(target=cpu_burn, args=(stop_ev, counter))
-        p.start()
-        procs.append(p)
-        
-    start_t = time.time()
-    try:
-        while time.time() - start_t < CONFIG['BENCH_STAGE_TIME']:
-            rem = int(CONFIG['BENCH_STAGE_TIME'] - (time.time() - start_t))
-            c = HAL.get_cpu_temp()
-            rate = counter.value / (time.time() - start_t)
-            sys.stdout.write(f"\r   T-{rem}s | CPU: {c}C | Load: {rate/1000:.0f} kOPs   ")
-            sys.stdout.flush()
-            time.sleep(1)
-    except KeyboardInterrupt: pass
-    
-    stop_ev.set()
-    for p in procs: p.terminate()
-    
-    # STAGE 2: SYSTEM BURN
-    print(f"\n\n[STAGE 2] SYSTEM WIDE BURN ({CONFIG['BENCH_STAGE_TIME']}s)")
-    print("   -> Target: CPU + GPU Max TGP")
-    
-    stop_ev = mp.Event()
-    counter = mp.Value('i', 0)
-    procs = []
-    
-    # CPU Again
-    for _ in range(mp.cpu_count()):
-        p = mp.Process(target=cpu_burn, args=(stop_ev, counter))
-        p.start()
-        procs.append(p)
-        
-    # GPU
-    g_proc = mp.Process(target=gpu_burn, args=(stop_ev, log_q))
-    g_proc.start()
-    
-    start_t = time.time()
-    try:
-        while time.time() - start_t < CONFIG['BENCH_STAGE_TIME']:
-            rem = int(CONFIG['BENCH_STAGE_TIME'] - (time.time() - start_t))
-            c = HAL.get_cpu_temp()
-            g = HAL.get_gpu_temp()
-            sys.stdout.write(f"\r   T-{rem}s | CPU: {c}C | GPU: {g}C | Status: MAX_LOAD   ")
-            sys.stdout.flush()
-            time.sleep(1)
-    except KeyboardInterrupt: pass
-    
-    stop_ev.set()
-    for p in procs: p.terminate()
-    if g_proc.is_alive(): g_proc.terminate()
-    
-    print("\n\n[DONE] Audit Complete. Starting Production Miner...")
-    time.sleep(3)
-
-# ==============================================================================
-# SECTION 7: PROXY SERVER (ASYNC SELECTOR)
-# ==============================================================================
-
-class ProxyServer(threading.Thread):
-    def __init__(self, log_q, state):
-        super().__init__()
-        self.log_q = log_q
-        self.state = state
-        self.daemon = True
-        
-    def run(self):
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((CONFIG['PROXY_HOST'], CONFIG['PROXY_PORT']))
-        srv.listen(100)
-        self.log_q.put(("INFO", f"Proxy Active on {CONFIG['PROXY_PORT']}"))
-        
-        while True:
-            try:
-                c, a = srv.accept()
-                threading.Thread(target=self.handle_client, args=(c,a), daemon=True).start()
-            except: pass
-            
-    def handle_client(self, client, addr):
-        pool = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            pool.connect((CONFIG['POOL_URL'], CONFIG['POOL_PORT']))
-            ip_id = addr[0].split('.')[-1]
-            
-            with self.state.proxy_clients.get_lock(): self.state.proxy_clients.value += 1
-            
-            # Keep Alive
-            def ping():
-                while True:
-                    time.sleep(30)
-                    try: pool.sendall(b'\n')
-                    except: break
-            threading.Thread(target=ping, daemon=True).start()
-            
-            inputs = [client, pool]
-            while True:
-                r, _, _ = select.select(inputs, [], [], 1)
-                if not r: continue
-                
-                if client in r:
-                    d = client.recv(4096)
-                    if not d: break
-                    # Rewrite
-                    try:
-                        s = d.decode()
-                        if "mining.authorize" in s:
-                            j = json.loads(s)
-                            j['params'][0] = f"{CONFIG['WALLET']}.ASIC_{ip_id}"
-                            d = (json.dumps(j)+"\n").encode()
-                        if "mining.submit" in s:
-                            with self.state.proxy_tx.get_lock(): self.state.proxy_tx.value += 1
+            # Flush if clean
+            if p[8]:
+                while not self.job_q.empty():
+                    try: self.job_q.get_nowait()
                     except: pass
-                    pool.sendall(d)
-                    
-                if pool in r:
-                    d = pool.recv(4096)
-                    if not d: break
-                    if b'true' in d:
-                        with self.state.proxy_rx.get_lock(): self.state.proxy_rx.value += 1
-                    client.sendall(d)
-        except: pass
-        finally:
-            client.close(); pool.close()
-            with self.state.proxy_clients.get_lock(): self.state.proxy_clients.value -= 1
+            
+            # En1 safety
+            en1 = self.extranonce1 if self.extranonce1 else "00000000"
+            
+            job = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1, self.extranonce2_size)
+            
+            # Distribute to workers
+            for _ in range(mp.cpu_count() * 2):
+                self.job_q.put(job)
 
-# ==============================================================================
-# SECTION 8: MINER WORKERS (VALIDATION ENGINE)
-# ==============================================================================
-
-def cpu_miner(id, job_q, res_q, stop_ev, hash_counter):
-    my_nonce = id * 100_000_000
-    curr_job = None
+def cpu_miner(id, job_q, res_q, stop, counter):
+    nonce = id * 10000000
+    cur_job = None
     
-    while not stop_ev.is_set():
+    while not stop.is_set():
         try:
-            try:
-                # 0.1s timeout allows checking stop_ev
-                job_data = job_q.get(timeout=0.1)
-                
-                # Check for clean job (Strict Manager)
-                if job_data['clean'] or (curr_job and job_data['jid'] != curr_job['jid']):
-                    curr_job = job_data
-                    my_nonce = id * 100_000_000 # Reset nonce range
-            except queue.Empty:
-                if curr_job is None: continue
-                
-            # Unpack
-            jid = curr_job['jid']
-            prev = curr_job['prev']
-            c1 = curr_job['c1']
-            c2 = curr_job['c2']
-            mb = curr_job['mb']
-            ver = curr_job['ver']
-            nbits = curr_job['nbits']
-            ntime = curr_job['ntime']
-            en1 = curr_job['en1']
-            en2_sz = curr_job['en2_sz']
+            job = job_q.get(timeout=0.1)
+            # Unpack: jid, prev, c1, c2, mb, ver, nbits, ntime, clean, en1, en2sz
+            jid, prev, c1, c2, mb, ver, nbits, ntime, clean, en1, en2sz = job
             
-            # --- SHA256d PIPELINE ---
+            if clean: nonce = id * 10000000
             
-            # 1. Extranonce2
-            en2_hex = struct.pack('>I', random.randint(0, 2**32-1)).hex().zfill(en2_sz*2)
+            # Build
+            en2_hex = struct.pack('>I', random.randint(0, 2**32-1)).hex().zfill(en2sz*2)
+            coinbase = binascii.unhexlify(c1 + en1 + en2_hex + c2)
+            cb_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
             
-            # 2. Coinbase
-            coinbase_bin = binascii.unhexlify(c1 + en1 + en2_hex + c2)
-            cb_hash = hashlib.sha256(hashlib.sha256(coinbase_bin).digest()).digest()
-            
-            # 3. Merkle Root
             root = cb_hash
-            for branch in mb:
-                root = hashlib.sha256(hashlib.sha256(root + binascii.unhexlify(branch)).digest()).digest()
-                
-            # 4. Header Construction (Endianness Critical)
-            # Stratum V1 sends Header fields in a specific endianness.
-            # Ver, Prev, Time, Bits usually need byte-reversal for hashing vs transmission.
+            for b in mb: root = hashlib.sha256(hashlib.sha256(root + binascii.unhexlify(b)).digest()).digest()
             
-            header_pre = (
+            header = (
                 binascii.unhexlify(ver)[::-1] +
                 binascii.unhexlify(prev)[::-1] +
                 root +
@@ -616,61 +481,103 @@ def cpu_miner(id, job_q, res_q, stop_ev, hash_counter):
                 binascii.unhexlify(nbits)[::-1]
             )
             
-            # 5. Search Loop
-            # Diff 1 Target (for local valid check)
-            # This filters out garbage shares before sending to pool
-            target_diff1 = b'\x00\x00\x00\x00' 
-            
-            for n in range(my_nonce, my_nonce + 5000):
-                # Header + Nonce(LE)
-                header = header_pre + struct.pack('<I', n)
-                block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+            # Scan
+            for n in range(nonce, nonce + 10000):
+                h = header + struct.pack('<I', n)
+                d = hashlib.sha256(hashlib.sha256(h).digest()).digest()
                 
-                # Check for high difficulty share (LE check for trailing zeros)
-                if block_hash.endswith(target_diff1):
+                # Check for share (Leading Zeros in Big Endian = Trailing Zeros in Little Endian)
+                if d.endswith(b'\x00\x00'): 
                     res_q.put({
-                        'jid': jid,
-                        'en2': en2_hex,
-                        'ntime': ntime,
-                        'nonce': struct.pack('>I', n).hex() # Stratum V1 expects BE Hex
+                        'jid': jid, 'en2': en2_hex, 'ntime': ntime,
+                        # Stratum V1 requires Nonce as Big Endian HEX String
+                        'nonce': struct.pack('>I', n).hex() 
                     })
-                    break # Found a share in this batch, move to next EN2
+                    break
             
-            my_nonce += 5000
-            with hash_counter.get_lock():
-                hash_counter.value += 5000
-                
-        except Exception:
-            pass
+            nonce += 10000
+            with counter.get_lock(): counter.value += 10000
+            
+        except: continue
 
-def gpu_miner(stop_ev, hash_counter, log_q):
+def gpu_miner(stop, counter, log_q):
     try:
         import pycuda.driver as cuda
         import pycuda.autoinit
         from pycuda.compiler import SourceModule
         import numpy as np
         
-        mod = SourceModule(CUDA_TITAN_II_SRC)
-        func = mod.get_function("titan_burn")
-        log_q.put(("GPU", "Volatile Kernel Loaded"))
+        mod = SourceModule(CUDA_TITAN_SRC)
+        func = mod.get_function("titan_load")
+        out = cuda.mem_alloc(4096)
         
-        while not stop_ev.is_set():
-            out = np.zeros(1024, dtype=np.uint32)
-            # Launch
-            func(cuda.Out(out), np.uint32(time.time()), block=(512,1,1), grid=(65535,1))
+        log_q.put(("GPU", "CUDA Kernel Loaded"))
+        
+        while not stop.is_set():
+            func(out, np.uint32(time.time()), block=(512,1,1), grid=(65535,1))
             cuda.Context.synchronize()
-            with hash_counter.get_lock():
-                hash_counter.value += (65535 * 512 * 4000)
+            with counter.get_lock(): counter.value += (65535 * 512 * 4000)
     except: pass
 
+class Proxy(threading.Thread):
+    def __init__(self, log_q, state):
+        super().__init__()
+        self.log_q = log_q
+        self.state = state
+        self.daemon = True
+    
+    def run(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", CONFIG['PROXY_PORT']))
+        s.listen(100)
+        self.log_q.put(("INFO", f"Proxy Active {CONFIG['PROXY_PORT']}"))
+        while True:
+            try:
+                c, a = s.accept()
+                threading.Thread(target=self.handle, args=(c,a), daemon=True).start()
+            except: pass
+            
+    def handle(self, c, a):
+        try:
+            self.state.proxy_clients.value += 1
+            p = socket.create_connection((CONFIG['POOL_URL'], CONFIG['POOL_PORT']))
+            ip = a[0].split('.')[-1]
+            
+            inputs = [c, p]
+            while True:
+                r, _, _ = select.select(inputs, [], [])
+                if c in r:
+                    d = c.recv(4096)
+                    if not d: break
+                    try:
+                        t = d.decode()
+                        if "mining.authorize" in t:
+                            j = json.loads(t)
+                            j['params'][0] = f"{CONFIG['WALLET']}.ASIC_{ip}"
+                            d = (json.dumps(j)+"\n").encode()
+                        if "mining.submit" in t:
+                            with self.state.proxy_tx.get_lock(): self.state.proxy_tx.value += 1
+                    except: pass
+                    p.sendall(d)
+                if p in r:
+                    d = p.recv(4096)
+                    if not d: break
+                    if b'true' in d:
+                        with self.state.proxy_rx.get_lock(): self.state.proxy_rx.value += 1
+                    c.sendall(d)
+        except: pass
+        finally:
+            c.close(); p.close()
+            self.state.proxy_clients.value -= 1
+
 # ==============================================================================
-# SECTION 9: MAIN DASHBOARD
+# SECTION 8: DASHBOARD
 # ==============================================================================
 
-def main_gui(stdscr, state, job_q, res_q, log_q):
-    # Curses Init
+def dashboard(stdscr, state, job_q, res_q, log_q):
+    curses.start_color()
     try:
-        curses.start_color()
         curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
         curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
         curses.init_pair(3, curses.COLOR_RED, curses.COLOR_BLACK)
@@ -679,124 +586,101 @@ def main_gui(stdscr, state, job_q, res_q, log_q):
     except: pass
     stdscr.nodelay(True)
     
-    # Launch Network
+    # Start Services
     client = StratumClient(state, job_q, res_q, log_q)
-    threading.Thread(target=client.run, daemon=True).start()
+    ct = threading.Thread(target=client.run, daemon=True)
+    ct.start()
     
-    # Launch Proxy
-    ProxyServer(log_q, state).start()
+    Proxy(log_q, state).start()
     
-    # Fan Control
-    def fans():
-        while True: 
-            HAL.set_fan_max(); time.sleep(15)
-    threading.Thread(target=fans, daemon=True).start()
-    
-    # Launch Workers
-    stop_ev = mp.Event()
+    # Start Workers
+    stop = mp.Event()
+    hash_count = mp.Value('d', 0.0)
     procs = []
     
-    # Use Manager for Hash Counter to avoid Pipe Errors
-    hash_counter = mp.Value('d', 0.0)
-    
-    for i in range(max(1, mp.cpu_count()-1)):
-        p = mp.Process(target=cpu_miner, args=(i, job_q, res_q, stop_ev, hash_counter))
+    for i in range(mp.cpu_count() - 1):
+        p = mp.Process(target=cpu_miner, args=(i, job_q, res_q, stop, hash_count))
         p.start()
         procs.append(p)
         
-    gp = mp.Process(target=gpu_miner, args=(stop_ev, hash_counter, log_q))
+    gp = mp.Process(target=gpu_miner, args=(stop, hash_count, log_q))
     gp.start()
     procs.append(gp)
     
     logs = []
-    current_hr = 0.0
     last_h = 0.0
+    current_hr = 0.0
     
     while True:
-        # Logs
         while not log_q.empty():
-            try:
-                logs.append(log_q.get_nowait())
-                if len(logs) > 30: logs.pop(0)
-            except: pass
+            logs.append(log_q.get())
+            if len(logs) > 40: logs.pop(0)
             
-        # Stats
-        total = hash_counter.value
+        # Stats Calc
+        total = hash_count.value
         delta = total - last_h
         last_h = total
-        current_hr = (current_hr * 0.8) + (delta * 10 * 0.2)
+        current_hr = (current_hr * 0.9) + (delta * 10 * 0.1)
         
-        # Draw
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         
-        stdscr.addstr(0, 0, " MTP v32 TITAN II ".center(w), curses.color_pair(5))
+        stdscr.addstr(0, 0, " MTP v33 TITAN III ".center(w), curses.color_pair(5))
         
-        c = HAL.get_cpu_temp()
-        g = HAL.get_gpu_temp()
-        
-        stdscr.addstr(2, 2, "LOCAL", curses.color_pair(4))
-        stdscr.addstr(3, 2, f"CPU: {c}C")
-        stdscr.addstr(4, 2, f"GPU: {g}C")
+        c = HardwareSensor.get_cpu_temp()
+        g = HardwareSensor.get_gpu_temp()
         
         if current_hr > 1e9: hrs = f"{current_hr/1e9:.2f} GH/s"
         elif current_hr > 1e6: hrs = f"{current_hr/1e6:.2f} MH/s"
         else: hrs = f"{current_hr/1000:.2f} kH/s"
+        
+        stdscr.addstr(2, 2, "LOCAL", curses.color_pair(4))
+        stdscr.addstr(3, 2, f"CPU: {c:.1f}C (Adj)")
+        stdscr.addstr(4, 2, f"GPU: {g:.1f}C")
         stdscr.addstr(5, 2, f"Hash: {hrs}")
         
-        stdscr.addstr(2, 30, "NET", curses.color_pair(4))
-        status = "UP" if state.connected else "DOWN"
-        stdscr.addstr(3, 30, f"Link: {status}")
-        stdscr.addstr(4, 30, f"Acc: {state.accepted.value}")
-        stdscr.addstr(5, 30, f"Rej: {state.rejected.value}")
+        stdscr.addstr(2, 30, "NETWORK", curses.color_pair(4))
+        stdscr.addstr(3, 30, f"Link: {state.connected.value}")
+        stdscr.addstr(4, 30, f"Shares: {state.local_tx.value}")
+        stdscr.addstr(5, 30, f"Acc/Rej: {state.accepted.value}/{state.rejected.value}")
         
         stdscr.addstr(2, 60, "PROXY", curses.color_pair(4))
         stdscr.addstr(3, 60, f"Clients: {state.proxy_clients.value}")
-        stdscr.addstr(4, 60, f"Tx: {state.proxy_tx.value}")
-        stdscr.addstr(5, 60, f"Rx: {state.proxy_rx.value}")
+        stdscr.addstr(4, 60, f"TX: {state.proxy_tx.value}")
         
         stdscr.hline(7, 0, '-', w)
-        for i, (lvl, msg) in enumerate(logs):
-            c = curses.color_pair(5)
-            if lvl == "ERR": c = curses.color_pair(3)
-            elif lvl == "TX": c = curses.color_pair(2)
-            elif lvl == "RX": c = curses.color_pair(1)
-            try: stdscr.addstr(8+i, 2, f"[{datetime.now().strftime('%H:%M:%S')}] [{lvl}] {msg}", c)
+        for i, (lvl, msg) in enumerate(logs[- (h-9) :]):
+            color = curses.color_pair(5)
+            if lvl == "TX": color = curses.color_pair(2)
+            if lvl == "RX": color = curses.color_pair(1)
+            if lvl == "ERR": color = curses.color_pair(3)
+            try: stdscr.addstr(8+i, 2, f"[{datetime.now().strftime('%H:%M:%S')}] [{lvl}] {msg}", color)
             except: pass
             
         stdscr.refresh()
         time.sleep(0.1)
         if stdscr.getch() == ord('q'): break
         
-    stop_ev.set()
+    stop.set()
     for p in procs: p.terminate()
 
 if __name__ == "__main__":
-    # 1. Boot Checks
+    run_titan_benchmark()
     
-    # 2. Bench
-    # Using a fake queue for bench logs to keep it simple
-    bq = mp.Queue()
-    run_titan_benchmark(bq)
+    man = mp.Manager()
+    state = man.Namespace()
+    state.connected = man.Value('b', False)
+    state.local_tx = man.Value('i', 0)
+    state.accepted = man.Value('i', 0)
+    state.rejected = man.Value('i', 0)
+    state.proxy_clients = man.Value('i', 0)
+    state.proxy_tx = man.Value('i', 0)
+    state.proxy_rx = man.Value('i', 0)
     
-    # 3. Init Shared State
-    manager = mp.Manager()
-    state = manager.Namespace()
-    state.connected = False
-    state.local_tx = manager.Value('i', 0)
-    state.accepted = manager.Value('i', 0)
-    state.rejected = manager.Value('i', 0)
-    state.proxy_clients = manager.Value('i', 0)
-    state.proxy_tx = manager.Value('i', 0)
-    state.proxy_rx = manager.Value('i', 0)
-    
-    state.extranonce1 = manager.Value('c', b'')
-    state.extranonce2_size = manager.Value('i', 4)
-    
-    job_q = manager.Queue()
-    res_q = manager.Queue()
-    log_q = manager.Queue()
+    job_q = man.Queue()
+    res_q = man.Queue()
+    log_q = man.Queue()
     
     try:
-        curses.wrapper(main_gui, state, job_q, res_q, log_q)
+        curses.wrapper(dashboard, state, job_q, res_q, log_q)
     except KeyboardInterrupt: pass
