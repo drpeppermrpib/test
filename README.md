@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+KXT MINER SUITE v49 - STABILITY FIX
+===================================
+Base: Beta v20 (Flux, Proxy, UI)
+Engine: v19 (Submission Logic)
+Fixes: Manager Crash, Error Parsing, Job Switch
+"""
+
 import sys
 # FIX: Large integer string conversion limit
 try: sys.set_int_max_str_digits(0)
@@ -36,8 +44,8 @@ DEFAULT_CONFIG = {
     "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig_local",
     "PASSWORD": "x",
     "PROXY_PORT": 60060,
-    "THROTTLE_START": 79.0, 
-    "THROTTLE_MAX": 88.0,
+    "THROTTLE_START": 79.0,
+    "THROTTLE_MAX": 85.0,
     "BENCH_DURATION": 60,
     "STATS_URL": "https://solo.braiins.com/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
 }
@@ -199,54 +207,59 @@ class ProxyServer(threading.Thread):
 # ================= CPU MINER =================
 def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_id):
     active_jid = None
-    nonce = (id * 100_000_000) + random.randint(0, 10000)
+    nonce = (id * 100_000_000) + random.randint(0, 5000)
     
     while not stop.is_set():
         if throttle.value > 0.0: time.sleep(throttle.value)
 
+        # 1. New Job Check
         try:
             if not job_q.empty():
                 try:
                     new_job = job_q.get_nowait()
-                    if active_jid != new_job[0] or new_job[8]:
+                    if not active_jid or active_jid != new_job[0] or new_job[8]:
                         active_jid = new_job[0]
                         curr_job = new_job
-                        nonce = (id * 100_000_000) + random.randint(0, 10000)
+                        # Randomize nonce start on new job to prevent overlap
+                        nonce = (id * 100_000_000) + random.randint(0, 5000)
                 except queue.Empty: pass
         except: pass
             
+        # 2. Global Job Lock Check (Prevents Stale)
         try:
-            current_global_id = global_job_id.value.decode('utf-8')
-            if active_jid and active_jid != current_global_id and current_global_id != "":
-                active_jid = None 
+            curr_g_id = global_job_id.value.decode('utf-8')
+            if active_jid and curr_g_id and active_jid != curr_g_id:
+                active_jid = None # Invalid job
                 continue
         except: pass
 
         if not active_jid: 
-            time.sleep(0.01); continue
+            time.sleep(0.05); continue
             
+        # 3. Mining Loop
         try:
-            jid, prev, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
+            jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
             
             en2_bin = os.urandom(4)
             en2 = binascii.hexlify(en2_bin).decode()
             
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
-            coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
+            cb_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
             
-            merkle_root = coinbase_hash
+            merkle = cb_hash
             for branch in mb:
                 branch_bin = binascii.unhexlify(branch)
-                merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + branch_bin).digest()).digest()
+                merkle = hashlib.sha256(hashlib.sha256(merkle + branch_bin).digest()).digest()
                 
             header = (
                 binascii.unhexlify(ver)[::-1] +
-                binascii.unhexlify(prev)[::-1] +
-                merkle_root +
+                binascii.unhexlify(ph)[::-1] +
+                merkle +
                 binascii.unhexlify(ntime)[::-1] +
                 binascii.unhexlify(nbits)[::-1]
             )
             
+            # Simple difficulty check
             target = b'\x00\x00'
             
             for n in range(nonce, nonce + 1000):
@@ -296,9 +309,7 @@ def run_benchmark_sequence():
     os.system('clear')
     print("=== KXT v49 SYSTEM AUDIT ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
-    
     stop = mp.Event()
-    
     procs = []
     for _ in range(mp.cpu_count()):
         p = mp.Process(target=cpu_bench_dummy, args=(stop,))
@@ -351,7 +362,7 @@ class MinerSuite:
         self.log_q = self.man.Queue()
         self.stop = mp.Event()
         
-        # FIX: Use standard mp.Array instead of manager.Array
+        # FIX: Use multiprocessing.Array (safe) instead of manager.Array (unstable)
         self.global_job_id = mp.Array('c', 64)
         self.global_job_id.value = b""
         
@@ -365,7 +376,6 @@ class MinerSuite:
         self.proxy_stats['submitted'] = 0
         self.proxy_stats['accepted'] = 0
         self.proxy_stats['rejected'] = 0
-        
         self.local_stats = self.man.dict()
         self.local_stats['submitted'] = 0
         
@@ -379,13 +389,12 @@ class MinerSuite:
         self.logs = []
         self.connected = False
         self.msg_id = 1
-        
         self.current_hashrate = 0.0
 
     def run_setup(self):
         os.system('clear')
         self.cfg = DEFAULT_CONFIG.copy()
-        print("Starting Suite...")
+        print("Starting KXT v49...")
         time.sleep(1)
 
     def log(self, t, m):
@@ -402,7 +411,6 @@ class MinerSuite:
             mx = max(c, g)
             start = self.cfg['THROTTLE_START']
             stop = self.cfg['THROTTLE_MAX']
-            
             if mx < start: self.throttle.value = 0.0
             elif mx < stop: self.throttle.value = (mx - start) / (stop - start) * 0.1
             else: self.throttle.value = 0.5; self.log("WARN", f"Overheat {mx}C")
@@ -415,18 +423,14 @@ class MinerSuite:
                 self.log("NET", f"Dialing {self.cfg['POOL_URL']}...")
                 s = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                
                 self.connected = True
                 self.log("NET", "Connected! Handshaking...")
                 
-                self.local_stats['submitted'] += 1
-                
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v49-Fix"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v49"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
 
                 buff = b""
-                
                 while not self.stop.is_set():
                     while not self.res_q.empty():
                         r = self.res_q.get()
@@ -460,22 +464,23 @@ class MinerSuite:
                                         self.log("RX", "Block/Share ACCEPTED!")
                                     else: 
                                         self.shares['rej'] += 1
-                                        err_msg = str(msg.get('error'))
-                                        if "stale" in err_msg.lower() or "duplicate" in err_msg.lower():
-                                            self.log("RX", f"REJECTED: Stale/Dup (Fixing...)")
+                                        # FIX: Better error handling to avoid "None"
+                                        err = msg.get('error')
+                                        if err and isinstance(err, list) and len(err) > 1:
+                                            self.log("RX", f"REJECTED: {err[1]}")
                                         else:
-                                            self.log("RX", f"REJECTED: {err_msg}")
+                                            self.log("RX", f"REJECTED: Stale/Unknown")
 
                                 if method == 'mining.notify':
                                     p = msg['params']
                                     jid = str(p[0])
                                     self.data['job'] = jid
-                                    
-                                    # Update Global Job ID
+                                    # Update global ID
                                     self.global_job_id.value = jid.encode('utf-8')
                                     
                                     en1 = self.data['en1']
                                     if en1:
+                                        # Force Flush
                                         if p[8]: 
                                             while not self.job_q.empty(): 
                                                 try: self.job_q.get_nowait()
@@ -507,7 +512,6 @@ class MinerSuite:
         curses.init_pair(3, curses.COLOR_RED, -1)
         curses.init_pair(4, curses.COLOR_CYAN, -1)
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
-        
         stdscr.nodelay(True)
         
         while not self.stop.is_set():
@@ -528,7 +532,6 @@ class MinerSuite:
                 self.last_stats[i] = self.stats[i]
             
             self.current_hashrate = (self.current_hashrate * 0.7) + (current_total * 0.3 * 10)
-            
             hr_disp = self.current_hashrate
             fhr = f"{hr_disp/1e6:.2f} MH/s" if hr_disp > 1e6 else f"{hr_disp/1000:.2f} kH/s"
             
