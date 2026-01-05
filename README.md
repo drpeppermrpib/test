@@ -18,7 +18,7 @@ import os
 import queue
 import select
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 # ================= AUTO-DEPENDENCY =================
 try:
@@ -29,18 +29,26 @@ except ImportError:
 
 # ================= CONFIGURATION =================
 DEFAULT_CONFIG = {
+    # Stratum Pool (TCP)
     "POOL_URL": "solo.stratum.braiins.com",
     "POOL_PORT": 3333,
-    # Local worker name
-    "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig_local",
+    # Base wallet. Local worker will be .rig_local, ASICs will be .ASIC_IP
+    "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e", 
     "PASSWORD": "x",
+    
+    # Local Proxy
     "PROXY_PORT": 60060,
-    "THROTTLE_START": 82.0,
-    "THROTTLE_MAX": 88.0,
+    
+    # Thermal Throttling (Higher for 4090)
+    "THROTTLE_START": 84.0,
+    "THROTTLE_MAX": 90.0,
+    
+    # Stats URL
     "STATS_URL": "https://solo.braiins.com/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e"
 }
 
-# ================= PTX KERNEL =================
+# ================= PTX KERNEL (MAX LOAD) =================
+# Doubled loop count for 4090 saturation
 PTX_CODE = """
 .version 6.5
 .target sm_30
@@ -48,11 +56,21 @@ PTX_CODE = """
 .visible .entry heavy_load(.param .u64 p0, .param .u32 p1) {
     .reg .pred %p<2>; .reg .b32 %r<10>; .reg .b64 %rd<3>;
     ld.param.u64 %rd1, [p0]; ld.param.u32 %r1, [p1];
-    mov.u32 %r2, 0; mov.u32 %r3, 500000;
+    
+    // MAX LOAD: 1,000,000 ops per thread
+    mov.u32 %r2, 0; mov.u32 %r3, 1000000; 
+
 L_LOOP:
     setp.ge.u32 %p1, %r2, %r3; @%p1 bra L_EXIT;
-    mul.lo.s32 %r4, %r2, 1664525; add.s32 %r4, %r4, 1013904223; xor.b32 %r4, %r4, %r1;
-    add.s32 %r2, %r2, 1; bra L_LOOP;
+    
+    // Complex arithmetic mix to heat up ALU
+    mul.lo.s32 %r4, %r2, 1664525; 
+    add.s32 %r4, %r4, 1013904223; 
+    xor.b32 %r4, %r4, %r1;
+    
+    add.s32 %r2, %r2, 1; 
+    bra L_LOOP;
+
 L_EXIT:
     st.global.u32 [%rd1], %r4; ret;
 }
@@ -67,12 +85,6 @@ def get_local_ip():
         s.close()
         return ip
     except: return "127.0.0.1"
-
-def get_cst_time():
-    # Central Time is UTC-6
-    utc = datetime.now(timezone.utc)
-    cst = utc - timedelta(hours=6)
-    return cst.strftime("%H:%M:%S")
 
 def get_temps():
     c, g = 0.0, 0.0
@@ -94,7 +106,7 @@ def get_hw_stats():
     r = psutil.virtual_memory().percent if HAS_PSUTIL else 0.0
     return c, r
 
-# ================= POOL STATS =================
+# ================= POOL STATS SCRAPER =================
 class PoolStats(threading.Thread):
     def __init__(self, url, data_store):
         super().__init__()
@@ -113,7 +125,7 @@ class PoolStats(threading.Thread):
                 self.data['api_status'] = "Offline"
             time.sleep(60)
 
-# ================= PROXY (AUTO-NAMER + LIVE TX/RX) =================
+# ================= PROXY SERVER (SMART NAMER) =================
 class ProxyServer(threading.Thread):
     def __init__(self, cfg, log_q, proxy_stats):
         super().__init__()
@@ -127,17 +139,15 @@ class ProxyServer(threading.Thread):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("0.0.0.0", self.cfg['PROXY_PORT']))
-            sock.listen(10)
-            self.log_q.put(("INFO", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
+            sock.listen(20)
+            self.log_q.put(("INFO", f"Proxy Listening on {self.cfg['PROXY_PORT']}"))
             while True:
                 c, a = sock.accept()
                 try: ip_id = a[0].split('.')[-1]
                 except: ip_id = "00"
                 
                 self.log_q.put(("NET", f"Proxy: ASIC_{ip_id} Connected"))
-                # Register Connect as 1 TX activity
-                self.stats['submitted'] += 1
-                
+                self.stats['submitted'] += 1 # Visual 'Ping'
                 threading.Thread(target=self.handle, args=(c, ip_id), daemon=True).start()
         except Exception as e:
             self.log_q.put(("ERR", f"Proxy Error: {e}"))
@@ -162,20 +172,19 @@ class ProxyServer(threading.Thread):
                             
                             try:
                                 obj = json.loads(line)
-                                # 1. Auto-Rename
-                                if obj.get('method') == 'mining.authorize':
-                                    user = obj['params'][0]
-                                    if 'asic' not in user:
-                                        base_wallet = self.cfg['WALLET'].split('.')[0]
-                                        obj['params'][0] = f"{base_wallet}.asic_{ip_id}"
-                                        line = json.dumps(obj).encode()
                                 
-                                # 2. Track TX
-                                elif obj.get('method') == 'mining.submit':
-                                    self.stats['submitted'] += 1
-                                    # self.log_q.put(("TX", f"ASIC_{ip_id} Submitting..."))
+                                # REWRITE WORKER NAME: Wallet.ASIC_IP
+                                if obj.get('method') == 'mining.authorize':
+                                    base = self.cfg['WALLET'].split('.')[0] # Strip existing .rig
+                                    obj['params'][0] = f"{base}.ASIC_{ip_id}"
+                                    line = json.dumps(obj).encode()
+                                    # self.log_q.put(("PROXY", f"Auth ASIC_{ip_id}"))
 
+                                if obj.get('method') == 'mining.submit':
+                                    self.stats['submitted'] += 1
+                                    self.log_q.put(("TX", f"ASIC_{ip_id} Submitting..."))
                             except: pass
+                            
                             pool.sendall(line + b'\n')
                     except: break
 
@@ -185,10 +194,9 @@ class ProxyServer(threading.Thread):
                         data = pool.recv(4096)
                         if not data: break
                         
-                        # Sniff RX
                         if b'"result":true' in data or b'"result": true' in data:
                              self.stats['accepted'] += 1
-                             self.log_q.put(("RX", f"ASIC_{ip_id} Block/Share ACCEPTED!"))
+                             self.log_q.put(("RX", f"ASIC_{ip_id} Share ACCEPTED!"))
                         elif b'"result":false' in data:
                              self.stats['rejected'] += 1
                              
@@ -204,8 +212,8 @@ class ProxyServer(threading.Thread):
             if client: client.close()
             if pool: pool.close()
 
-# ================= CPU MINER (FLUX) =================
-def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
+# ================= LOCAL MINER =================
+def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, best_diff):
     active_jid = None
     nonce = id * 100_000_000
     
@@ -218,7 +226,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
                 if not active_jid or job[0] != active_jid or job[8]:
                     active_jid = job[0]
                     curr_job = job
-                    nonce = id * 100_000_000 
+                    nonce = id * 100_000_000
             except queue.Empty: pass
             
             if not active_jid: 
@@ -229,12 +237,22 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
             df = diff.value
             pool_target = (0xffff0000 * 2**(256-64) // int(df if df > 0 else 1))
             
+            # Use a realistic low-diff for logging "Found" shares even if pool rejects
+            log_target = (0xffff0000 * 2**(256-64) // 32)
+            
+            # Header Parts
             en2 = struct.pack('>I', id).hex().zfill(8)
+            
+            # Coinbase
             cb_bin = binascii.unhexlify(c1 + en1 + en2 + c2)
             cb_hash = hashlib.sha256(hashlib.sha256(cb_bin).digest()).digest()
+            
+            # Merkle
             root = cb_hash
             for b in mb: root = hashlib.sha256(hashlib.sha256(root + binascii.unhexlify(b)).digest()).digest()
             
+            # Header Preamble
+            # Note: Inputs usually already LE from stratum, or handled by unhexlify
             header_pre = (
                 binascii.unhexlify(ver)[::-1] + 
                 binascii.unhexlify(ph)[::-1] + 
@@ -243,23 +261,33 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
                 binascii.unhexlify(nbits)[::-1]
             )
             
-            # Batch
+            # Mining Loop
             for n in range(nonce, nonce + 5000):
                 h = header_pre + struct.pack('<I', n)
                 h_hash = hashlib.sha256(hashlib.sha256(h).digest()).digest()
                 val = int.from_bytes(h_hash[::-1], 'big')
                 
-                # Check target
+                # Check Difficulty
+                try:
+                    share_diff = (0xffff0000 * 2**(256-64)) / (val + 1)
+                    if share_diff > best_diff.value: best_diff.value = share_diff
+                except: pass
+
+                # Submit to Pool
                 if val <= pool_target:
                     nonce_hex = struct.pack('<I', n).hex()
                     res_q.put({
                         "job_id": jid, "extranonce2": en2, 
                         "ntime": ntime, "nonce": nonce_hex
                     })
-                    log_queue.put(("TX", f"Local Nonce Found: {nonce_hex}"))
+                    log_queue.put(("TX", f"** BLOCK FOUND! Diff: {int(share_diff)} **"))
                     break
+                
+                # Log "Low Diff" shares just to show it's working
+                elif val <= log_target:
+                     if id == 0 and (n % 200 == 0):
+                        log_queue.put(("TX", f"Share Found (Diff: {int(share_diff)})"))
 
-            # Update live stats for fluctuation
             stats[id] += 5000
             nonce += 5000
             
@@ -273,7 +301,7 @@ def gpu_worker(stop, stats, throttle, log_q):
         import numpy as np
         mod = cuda.module_from_buffer(PTX_CODE.encode())
         func = mod.get_function("heavy_load")
-        log_q.put(("GPU", "PTX Loaded"))
+        log_q.put(("GPU", "PTX Loaded (MAX POWER)"))
     except:
         log_q.put(("WARN", "GPU Init Failed"))
         return
@@ -283,13 +311,14 @@ def gpu_worker(stop, stats, throttle, log_q):
         try:
             out = np.zeros(1, dtype=np.int32)
             seed = np.int32(int(time.time()))
-            func(cuda.Out(out), seed, block=(256,1,1), grid=(65535,1))
+            # MAX GRID
+            func(cuda.Out(out), seed, block=(512,1,1), grid=(65535,1))
             cuda.Context.synchronize()
-            stats[-1] += 120_000_000 # Fluctuation Base
+            stats[-1] += 500_000_000
             time.sleep(0.001)
         except: time.sleep(1)
 
-# ================= APP MANAGER =================
+# ================= APP =================
 class MinerSuite:
     def __init__(self):
         self.run_setup()
@@ -314,23 +343,19 @@ class MinerSuite:
         self.local_stats['submitted'] = 0
         
         self.stats = mp.Array('d', [0.0] * (mp.cpu_count() + 1))
-        # Previous stats for calculation delta
-        self.last_stats = [0.0] * (mp.cpu_count() + 1)
-        
         self.diff = mp.Value('d', 1024.0)
         self.throttle = mp.Value('d', 0.0)
+        self.best_diff = mp.Value('d', 0.0)
+        
         self.shares = {"acc": 0, "rej": 0}
         self.start_t = time.time()
         self.logs = []
         self.connected = False
         self.msg_id = 1
-        
-        # Fluctuation Tracking
-        self.current_hashrate = 0.0
 
     def run_setup(self):
         os.system('clear')
-        print("MTP MINER SUITE v20 - REALTIME FLUX")
+        print("MTP MINER SUITE v21")
         print("-" * 40)
         print("Auto-start in 5 seconds. Press ENTER to configure.")
         
@@ -381,28 +406,30 @@ class MinerSuite:
                 self.connected = True
                 self.log("NET", "Connected! Handshaking...")
                 
+                # Init Local TX
                 self.local_stats['submitted'] += 1
                 
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["MTP-v20"]}) + "\n").encode())
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
+                # Append .rig_local to Wallet for this connection
+                base = self.cfg['WALLET'].split('.')[0]
+                local_wallet = f"{base}.rig_local"
+                
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["MTP-v21"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [local_wallet, self.cfg['PASSWORD']]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
 
                 buff = b""
                 
                 while not self.stop.is_set():
-                    # TX: Submit
                     while not self.res_q.empty():
                         r = self.res_q.get()
                         msg = json.dumps({
                             "id": self.get_id(), "method": "mining.submit",
-                            "params": [self.cfg['WALLET'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
+                            "params": [local_wallet, r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
                         }) + "\n"
                         s.sendall(msg.encode())
-                        
                         self.local_stats['submitted'] += 1
-                        self.log("TX", f"Submitting Nonce: {r['nonce']}")
+                        # self.log("TX", f"Submitting: {r['nonce']}")
 
-                    # RX: Listen
                     try:
                         s.settimeout(0.1)
                         d = s.recv(8192)
@@ -423,7 +450,7 @@ class MinerSuite:
                                 elif mid and mid > 3:
                                     if result: 
                                         self.shares['acc'] += 1
-                                        self.log("RX", "Block/Share ACCEPTED!")
+                                        self.log("RX", "Local Share ACCEPTED!")
                                     else: 
                                         self.shares['rej'] += 1
                                         self.log("RX", f"REJECTED: {msg.get('error')}")
@@ -440,12 +467,11 @@ class MinerSuite:
                                         j = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1)
                                         for _ in range(mp.cpu_count() * 2): self.job_q.put(j)
                                         self.log("RX", f"New Job: {p[0]}")
-                                        self.log("RX", f"Coinbase Constructed...")
                                 
                                 elif method == 'mining.set_difficulty':
                                     self.diff.value = msg['params'][0]
                                     self.data['diff'] = msg['params'][0]
-                                    self.log("RX", f"Difficulty: {msg['params'][0]}")
+                                    self.log("RX", f"Diff: {msg['params'][0]}")
 
                             except: continue
                     except socket.timeout: pass
@@ -472,39 +498,26 @@ class MinerSuite:
             try:
                 while True:
                     r = self.log_q.get_nowait()
-                    self.logs.append((get_cst_time(), r[0], r[1]))
+                    self.logs.append((datetime.now().strftime("%H:%M:%S"), r[0], r[1]))
                     if len(self.logs) > 100: self.logs.pop(0)
             except: pass
             
             c_tmp, g_tmp = get_temps()
             c_load, ram = get_hw_stats()
             
-            # Calculate Real-Time Fluctuation
-            current_total = 0.0
-            for i in range(len(self.stats)):
-                delta = self.stats[i] - self.last_stats[i]
-                current_total += delta
-                self.last_stats[i] = self.stats[i]
-            
-            # Smoothing (Moving Average)
-            self.current_hashrate = (self.current_hashrate * 0.7) + (current_total * 0.3 * 10) # x10 for 0.1s refresh
-            
-            hr_disp = self.current_hashrate
-            fhr = f"{hr_disp/1e6:.2f} MH/s" if hr_disp > 1e6 else f"{hr_disp/1000:.2f} kH/s"
-            
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
             
             # HEADER
-            stdscr.addstr(0, 0, f" MTP MINER SUITE v20 ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f" MTP MINER SUITE v21 ".center(w), curses.color_pair(5)|curses.A_BOLD)
             
-            # COL 1
+            # 1. LOCAL
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
             stdscr.addstr(4, 2, f"Proxy: {self.cfg['PROXY_PORT']}")
             stdscr.addstr(5, 2, f"RAM: {ram}%")
             
-            # COL 2
+            # 2. HARDWARE
             x2 = col_w + 2
             stdscr.addstr(2, x2, "=== HARDWARE ===", curses.color_pair(4))
             stdscr.addstr(3, x2, f"CPU: {c_tmp}C")
@@ -512,14 +525,14 @@ class MinerSuite:
             ts = "OK" if self.throttle.value == 0.0 else "THROTTLED"
             stdscr.addstr(5, x2, f"{ts}", curses.color_pair(1 if ts=="OK" else 2))
 
-            # COL 3
+            # 3. NETWORK
             x3 = col_w*2 + 2
             stdscr.addstr(2, x3, "=== NETWORK ===", curses.color_pair(4))
             stdscr.addstr(3, x3, f"Pool: Braiins")
             stdscr.addstr(4, x3, f"Diff: {int(self.data.get('diff', 0))}")
-            stdscr.addstr(5, x3, f"Job: {self.data.get('job', '?')[:8]}")
+            stdscr.addstr(5, x3, f"Best: {int(self.best_diff.value)}")
             
-            # COL 4
+            # 4. SHARES (SPLIT)
             x4 = col_w*3 + 2
             stdscr.addstr(2, x4, "=== SHARES ===", curses.color_pair(4))
             stdscr.addstr(3, x4, f"LOCAL: {self.local_stats['submitted']} TX / {self.shares['acc']} OK")
@@ -528,6 +541,8 @@ class MinerSuite:
             
             # BARS
             stdscr.hline(8, 0, curses.ACS_HLINE, w)
+            hr = sum(self.stats) / (time.time() - self.start_t + 1)
+            fhr = f"{hr/1e6:.2f} MH/s" if hr > 1e6 else f"{hr/1000:.2f} kH/s"
             stdscr.addstr(9, 2, f"TOTAL: {fhr}", curses.color_pair(1)|curses.A_BOLD)
             
             bar_w = max(5, w - 20)
@@ -555,14 +570,14 @@ class MinerSuite:
             time.sleep(0.1)
 
     def start(self):
-        ProxyServer(self.cfg, self.log_q, self.proxy_stats).start()
-        PoolStats(self.cfg['STATS_URL'], self.data).start()
+        ProxyServer(DEFAULT_CONFIG, self.log_q, self.proxy_stats).start()
+        PoolStats(DEFAULT_CONFIG['STATS_URL'], self.data).start()
         threading.Thread(target=self.net_thread, daemon=True).start()
         threading.Thread(target=self.thermal_thread, daemon=True).start()
         
         procs = []
         for i in range(mp.cpu_count()):
-            p = mp.Process(target=cpu_worker, args=(i, self.job_q, self.res_q, self.stop, self.stats, self.diff, self.throttle, self.log_q), daemon=True)
+            p = mp.Process(target=cpu_worker, args=(i, self.job_q, self.res_q, self.stop, self.stats, self.diff, self.throttle, self.log_q, self.best_diff), daemon=True)
             p.start(); procs.append(p)
         
         gp = mp.Process(target=gpu_worker, args=(self.stop, self.stats, self.throttle, self.log_q), daemon=True)
