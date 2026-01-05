@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE (v36) - THROTTLE EDITION
-========================================
-Architecture: Thermal Governor (79C Limit) + Heavy Load
+KXT MINER SUITE (v37) - STABLE THROTTLE
+=======================================
+Architecture: Thermal Governor (79C) + Heavy Load
 Target: solo.stratum.braiins.com:3333
-Fixes: Auto-close bug, Thermal runaway, Visuals
+Fixes: SyntaxError on line 448, Python 3.10 Compatibility
 """
 
 import sys
@@ -24,9 +24,9 @@ import subprocess
 import signal
 import resource
 import glob
-import math  # Global Import
+import math
 import re
-import queue # Critical for worker queues
+import queue
 from datetime import datetime
 
 # ==============================================================================
@@ -38,19 +38,16 @@ EXIT_FLAG = mp.Event()
 def signal_handler(signum, frame):
     if not EXIT_FLAG.is_set():
         EXIT_FLAG.set()
-        # No print here to avoid corrupting curses
-        
+
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 def boot_prep():
-    # Fix file limits
     try:
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(65535, hard), hard))
     except: pass
     
-    # Check dependencies
     try: import curses
     except ImportError:
         print("[FAIL] Curses missing.")
@@ -69,13 +66,9 @@ CONFIG = {
     "USER": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig1",
     "PASS": "x",
     "PROXY_PORT": 60060,
-    
-    # Benchmark Settings
     "BENCH_TIME": 300,
-    
-    # SAFETY LIMITS
-    "THROTTLE_TEMP": 79.0, # Pause load above this
-    "RESUME_TEMP": 75.0,   # Resume load below this
+    "THROTTLE_TEMP": 79.0,
+    "RESUME_TEMP": 75.0,
 }
 
 # ==============================================================================
@@ -103,7 +96,7 @@ extern "C" {
 """
 
 # ==============================================================================
-# SECTION 4: FIND-MAX SENSOR LOGIC
+# SECTION 4: SENSORS
 # ==============================================================================
 
 class HardwareHAL:
@@ -165,12 +158,10 @@ def draw_box(stdscr, y, x, h, w, title, color_pair):
         stdscr.addch(y, x + w - 1, curses.ACS_URCORNER)
         stdscr.addch(y + h - 1, x, curses.ACS_LLCORNER)
         stdscr.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER)
-        
         stdscr.hline(y, x + 1, curses.ACS_HLINE, w - 2)
         stdscr.hline(y + h - 1, x + 1, curses.ACS_HLINE, w - 2)
         stdscr.vline(y + 1, x, curses.ACS_VLINE, h - 2)
         stdscr.vline(y + 1, x + w - 1, curses.ACS_VLINE, h - 2)
-        
         stdscr.addstr(y, x + 2, f" {title} ")
         stdscr.attroff(color_pair)
     except: pass
@@ -182,21 +173,17 @@ def draw_bar(val, max_val, width=10):
     return f"[{bar}]"
 
 # ==============================================================================
-# SECTION 6: BENCHMARK WITH THROTTLING
+# SECTION 6: BENCHMARK
 # ==============================================================================
 
 def cpu_stress(stop_ev, load_counter, throttle_ev):
     import math
     while not stop_ev.is_set():
-        throttle_ev.wait() # Pauses if cleared
-        
-        # Heavy Matrix Math
+        throttle_ev.wait()
         size = 50
         A = [[random.random() for _ in range(size)] for _ in range(size)]
         B = [[random.random() for _ in range(size)] for _ in range(size)]
-        # This keeps the CPU busy
         _ = [[sum(a*b for a,b in zip(A_row, B_col)) for B_col in zip(*B)] for A_row in A]
-        
         with load_counter.get_lock():
             load_counter.value += (size * size)
 
@@ -206,11 +193,9 @@ def gpu_stress(stop_ev, throttle_ev):
         import pycuda.autoinit
         from pycuda.compiler import SourceModule
         import numpy as np
-        
         mod = SourceModule(CUDA_SRC)
         func = mod.get_function("kxt_heavy")
         out = cuda.mem_alloc(4096)
-        
         while not stop_ev.is_set():
             throttle_ev.wait()
             func(out, np.uint32(time.time()), block=(512,1,1), grid=(65535,1))
@@ -222,12 +207,11 @@ def run_benchmark(stdscr):
     
     stop = mp.Event()
     throttle = mp.Event()
-    throttle.set() # Default to Running
+    throttle.set()
     
     cnt = mp.Value('d', 0.0)
     procs = []
     
-    # Phase 1: CPU
     for _ in range(mp.cpu_count()):
         p = mp.Process(target=cpu_stress, args=(stop, cnt, throttle))
         p.start()
@@ -240,7 +224,6 @@ def run_benchmark(stdscr):
         rem = CONFIG['BENCH_TIME'] - (time.time() - start)
         t = HardwareHAL.get_cpu_temp()
         
-        # GOVERNOR LOGIC
         if not throttled_state:
             if t >= CONFIG['THROTTLE_TEMP']:
                 throttle.clear()
@@ -250,7 +233,6 @@ def run_benchmark(stdscr):
                 throttle.set()
                 throttled_state = False
                 
-        # Flush Input (Fixes the auto-close bug)
         try: stdscr.getch()
         except: pass
         
@@ -258,24 +240,23 @@ def run_benchmark(stdscr):
         h, w = stdscr.getmaxyx()
         
         stdscr.addstr(0, 0, " KXT GOVERNOR BENCHMARK ".center(w), curses.A_REVERSE)
-        draw_box(stdscr, 2, 2, 10, w-4, "CPU STRESS TEST", curses.color_pair(1))
+        draw_box(stdscr, 2, 2, 8, w-4, "CPU STRESS TEST", curses.color_pair(1))
         
         stdscr.addstr(4, 4, f"Time Remaining: {int(rem)}s")
         stdscr.addstr(6, 4, f"CPU Die Temp  : {t:.1f}C  {draw_bar(t, 90, 20)}")
         
         status = "RUNNING (MAX LOAD)"
-        status_color = curses.color_pair(1)
+        col = curses.color_pair(1)
         if throttled_state:
-            status = f"THROTTLED (TEMP > {CONFIG['THROTTLE_TEMP']}C) - COOLING DOWN"
-            status_color = curses.color_pair(2)
+            status = f"THROTTLED (TEMP > {CONFIG['THROTTLE_TEMP']}C) - COOLING"
+            col = curses.color_pair(2)
             
-        stdscr.addstr(8, 4, f"STATUS: {status}", status_color)
+        stdscr.addstr(8, 4, f"STATUS: {status}", col)
         
         stdscr.refresh()
         if EXIT_FLAG.is_set(): return
         time.sleep(0.5)
         
-    # Phase 2: CPU + GPU
     gp = mp.Process(target=gpu_stress, args=(stop, throttle))
     gp.start()
     procs.append(gp)
@@ -286,7 +267,6 @@ def run_benchmark(stdscr):
         c = HardwareHAL.get_cpu_temp()
         g = HardwareHAL.get_gpu_temp()
         
-        # Governor Logic (CPU only affects throttle mostly)
         if not throttled_state:
             if c >= CONFIG['THROTTLE_TEMP']:
                 throttle.clear()
@@ -344,7 +324,7 @@ class StratumClient(threading.Thread):
         while not EXIT_FLAG.is_set():
             if not self.sock:
                 if self.connect():
-                    self.send("mining.subscribe", ["KXT-v36"])
+                    self.send("mining.subscribe", ["KXT-v37"])
                     self.send("mining.authorize", [CONFIG['USER'], CONFIG['PASS']])
                     self.log_q.put(("NET", "Connected"))
                 else:
@@ -401,13 +381,11 @@ def miner_worker(id, job_q, res_q, stop):
             params, en1, en2sz = job_q.get(timeout=0.1)
             jid, prev, c1, c2, mb, ver, nbits, ntime, clean = params
             if clean: nonce = id * 5000000
-            
             en2 = struct.pack('>I', random.randint(0, 2**32-1)).hex().zfill(en2sz*2)
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
             root = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
             for b in mb: root = hashlib.sha256(hashlib.sha256(root + binascii.unhexlify(b)).digest()).digest()
             header = binascii.unhexlify(ver)[::-1] + binascii.unhexlify(prev)[::-1] + root + binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1]
-            
             target = b'\x00\x00'
             for n in range(nonce, nonce + 5000):
                 h = header + struct.pack('<I', n)
@@ -445,7 +423,11 @@ class Proxy(threading.Thread):
                     if not d: break
                     c.sendall(d)
         except: pass
-        finally: c.close(); p.close(); with self.state.proxy_clients.get_lock(): self.state.proxy_clients.value -= 1
+        finally: 
+            c.close()
+            p.close()
+            with self.state.proxy_clients.get_lock():
+                self.state.proxy_clients.value -= 1
 
 # ==============================================================================
 # SECTION 8: DASHBOARD
@@ -462,7 +444,6 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
     run_benchmark(stdscr)
     if EXIT_FLAG.is_set(): return
     
-    # Transition
     stdscr.clear()
     stdscr.addstr(5, 5, "BENCHMARK COMPLETE. STARTING MINER...", curses.A_BOLD)
     stdscr.refresh()
@@ -486,7 +467,7 @@ def dashboard(stdscr, state, job_q, res_q, log_q):
             if len(logs) > 20: logs.pop(0)
             
         stdscr.erase(); h, w = stdscr.getmaxyx()
-        stdscr.addstr(0, 0, " KXT MINER v36 ".center(w), curses.A_REVERSE)
+        stdscr.addstr(0, 0, " KXT MINER v37 ".center(w), curses.A_REVERSE)
         
         c = HardwareHAL.get_cpu_temp(); g = HardwareHAL.get_gpu_temp()
         
