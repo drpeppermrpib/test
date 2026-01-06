@@ -249,7 +249,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
             jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = block_data
             
             df = diff.value
-            if df <= 0: df = 1.0
+            if df <= 0: df = 800.0
             target_val = (0xffff0000 * 2**(256-64)) // int(df)
             
             # UNIQUE MINING FIX: Prefix En2 with WorkerID (4 bytes)
