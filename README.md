@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE v51 - BLOCK DATA FIX
+KXT MINER SUITE v51 - LV06 LOG STYLE
 ====================================
-Base: Beta v20 (UI, Sensors)
-Engine: v19 (Submission Logic)
-Fixes: Force Job Switch, UI Label "Block Data"
+1. Log Format: ₿ (uptime) category: message
+2. Params: 6-field submit (Wallet, Job, En2, Time, Nonce, VBits)
+3. En2: 8 Bytes (16 Hex Chars)
+4. Wallet: Bare address only
 """
 
 import sys
@@ -41,7 +42,8 @@ except ImportError:
 DEFAULT_CONFIG = {
     "POOL_URL": "solo.stratum.braiins.com",
     "POOL_PORT": 3333,
-    "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e.rig_local",
+    # REMOVED WORKER EXTENSION AS REQUESTED
+    "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
     "PASSWORD": "x",
     "PROXY_PORT": 60060,
     "THROTTLE_START": 79.0, 
@@ -69,6 +71,11 @@ L_EXIT:
 """
 
 # ================= UTILS =================
+START_TIME_MS = int(time.time() * 1000)
+
+def get_uptime_ms():
+    return int(time.time() * 1000) - START_TIME_MS
+
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -204,64 +211,97 @@ class ProxyServer(threading.Thread):
             if client: client.close()
             if pool: pool.close()
 
-# ================= CPU MINER (v19 ENGINE) =================
-def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q):
+# ================= CPU MINER (LV06 ENGINE) =================
+def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_id):
     active_jid = None
-    nonce = (id * 100_000_000) + random.randint(0, 10000)
+    block_data = None
+    nonce = (id * 100_000_000) + random.randint(0, 5000)
     
     while not stop.is_set():
         if throttle.value > 0.0: time.sleep(throttle.value)
 
+        # 1. New Job Check
         try:
             if not job_q.empty():
                 try:
-                    # Priority check for new job
-                    job = job_q.get_nowait()
-                    if not active_jid or job[0] != active_jid or job[8]:
-                        active_jid = job[0]
-                        curr_job = job
-                        nonce = (id * 100_000_000) + random.randint(0, 10000)
+                    new_block_data = job_q.get_nowait()
+                    if not active_jid or active_jid != new_block_data[0] or new_block_data[8]:
+                        active_jid = new_block_data[0]
+                        block_data = new_block_data
+                        nonce = (id * 100_000_000) + random.randint(0, 5000)
                 except queue.Empty: pass
         except: pass
             
-        if not active_jid: 
-            time.sleep(0.01); continue
-            
-        # --- v19 HASHING ENGINE ---
+        # 2. Global Lock
         try:
-            jid, prev, c1, c2, mb, ver, nbits, ntime, clean, en1 = curr_job
+            curr_g_id = global_job_id.value.decode('utf-8')
+            if active_jid and curr_g_id and active_jid != curr_g_id:
+                active_jid = None 
+                continue
+        except: pass
+
+        if not active_jid: 
+            time.sleep(0.05); continue
             
-            en2_bin = os.urandom(4)
+        # 3. Mining Loop
+        try:
+            jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = block_data
+            
+            # Difficulty Math (Target Calculation)
+            df = diff.value
+            if df <= 0: df = 1.0
+            
+            # Standard Stratum Target: max_target / diff
+            # max_target for diff 1 is 0x00000000FFFF... (approx)
+            # Actually diff 1 target is 0xffff000000...00 (256 bits)
+            # Target = 2^224 - 1
+            # Adjust to 0xffff...
+            
+            # Simplified:
+            target_val = (0xffff0000 * 2**(256-64)) // int(df)
+            
+            # UPDATED: En2 is 8 bytes (16 hex chars) per log
+            en2_bin = os.urandom(8)
             en2 = binascii.hexlify(en2_bin).decode()
             
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
-            coinbase_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
+            cb_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
             
-            merkle_root = coinbase_hash
+            merkle = cb_hash
             for branch in mb:
                 branch_bin = binascii.unhexlify(branch)
-                merkle_root = hashlib.sha256(hashlib.sha256(merkle_root + branch_bin).digest()).digest()
+                merkle = hashlib.sha256(hashlib.sha256(merkle + branch_bin).digest()).digest()
                 
             header = (
                 binascii.unhexlify(ver)[::-1] +
-                binascii.unhexlify(prev)[::-1] +
-                merkle_root +
+                binascii.unhexlify(ph)[::-1] +
+                merkle +
                 binascii.unhexlify(ntime)[::-1] +
                 binascii.unhexlify(nbits)[::-1]
             )
             
-            target = b'\x00\x00'
-            
+            # Small batch
             for n in range(nonce, nonce + 2000):
                 nonce_bin = struct.pack('<I', n)
-                block_hash = hashlib.sha256(hashlib.sha256(header + nonce_bin).digest()).digest()
+                block_hash_bin = hashlib.sha256(hashlib.sha256(header + nonce_bin).digest()).digest()
+                hash_int = int.from_bytes(block_hash_bin[::-1], 'big')
                 
-                if block_hash.endswith(target):
+                if hash_int <= target_val:
+                    # FOUND SHARE
+                    
+                    # Calculate share difficulty for log
+                    # Diff = (pool_diff_1_target) / hash_int
+                    try:
+                        share_diff = (0xffff0000 * 2**(256-64)) / hash_int
+                    except: share_diff = df
+
                     res_q.put({
                         "job_id": jid, 
                         "extranonce2": en2, 
                         "ntime": ntime, 
-                        "nonce": binascii.hexlify(nonce_bin).decode()
+                        "nonce": binascii.hexlify(nonce_bin).decode(),
+                        "share_diff": share_diff,
+                        "pool_diff": df
                     })
                     break
 
@@ -297,11 +337,9 @@ def gpu_worker(stop, stats, throttle, log_q):
 # ================= BENCHMARK =================
 def run_benchmark_sequence():
     os.system('clear')
-    print("=== KXT v51 SYSTEM AUDIT ===")
+    print("=== KXT v51 LV06 AUDIT ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
-    
     stop = mp.Event()
-    
     procs = []
     for _ in range(mp.cpu_count()):
         p = mp.Process(target=cpu_bench_dummy, args=(stop,))
@@ -354,6 +392,9 @@ class MinerSuite:
         self.log_q = self.man.Queue()
         self.stop = mp.Event()
         
+        self.global_job_id = mp.Array('c', 64)
+        self.global_job_id.value = b""
+        
         self.data = self.man.dict()
         self.data['job'] = "Connecting..."
         self.data['en1'] = ""
@@ -364,13 +405,10 @@ class MinerSuite:
         self.proxy_stats['submitted'] = 0
         self.proxy_stats['accepted'] = 0
         self.proxy_stats['rejected'] = 0
-        
         self.local_stats = self.man.dict()
         self.local_stats['submitted'] = 0
-        
         self.stats = mp.Array('d', [0.0] * (mp.cpu_count() + 1))
         self.last_stats = [0.0] * (mp.cpu_count() + 1)
-        
         self.diff = mp.Value('d', 1024.0)
         self.throttle = mp.Value('d', 0.0)
         self.shares = {"acc": 0, "rej": 0}
@@ -378,17 +416,18 @@ class MinerSuite:
         self.logs = []
         self.connected = False
         self.msg_id = 1
-        
         self.current_hashrate = 0.0
 
     def run_setup(self):
         os.system('clear')
         self.cfg = DEFAULT_CONFIG.copy()
-        print("Starting Suite...")
+        print("Starting KXT v51...")
         time.sleep(1)
 
-    def log(self, t, m):
-        try: self.log_q.put((t, m))
+    def log(self, category, message):
+        # NEW LOG FORMAT: ₿ (timestamp) category: message
+        t = get_uptime_ms()
+        try: self.log_q.put((t, category, message))
         except: pass
 
     def get_id(self):
@@ -401,88 +440,105 @@ class MinerSuite:
             mx = max(c, g)
             start = self.cfg['THROTTLE_START']
             stop = self.cfg['THROTTLE_MAX']
-            
             if mx < start: self.throttle.value = 0.0
             elif mx < stop: self.throttle.value = (mx - start) / (stop - start) * 0.1
-            else: self.throttle.value = 0.5; self.log("WARN", f"Overheat {mx}C")
+            else: self.throttle.value = 0.5; self.log("system", f"Overheat {mx}C")
             time.sleep(2)
 
     def net_thread(self):
         while not self.stop.is_set():
             s = None
             try:
-                self.log("NET", f"Dialing {self.cfg['POOL_URL']}...")
+                self.log("stratum_api", f"Dialing {self.cfg['POOL_URL']}...")
                 s = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                
                 self.connected = True
-                self.log("NET", "Connected! Handshaking...")
+                self.log("stratum_api", "Connected")
                 
-                self.local_stats['submitted'] += 1
-                
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v51-BlockData"]}) + "\n").encode())
+                # AUTHORIZE: Address only
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v51"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
 
                 buff = b""
-                
                 while not self.stop.is_set():
-                    # TX: Submit (v19 Format)
                     while not self.res_q.empty():
                         r = self.res_q.get()
-                        msg = json.dumps({
-                            "id": self.get_id(), "method": "mining.submit",
-                            "params": [self.cfg['WALLET'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
-                        }) + "\n"
-                        s.sendall(msg.encode())
                         
+                        # PARAMS: 6 FIELDS to match log
+                        # [Wallet, JobID, En2, nTime, Nonce, VersionBits(0)]
+                        params = [
+                            self.cfg['WALLET'],
+                            r['job_id'],
+                            r['extranonce2'], # 16 chars
+                            r['ntime'],
+                            r['nonce'],
+                            "00000000" # Generic Version Bits placeholder
+                        ]
+                        
+                        tx_msg = json.dumps({
+                            "id": self.get_id(), "method": "mining.submit",
+                            "params": params
+                        })
+                        
+                        s.sendall((tx_msg + "\n").encode())
                         self.local_stats['submitted'] += 1
-                        self.log("TX", f"Submitting Nonce: {r['nonce']}")
+                        
+                        # LOG: stratum_api: tx: {json}
+                        self.log("stratum_api", f"tx: {tx_msg}")
+                        
+                        # LOG: asic_result
+                        self.log("asic_result", f"Nonce difficulty {r['share_diff']:.2f} of {r['pool_diff']:.0f}")
 
-                    # RX: Listen
                     try:
                         s.settimeout(0.1)
                         d = s.recv(8192)
                         if not d: break
                         buff += d
-                        
                         while b'\n' in buff:
                             line, buff = buff.split(b'\n', 1)
                             if not line: continue
                             try:
-                                msg = json.loads(line.decode())
+                                msg_str = line.decode()
+                                msg = json.loads(msg_str)
                                 mid = msg.get('id')
                                 result = msg.get('result')
                                 method = msg.get('method')
+                                
+                                # LOG ALL RX: stratum_task: rx: {json}
+                                # Filter out huge notify messages to keep log clean? 
+                                # User log showed notify in rx, so we include it.
+                                # But let's truncate mining.notify params for screen space if needed
+                                self.log("stratum_task", f"rx: {msg_str}")
                                 
                                 if result and isinstance(result, list) and "mining.notify" in str(result):
                                      self.data['en1'] = result[1]
                                 elif mid and mid > 3:
                                     if result: 
                                         self.shares['acc'] += 1
-                                        self.log("RX", "Block/Share ACCEPTED!")
+                                        self.log("stratum_task", "message result accepted")
                                     else: 
                                         self.shares['rej'] += 1
-                                        self.log("RX", "Share REJECTED") 
+                                        # Error handled by displaying rx log
 
                                 if method == 'mining.notify':
                                     p = msg['params']
-                                    self.data['job'] = str(p[0])
+                                    jid = str(p[0])
+                                    self.data['job'] = jid
+                                    self.global_job_id.value = jid.encode('utf-8')
+                                    
                                     en1 = self.data['en1']
                                     if en1:
-                                        # FIX: FORCE SWITCH ON NEW JOB (Prevent Stuck/Stale)
-                                        while not self.job_q.empty():
-                                            try: self.job_q.get_nowait()
-                                            except: pass
-                                            
+                                        if p[8]: 
+                                            while not self.job_q.empty(): 
+                                                try: self.job_q.get_nowait()
+                                                except: pass
                                         j = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1)
                                         for _ in range(mp.cpu_count() * 2): self.job_q.put(j)
-                                        self.log("RX", f"Block Data: {p[0]}")
                                 
                                 elif method == 'mining.set_difficulty':
                                     self.diff.value = msg['params'][0]
                                     self.data['diff'] = msg['params'][0]
-                                    self.log("RX", f"Difficulty: {msg['params'][0]}")
 
                             except: continue
                     except socket.timeout: pass
@@ -502,14 +558,15 @@ class MinerSuite:
         curses.init_pair(3, curses.COLOR_RED, -1)
         curses.init_pair(4, curses.COLOR_CYAN, -1)
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
-        
         stdscr.nodelay(True)
         
         while not self.stop.is_set():
             try:
                 while True:
                     r = self.log_q.get_nowait()
-                    self.logs.append((get_cst_time(), r[0], r[1]))
+                    # r = (timestamp, category, message)
+                    fmt_msg = f"₿ ({r[0]}) {r[1]}: {r[2]}"
+                    self.logs.append(fmt_msg)
                     if len(self.logs) > 100: self.logs.pop(0)
             except: pass
             
@@ -523,14 +580,13 @@ class MinerSuite:
                 self.last_stats[i] = self.stats[i]
             
             self.current_hashrate = (self.current_hashrate * 0.7) + (current_total * 0.3 * 10)
-            
             hr_disp = self.current_hashrate
             fhr = f"{hr_disp/1e6:.2f} MH/s" if hr_disp > 1e6 else f"{hr_disp/1000:.2f} kH/s"
             
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
             
-            stdscr.addstr(0, 0, f" KXT MINER v51 - BLOCK DATA ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f" KXT MINER v51 - LV06 LOGS ".center(w), curses.color_pair(5)|curses.A_BOLD)
             
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
@@ -548,8 +604,9 @@ class MinerSuite:
             stdscr.addstr(2, x3, "=== NETWORK ===", curses.color_pair(4))
             stdscr.addstr(3, x3, f"Pool: Braiins")
             stdscr.addstr(4, x3, f"Diff: {int(self.data.get('diff', 0))}")
-            # RENAME UI LABEL TO 'Block Data'
-            stdscr.addstr(5, x3, f"Block Data: {self.data.get('job', '?')[:8]}")
+            curr_job = self.global_job_id.value.decode('utf-8')
+            if not curr_job: curr_job = "?"
+            stdscr.addstr(5, x3, f"Job: {curr_job[:8]}")
             
             x4 = col_w*3 + 2
             stdscr.addstr(2, x4, "=== SHARES ===", curses.color_pair(4))
@@ -566,10 +623,11 @@ class MinerSuite:
             if log_h > 0:
                 for i, l in enumerate(self.logs[-log_h:]):
                     c = curses.color_pair(1)
-                    if "ERR" in l[1] or "REJECTED" in l[1]: c = curses.color_pair(3)
-                    elif "WARN" in l[1]: c = curses.color_pair(2)
-                    elif "TX" in l[1]: c = curses.color_pair(5)
-                    try: stdscr.addstr(13+i, 2, f"{l[0]} [{l[1]}] {l[2]}"[:w-4], c)
+                    # Color coding based on content
+                    if "rx" in l.lower() and "true" in l.lower(): c = curses.color_pair(1) # Green for good RX
+                    elif "false" in l.lower() or "error" in l.lower(): c = curses.color_pair(3) # Red for bad
+                    elif "tx" in l.lower(): c = curses.color_pair(5) # Blue/White for TX
+                    try: stdscr.addstr(13+i, 2, l[:w-4], c)
                     except: pass
             
             stdscr.refresh()
@@ -584,7 +642,7 @@ class MinerSuite:
         
         procs = []
         for i in range(mp.cpu_count()):
-            p = mp.Process(target=cpu_worker, args=(i, self.job_q, self.res_q, self.stop, self.stats, self.diff, self.throttle, self.log_q), daemon=True)
+            p = mp.Process(target=cpu_worker, args=(i, self.job_q, self.res_q, self.stop, self.stats, self.diff, self.throttle, self.log_q, self.global_job_id), daemon=True)
             p.start(); procs.append(p)
         
         gp = mp.Process(target=gpu_worker, args=(self.stop, self.stats, self.throttle, self.log_q), daemon=True)
