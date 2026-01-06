@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE v52 - LV06 LOG MATCH
-====================================
-1. Exact LV06 Log Format (asic_result, stratum_api, etc.)
-2. Proxy generates 'asic_result' logs for connected ASICs
-3. Local miner logs 'asic_result' for activity
-4. Wallet address only (no worker name)
+KXT MINER SUITE v52 - UNIQUE MINING FIX
+=======================================
+1. Mining Uniqueness: En2 = WorkerID + Random (Guaranteed separation)
+2. Log Order: asic_result -> tx -> rx
+3. Base: v51 (Block Data, LV06 Style)
 """
 
 import sys
@@ -31,11 +30,17 @@ import urllib.request
 import random
 from datetime import datetime, timedelta, timezone
 
+# ================= AUTO-DEPENDENCY =================
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
 # ================= CONFIGURATION =================
 DEFAULT_CONFIG = {
     "POOL_URL": "solo.stratum.braiins.com",
     "POOL_PORT": 3333,
-    # Wallet only, no worker name
     "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
     "PASSWORD": "x",
     "PROXY_PORT": 60060,
@@ -64,6 +69,11 @@ L_EXIT:
 """
 
 # ================= UTILS =================
+START_TIME_MS = int(time.time() * 1000)
+
+def get_uptime_ms():
+    return int(time.time() * 1000) - START_TIME_MS
+
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -72,6 +82,11 @@ def get_local_ip():
         s.close()
         return ip
     except: return "127.0.0.1"
+
+def get_cst_time():
+    utc = datetime.now(timezone.utc)
+    cst = utc - timedelta(hours=6)
+    return cst.strftime("%H:%M:%S")
 
 def get_temps():
     c, g = 0.0, 0.0
@@ -89,23 +104,13 @@ def get_temps():
     return c, g
 
 def get_hw_stats():
-    try:
-        import psutil
-        c = psutil.cpu_percent()
-        r = psutil.virtual_memory().percent
-        return c, r
-    except: return 0.0, 0.0
+    c = psutil.cpu_percent() if HAS_PSUTIL else 0.0
+    r = psutil.virtual_memory().percent if HAS_PSUTIL else 0.0
+    return c, r
 
 def fix_env():
     try: os.environ['PATH'] += ':/usr/local/cuda/bin'
     except: pass
-
-# ================= LV06 LOGGING =================
-def get_lv06_ts():
-    # Format: ₿ (7682953)
-    # Using simple monotonic time in ms relative to start for effect
-    ms = int(time.time() * 1000) % 10000000
-    return f"₿ ({ms})"
 
 # ================= POOL STATS =================
 class PoolStats(threading.Thread):
@@ -114,18 +119,25 @@ class PoolStats(threading.Thread):
         self.url = url
         self.data = data_store
         self.daemon = True
+        
     def run(self):
         while True:
+            try:
+                req = urllib.request.Request(self.url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    _ = response.read()
+                    self.data['api_status'] = "Online"
+            except:
+                self.data['api_status'] = "Offline"
             time.sleep(60)
 
-# ================= PROXY (LV06 FORMATTER) =================
+# ================= PROXY =================
 class ProxyServer(threading.Thread):
-    def __init__(self, cfg, log_q, proxy_stats, diff_val):
+    def __init__(self, cfg, log_q, proxy_stats):
         super().__init__()
         self.cfg = cfg
         self.log_q = log_q
         self.stats = proxy_stats
-        self.diff = diff_val
         self.daemon = True
         
     def run(self):
@@ -134,18 +146,24 @@ class ProxyServer(threading.Thread):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("0.0.0.0", self.cfg['PROXY_PORT']))
             sock.listen(10)
-            self.log_q.put((get_lv06_ts(), "system", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
+            self.log_q.put(("INFO", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
             while True:
                 c, a = sock.accept()
-                threading.Thread(target=self.handle, args=(c,), daemon=True).start()
+                try: ip_id = a[0].split('.')[-1]
+                except: ip_id = "00"
+                self.log_q.put(("NET", f"Proxy: ASIC_{ip_id} Connected"))
+                self.stats['submitted'] += 1
+                threading.Thread(target=self.handle, args=(c, ip_id), daemon=True).start()
         except Exception as e:
-            self.log_q.put((get_lv06_ts(), "error", f"Proxy Error: {e}"))
+            self.log_q.put(("ERR", f"Proxy Error: {e}"))
 
-    def handle(self, client):
+    def handle(self, client, ip_id):
         pool = None
         try:
             pool = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
-            
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            pool.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
             def fwd_up():
                 buff = b""
                 while True:
@@ -157,18 +175,14 @@ class ProxyServer(threading.Thread):
                             line, buff = buff.split(b'\n', 1)
                             try:
                                 obj = json.loads(line)
-                                if obj.get('method') == 'mining.submit':
+                                if obj.get('method') == 'mining.authorize':
+                                    user = obj['params'][0]
+                                    if 'asic' not in user:
+                                        base_wallet = self.cfg['WALLET'].split('.')[0]
+                                        obj['params'][0] = f"{base_wallet}.asic_{ip_id}"
+                                        line = json.dumps(obj).encode()
+                                elif obj.get('method') == 'mining.submit':
                                     self.stats['submitted'] += 1
-                                    
-                                    # LV06: asic_result log
-                                    # We simulate a "found" difficulty slightly above target for accepted shares
-                                    # Or realistic random for display
-                                    curr_diff = self.diff.value
-                                    found_diff = curr_diff * (1.0 + (random.random() * 0.5)) 
-                                    self.log_q.put((get_lv06_ts(), "asic_result", f"Nonce difficulty {found_diff:.2f} of {int(curr_diff)}"))
-                                    
-                                    # LV06: stratum_api log
-                                    self.log_q.put((get_lv06_ts(), "stratum_api", f"tx: {line.decode()}"))
                             except: pass
                             pool.sendall(line + b'\n')
                     except: break
@@ -178,21 +192,11 @@ class ProxyServer(threading.Thread):
                     try:
                         data = pool.recv(4096)
                         if not data: break
-                        
-                        # LV06: stratum_task log
-                        # It logs the RAW rx json, then "message result accepted"
-                        try:
-                            s_data = data.decode().strip()
-                            for part in s_data.split('\n'):
-                                if not part: continue
-                                self.log_q.put((get_lv06_ts(), "stratum_task", f"rx: {part}"))
-                                if '"result":true' in part or '"result": true' in part:
-                                    self.stats['accepted'] += 1
-                                    self.log_q.put((get_lv06_ts(), "stratum_task", "message result accepted"))
-                                elif '"result":false' in part:
-                                    self.stats['rejected'] += 1
-                        except: pass
-                            
+                        if b'"result":true' in data or b'"result": true' in data:
+                             self.stats['accepted'] += 1
+                             self.log_q.put(("RX", f"ASIC_{ip_id} Share ACCEPTED!"))
+                        elif b'"result":false' in data:
+                             self.stats['rejected'] += 1
                         client.sendall(data)
                     except: break
 
@@ -207,6 +211,9 @@ class ProxyServer(threading.Thread):
 
 # ================= CPU MINER =================
 def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_id):
+    # Ensure RNG is seeded per process
+    random.seed() 
+    
     active_jid = None
     block_data = None
     nonce = (id * 100_000_000) + random.randint(0, 5000)
@@ -214,35 +221,42 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
     while not stop.is_set():
         if throttle.value > 0.0: time.sleep(throttle.value)
 
+        # 1. New Job Check
         try:
             if not job_q.empty():
                 try:
-                    new_block = job_q.get_nowait()
-                    if not active_jid or active_jid != new_block[0] or new_block[8]:
-                        active_jid = new_block[0]
-                        block_data = new_block
+                    new_block_data = job_q.get_nowait()
+                    if not active_jid or active_jid != new_block_data[0] or new_block_data[8]:
+                        active_jid = new_block_data[0]
+                        block_data = new_block_data
                         nonce = (id * 100_000_000) + random.randint(0, 5000)
                 except queue.Empty: pass
         except: pass
             
+        # 2. Global Lock
         try:
             curr_g_id = global_job_id.value.decode('utf-8')
             if active_jid and curr_g_id and active_jid != curr_g_id:
-                active_jid = None; continue
+                active_jid = None 
+                continue
         except: pass
 
         if not active_jid: 
             time.sleep(0.05); continue
             
+        # 3. Mining Loop
         try:
             jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = block_data
             
-            # Target
             df = diff.value
             if df <= 0: df = 1.0
-            pool_target = (0xffff0000 * 2**(256-64) // int(df))
+            target_val = (0xffff0000 * 2**(256-64)) // int(df)
             
-            en2_bin = os.urandom(4)
+            # UNIQUE MINING FIX: Prefix En2 with WorkerID (4 bytes)
+            # This guarantees distinct search spaces for every worker
+            en2_prefix = struct.pack('>I', id) # Worker ID as bytes
+            en2_suffix = os.urandom(4)         # Random bytes
+            en2_bin = en2_prefix + en2_suffix
             en2 = binascii.hexlify(en2_bin).decode()
             
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
@@ -252,7 +266,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
             for branch in mb:
                 branch_bin = binascii.unhexlify(branch)
                 merkle = hashlib.sha256(hashlib.sha256(merkle + branch_bin).digest()).digest()
-            
+                
             header = (
                 binascii.unhexlify(ver)[::-1] +
                 binascii.unhexlify(ph)[::-1] +
@@ -261,31 +275,28 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
                 binascii.unhexlify(nbits)[::-1]
             )
             
-            for n in range(nonce, nonce + 500):
+            # Batch
+            for n in range(nonce, nonce + 2000):
                 nonce_bin = struct.pack('<I', n)
                 block_hash_bin = hashlib.sha256(hashlib.sha256(header + nonce_bin).digest()).digest()
                 hash_int = int.from_bytes(block_hash_bin[::-1], 'big')
                 
-                # Calculate Hash Difficulty for LV06 Log
-                # Diff = (Target_1) / Hash_Int
-                try:
-                    hash_diff = (0xffff0000 * 2**(256-64)) / hash_int
-                except: hash_diff = 0
-                
-                # LOG "asic_result" occasionally even if rejected (Simulate Activity)
-                # Show anything > 10% of target difficulty
-                if hash_diff > (df * 0.1):
-                     log_q.put((get_lv06_ts(), "asic_result", f"Nonce difficulty {hash_diff:.2f} of {int(df)}"))
-                
-                if hash_int <= pool_target:
+                if hash_int <= target_val:
+                    try: share_diff = (0xffff0000 * 2**(256-64)) / hash_int
+                    except: share_diff = df
+
                     res_q.put({
-                        "job_id": jid, "extranonce2": en2, 
-                        "ntime": ntime, "nonce": binascii.hexlify(nonce_bin).decode()
+                        "job_id": jid, 
+                        "extranonce2": en2, 
+                        "ntime": ntime, 
+                        "nonce": binascii.hexlify(nonce_bin).decode(),
+                        "share_diff": share_diff,
+                        "pool_diff": df
                     })
                     break
 
-            stats[id] += 500
-            nonce += 500
+            stats[id] += 2000
+            nonce += 2000
             
         except Exception: time.sleep(0.1)
 
@@ -297,14 +308,17 @@ def gpu_worker(stop, stats, throttle, log_q):
         import numpy as np
         mod = cuda.module_from_buffer(PTX_CODE.encode())
         func = mod.get_function("heavy_load")
-        log_q.put((get_lv06_ts(), "GPU", "PTX Loaded"))
+        log_q.put(("GPU", "PTX Loaded"))
     except:
+        log_q.put(("WARN", "GPU Init Failed"))
         return
+
     while not stop.is_set():
         if throttle.value > 0.0: time.sleep(throttle.value)
         try:
             out = np.zeros(1, dtype=np.int32)
-            func(cuda.Out(out), np.int32(int(time.time())), block=(256,1,1), grid=(65535,1))
+            seed = np.int32(int(time.time()))
+            func(cuda.Out(out), seed, block=(256,1,1), grid=(65535,1))
             cuda.Context.synchronize()
             stats[-1] += 120_000_000
             time.sleep(0.001)
@@ -313,7 +327,7 @@ def gpu_worker(stop, stats, throttle, log_q):
 # ================= BENCHMARK =================
 def run_benchmark_sequence():
     os.system('clear')
-    print("=== KXT v52 SYSTEM AUDIT ===")
+    print("=== KXT v52 UNIQUE MINING ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
     stop = mp.Event()
     procs = []
@@ -332,6 +346,7 @@ def run_benchmark_sequence():
             sys.stdout.flush()
             time.sleep(1)
     except KeyboardInterrupt: pass
+    
     stop.set()
     for p in procs: p.terminate()
     print("\nBenchmark Complete. Starting Miner...")
@@ -339,7 +354,8 @@ def run_benchmark_sequence():
 
 def cpu_bench_dummy(stop):
     import random
-    while not stop.is_set(): _ = [random.random() for _ in range(1000)]
+    while not stop.is_set():
+        _ = [random.random() * random.random() for _ in range(1000)]
 
 def gpu_bench_dummy(stop):
     try:
@@ -358,6 +374,7 @@ def gpu_bench_dummy(stop):
 class MinerSuite:
     def __init__(self):
         run_benchmark_sequence()
+        
         self.run_setup()
         self.man = mp.Manager()
         self.job_q = self.man.Queue()
@@ -369,9 +386,10 @@ class MinerSuite:
         self.global_job_id.value = b""
         
         self.data = self.man.dict()
-        self.data['job'] = "?"
+        self.data['job'] = "Connecting..."
         self.data['en1'] = ""
         self.data['diff'] = 1024.0
+        self.data['api_status'] = "Init"
         
         self.proxy_stats = self.man.dict()
         self.proxy_stats['submitted'] = 0
@@ -393,11 +411,12 @@ class MinerSuite:
     def run_setup(self):
         os.system('clear')
         self.cfg = DEFAULT_CONFIG.copy()
-        print("Starting Suite...")
+        print("Starting KXT v52...")
         time.sleep(1)
 
-    def log(self, ts, cat, msg):
-        try: self.log_q.put((ts, cat, msg))
+    def log(self, category, message):
+        t = get_uptime_ms()
+        try: self.log_q.put((t, category, message))
         except: pass
 
     def get_id(self):
@@ -412,32 +431,44 @@ class MinerSuite:
             stop = self.cfg['THROTTLE_MAX']
             if mx < start: self.throttle.value = 0.0
             elif mx < stop: self.throttle.value = (mx - start) / (stop - start) * 0.1
-            else: self.throttle.value = 0.5
+            else: self.throttle.value = 0.5; self.log("system", f"Overheat {mx}C")
             time.sleep(2)
 
     def net_thread(self):
         while not self.stop.is_set():
             s = None
             try:
-                self.log(get_lv06_ts(), "system", f"Dialing {self.cfg['POOL_URL']}...")
+                self.log("stratum_api", f"Dialing {self.cfg['POOL_URL']}...")
                 s = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 self.connected = True
+                self.log("stratum_api", "Connected")
                 
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v52"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.suggest_difficulty", "params": [1.0]}) + "\n").encode())
 
                 buff = b""
                 while not self.stop.is_set():
                     while not self.res_q.empty():
                         r = self.res_q.get()
-                        msg = json.dumps({
+                        
+                        params = [
+                            self.cfg['WALLET'], r['job_id'], r['extranonce2'], 
+                            r['ntime'], r['nonce'], "00000000"
+                        ]
+                        
+                        tx_msg = json.dumps({
                             "id": self.get_id(), "method": "mining.submit",
-                            "params": [self.cfg['WALLET'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce']]
+                            "params": params
                         })
-                        s.sendall((msg + "\n").encode())
+                        
+                        s.sendall((tx_msg + "\n").encode())
                         self.local_stats['submitted'] += 1
-                        self.log(get_lv06_ts(), "stratum_api", f"tx: {msg}")
+                        
+                        # LOG ORDER FIXED: asic_result FIRST, then tx
+                        self.log("asic_result", f"Nonce difficulty {r['share_diff']:.2f} of {r['pool_diff']:.0f}")
+                        self.log("stratum_api", f"tx: {tx_msg}")
 
                     try:
                         s.settimeout(0.1)
@@ -448,20 +479,20 @@ class MinerSuite:
                             line, buff = buff.split(b'\n', 1)
                             if not line: continue
                             try:
-                                msg = json.loads(line.decode())
+                                msg_str = line.decode()
+                                msg = json.loads(msg_str)
                                 mid = msg.get('id')
                                 result = msg.get('result')
                                 method = msg.get('method')
                                 
-                                # LOG RX
-                                self.log(get_lv06_ts(), "stratum_task", f"rx: {line.decode()}")
+                                self.log("stratum_task", f"rx: {msg_str}")
                                 
                                 if result and isinstance(result, list) and "mining.notify" in str(result):
                                      self.data['en1'] = result[1]
                                 elif mid and mid > 3:
                                     if result: 
                                         self.shares['acc'] += 1
-                                        self.log(get_lv06_ts(), "stratum_task", "message result accepted")
+                                        self.log("stratum_task", "message result accepted")
                                     else: 
                                         self.shares['rej'] += 1
 
@@ -470,12 +501,13 @@ class MinerSuite:
                                     jid = str(p[0])
                                     self.data['job'] = jid
                                     self.global_job_id.value = jid.encode('utf-8')
+                                    
                                     en1 = self.data['en1']
                                     if en1:
-                                        # Force Flush
-                                        while not self.job_q.empty(): 
-                                            try: self.job_q.get_nowait()
-                                            except: pass
+                                        if p[8]: 
+                                            while not self.job_q.empty(): 
+                                                try: self.job_q.get_nowait()
+                                                except: pass
                                         j = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1)
                                         for _ in range(mp.cpu_count() * 2): self.job_q.put(j)
                                 
@@ -487,7 +519,7 @@ class MinerSuite:
                     except socket.timeout: pass
                     except OSError: break
             except Exception as e:
-                self.log(get_lv06_ts(), "error", f"Net: {e}")
+                self.log("ERR", f"Net: {e}")
             finally:
                 self.connected = False
                 if s: s.close()
@@ -507,7 +539,8 @@ class MinerSuite:
             try:
                 while True:
                     r = self.log_q.get_nowait()
-                    self.logs.append(r)
+                    fmt_msg = f"₿ ({r[0]}) {r[1]}: {r[2]}"
+                    self.logs.append(fmt_msg)
                     if len(self.logs) > 100: self.logs.pop(0)
             except: pass
             
@@ -527,7 +560,7 @@ class MinerSuite:
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
             
-            stdscr.addstr(0, 0, f" KXT MINER v52 - LV06 LOGS ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f" KXT MINER v52 - UNIQUE FIX ".center(w), curses.color_pair(5)|curses.A_BOLD)
             
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
@@ -546,6 +579,7 @@ class MinerSuite:
             stdscr.addstr(3, x3, f"Pool: Braiins")
             stdscr.addstr(4, x3, f"Diff: {int(self.data.get('diff', 0))}")
             curr_job = self.global_job_id.value.decode('utf-8')
+            if not curr_job: curr_job = "?"
             stdscr.addstr(5, x3, f"Block Data: {curr_job[:8]}")
             
             x4 = col_w*3 + 2
@@ -562,16 +596,11 @@ class MinerSuite:
             log_h = h - 13
             if log_h > 0:
                 for i, l in enumerate(self.logs[-log_h:]):
-                    # Format: ₿ (TS) Category: Message
-                    ts, cat, msg = l
                     c = curses.color_pair(1)
-                    if "error" in cat or "rejected" in msg.lower(): c = curses.color_pair(3)
-                    elif "system" in cat: c = curses.color_pair(4)
-                    elif "stratum_api" in cat: c = curses.color_pair(5) # TX Blue
-                    elif "asic_result" in cat: c = curses.color_pair(2) # Result Yellow
-                    
-                    line = f"{ts} {cat}: {msg}"
-                    try: stdscr.addstr(13+i, 2, line[:w-4], c)
+                    if "rx" in l.lower() and "true" in l.lower(): c = curses.color_pair(1)
+                    elif "false" in l.lower() or "error" in l.lower(): c = curses.color_pair(3)
+                    elif "tx" in l.lower(): c = curses.color_pair(5)
+                    try: stdscr.addstr(13+i, 2, l[:w-4], c)
                     except: pass
             
             stdscr.refresh()
@@ -579,7 +608,7 @@ class MinerSuite:
             time.sleep(0.1)
 
     def start(self):
-        ProxyServer(self.cfg, self.log_q, self.proxy_stats, self.diff).start()
+        ProxyServer(self.cfg, self.log_q, self.proxy_stats).start()
         PoolStats(self.cfg['STATS_URL'], self.data).start()
         threading.Thread(target=self.net_thread, daemon=True).start()
         threading.Thread(target=self.thermal_thread, daemon=True).start()
