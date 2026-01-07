@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE v58 - SEAMLESS & ROBUST
-=======================================
-1. Proxy Error 98 Fix: Explicit Socket Kill + Retry Loop
-2. Seamless Update: Saves config -> Restarts -> Skips Menu
-3. Pre-Screen: Includes manual update check before input
-4. Active Miner List: Granular hashrate for every device
-5. Braiins Stats: Dual Scraper (API + HTML)
+kx2000 MINER SUITE v59 - TUPLE FIX
+==================================
+1. Fixed Crash: 'tuple' object has no attribute 'lower' in draw_ui
+2. Seamless Update: Skips menu on restart
+3. Proxy Killer: Hard kills port 60060 before binding
+4. Braiins Stats: Dual Scraper
 """
 
 import sys
@@ -15,6 +14,7 @@ import os
 import subprocess
 import importlib.util
 import time
+import signal
 
 # ================= DEPENDENCY CHECK =================
 def install_deps():
@@ -124,6 +124,20 @@ def fix_env():
     try: os.environ['PATH'] += ':/usr/local/cuda/bin'
     except: pass
 
+def kill_port(port):
+    """Force kill any process using the proxy port to prevent Error 98"""
+    try:
+        # Find PID using lsof
+        cmd = f"lsof -t -i:{port}"
+        try:
+            pids = subprocess.check_output(cmd, shell=True).decode().strip().split('\n')
+            for pid in pids:
+                if pid:
+                    os.kill(int(pid), signal.SIGKILL)
+        except: pass
+        time.sleep(1)
+    except: pass
+
 # ================= AUTO UPDATER (SEAMLESS) =================
 class AutoUpdate(threading.Thread):
     def __init__(self, url, log_q, stop_event, restart_flag, config_saver):
@@ -132,7 +146,7 @@ class AutoUpdate(threading.Thread):
         self.log_q = log_q
         self.stop_event = stop_event
         self.restart_flag = restart_flag
-        self.config_saver = config_saver # Function to save config before death
+        self.config_saver = config_saver
         self.daemon = True
 
     def run(self):
@@ -143,25 +157,25 @@ class AutoUpdate(threading.Thread):
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
                 
-                req = urllib.request.Request(self.url, headers={'User-Agent': 'KXT-Miner'})
+                req = urllib.request.Request(self.url, headers={'User-Agent': 'kx2000-Miner'})
                 with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
                     content = response.read().decode('utf-8')
                     if len(content) > 500 and "import" in content:
                         with open(sys.argv[0], 'r') as f:
                             current = f.read()
                         
-                        # Compare stripping whitespace to avoid false positives
+                        # Compare content
                         if content.strip() != current.strip():
-                            self.log_q.put((get_lv06_ts(), "system", "UPDATE FOUND. Initiating Seamless Restart..."))
+                            self.log_q.put((get_lv06_ts(), "system", "UPDATE FOUND. Seamless Restart..."))
                             
-                            # 1. Write New File
+                            # 1. Update File
                             with open(sys.argv[0], 'w') as f:
                                 f.write(content)
                             
-                            # 2. Save Config for next run
+                            # 2. Save Config
                             self.config_saver()
                             
-                            # 3. Trigger Main Loop Exit
+                            # 3. Trigger Restart
                             self.restart_flag.set()
                             self.stop_event.set()
                             return
@@ -233,7 +247,9 @@ class ProxyServer(threading.Thread):
         self.running = True
         
     def run(self):
-        # ERROR 98 RETRY LOOP
+        # ERROR 98 FIX: Kill old port first
+        kill_port(self.cfg['PROXY_PORT'])
+        
         retries = 0
         while self.running:
             try:
@@ -247,6 +263,7 @@ class ProxyServer(threading.Thread):
                 if "Address already in use" in str(e):
                     retries += 1
                     self.log_q.put((get_lv06_ts(), "warn", f"Port {self.cfg['PROXY_PORT']} busy, retrying..."))
+                    kill_port(self.cfg['PROXY_PORT']) # Aggressive kill
                     time.sleep(2)
                     if retries > 10: 
                         self.log_q.put((get_lv06_ts(), "error", "Proxy failed to bind."))
@@ -433,8 +450,10 @@ def gpu_worker(stop, stats, throttle, log_q):
         except: time.sleep(1)
 
 def run_benchmark_sequence():
+    if "-r" in sys.argv: return # Skip on seamless restart
+    
     os.system('clear')
-    print("=== KXT v58 BENCHMARK ===")
+    print("=== kx2000 v59 BENCHMARK ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
     stop = mp.Event()
     procs = []
@@ -480,14 +499,14 @@ def pre_screen(log_q):
     # 1. CHECK FOR SEAMLESS RESTART FLAG
     if "-r" in sys.argv:
         try:
-            if os.path.exists("kxt_restore.json"):
-                with open("kxt_restore.json", "r") as f:
+            if os.path.exists("kx_restore.json"):
+                with open("kx_restore.json", "r") as f:
                     cfg = json.load(f)
                 return cfg
         except: pass
 
     os.system('clear')
-    print("=== KXT MINER SUITE v58 - SETUP ===")
+    print("=== kx2000 MINER SUITE v59 - SETUP ===")
     
     # 2. MANUAL UPDATE CHECK (USER REQUESTED)
     print("\n[SYSTEM] Checking for updates from GitHub...")
@@ -496,7 +515,7 @@ def pre_screen(log_q):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         
-        req = urllib.request.Request(DEFAULT_CONFIG['UPDATE_URL'], headers={'User-Agent': 'KXT-Miner'})
+        req = urllib.request.Request(DEFAULT_CONFIG['UPDATE_URL'], headers={'User-Agent': 'kx2000-Miner'})
         with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
             remote_code = response.read().decode('utf-8')
             with open(sys.argv[0], 'r') as f:
@@ -514,7 +533,7 @@ def pre_screen(log_q):
         print(f"[SYSTEM] Update check skipped: {e}")
     time.sleep(1)
 
-    print("\nPress Enter to keep default\n")
+    print("Press Enter to keep default\n")
 
     cfg = DEFAULT_CONFIG.copy()
     print(f"Pool URL: {cfg['POOL_URL']}")
@@ -535,6 +554,11 @@ def pre_screen(log_q):
 
     print("\nConfiguration complete. Starting...")
     time.sleep(1)
+    
+    # Save config for seamless updates
+    with open("kx_restore.json", "w") as f:
+        json.dump(cfg, f)
+        
     return cfg
 
 # ================= MAIN SUITE =================
@@ -542,14 +566,12 @@ class MinerSuite:
     def __init__(self):
         self.log_q = queue.Queue()
         self.cfg = pre_screen(self.log_q)
-        
-        # Only bench if not a restart
-        if "-r" not in sys.argv:
-            run_benchmark_sequence()
-        
+        run_benchmark_sequence()
+        self.run_setup()
         self.man = mp.Manager()
         self.job_q = self.man.Queue()
         self.res_q = self.man.Queue()
+        # Use existing log_q wrapper
         self.stop = mp.Event()
         self.restart_flag = mp.Event()
         
@@ -560,6 +582,7 @@ class MinerSuite:
         self.data['job'] = "?"
         self.data['en1'] = ""
         self.data['diff'] = 1024.0
+        # Scraper fields
         self.data['hr_1m'] = "---"
         self.data['hr_5m'] = "---"
         self.data['hr_1h'] = "---"
@@ -580,6 +603,7 @@ class MinerSuite:
         self.diff = mp.Value('d', 1024.0)
         self.throttle = mp.Value('d', 0.0)
         self.shares = {"acc": 0, "rej": 0}
+        self.start_t = time.time()
         self.logs = []
         self.connected = False
         self.msg_id = 1
@@ -588,9 +612,8 @@ class MinerSuite:
         self.proxy_server = None
 
     def save_config(self):
-        # Called by AutoUpdate before death
         try:
-            with open("kxt_restore.json", "w") as f:
+            with open("kx_restore.json", "w") as f:
                 json.dump(self.cfg, f)
         except: pass
 
@@ -622,7 +645,7 @@ class MinerSuite:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 self.connected = True
                 
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v58"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["kx2000-v59"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
 
                 buff = b""
@@ -636,7 +659,9 @@ class MinerSuite:
                         msg = json.dumps({"id": self.get_id(), "method": "mining.submit", "params": params})
                         s.sendall((msg + "\n").encode())
                         self.local_stats['submitted'] += 1
+                        
                         self.active_miners['LOCAL'] = {'last': time.time(), 'diff': r['share_diff']}
+                        
                         self.log("asic_result", f"[LOCAL] Nonce difficulty {r['share_diff']:.2f} of {r['pool_diff']:.0f}")
                         self.log("stratum_api", f"tx: {msg}")
 
@@ -684,7 +709,8 @@ class MinerSuite:
                             except: continue
                     except socket.timeout: pass
                     except OSError: break
-            except Exception as e: self.log("error", f"Net: {e}")
+            except Exception as e:
+                self.log("error", f"Net: {e}")
             finally:
                 self.connected = False
                 if s: s.close()
@@ -724,7 +750,7 @@ class MinerSuite:
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
             
-            stdscr.addstr(0, 0, f" KXT MINER v58 - SEAMLESS ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f" kx2000 MINER v59 - TUPLE FIX ".center(w), curses.color_pair(5)|curses.A_BOLD)
             
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
@@ -739,17 +765,17 @@ class MinerSuite:
             stdscr.addstr(5, x2, f"{ts}", curses.color_pair(1 if ts=="OK" else 2))
 
             x3 = col_w*2 + 2
-            stdscr.addstr(2, x3, "=== POOL STATS ===", curses.color_pair(4))
-            stdscr.addstr(3, x3, f"1m: {self.data.get('hr_1m', '-')} | 5m: {self.data.get('hr_5m', '-')}")
-            stdscr.addstr(4, x3, f"1h: {self.data.get('hr_1h', '-')} | Wrk: {self.data.get('workers', '-')}")
-            stdscr.addstr(5, x3, f"Status: {self.data.get('api_status', 'Init')}", curses.color_pair(5))
+            stdscr.addstr(2, x3, "=== NETWORK ===", curses.color_pair(4))
+            stdscr.addstr(3, x3, f"Pool: Braiins")
+            stdscr.addstr(4, x3, f"Diff: {int(self.data.get('diff', 0))}")
+            curr_job = self.global_job_id.value.decode('utf-8')
+            stdscr.addstr(5, x3, f"Block Data: {curr_job[:8]}")
             
             x4 = col_w*3 + 2
-            stdscr.addstr(2, x4, "=== NETWORK ===", curses.color_pair(4))
-            curr_job = self.global_job_id.value.decode('utf-8')
-            stdscr.addstr(3, x4, f"Block Data: {curr_job[:8]}")
-            stdscr.addstr(4, x4, f"Diff: {int(self.data.get('diff', 0))}")
-            stdscr.addstr(5, x4, f"Link: {'ONLINE' if self.connected else 'DOWN'}", curses.color_pair(1 if self.connected else 3))
+            stdscr.addstr(2, x4, "=== BRAIINS STATS ===", curses.color_pair(4))
+            stdscr.addstr(3, x4, f"1m: {self.data.get('hr_1m', '-')} | 5m: {self.data.get('hr_5m', '-')}")
+            stdscr.addstr(4, x4, f"1h: {self.data.get('hr_1h', '-')} | Wrk: {self.data.get('workers', '-')}")
+            stdscr.addstr(5, x4, f"Status: {self.data.get('api_status', 'Init')}", curses.color_pair(5))
             
             stdscr.hline(7, 0, curses.ACS_HLINE, w)
             stdscr.addstr(8, 2, "ACTIVE PROXY MINERS (Last 60s):", curses.color_pair(2))
@@ -757,6 +783,7 @@ class MinerSuite:
             row = 9
             now = time.time()
             active = dict(self.active_miners)
+            
             if 'LOCAL' in active:
                 l = active['LOCAL']
                 if now - l['last'] < 60:
@@ -775,15 +802,21 @@ class MinerSuite:
             log_h = h - 13
             if log_h > 0:
                 for i, l in enumerate(self.logs[-log_h:]):
-                    ts, cat, msg = l
-                    c = curses.color_pair(1)
-                    if "error" in cat or "rejected" in msg.lower(): c = curses.color_pair(3)
-                    elif "system" in cat: c = curses.color_pair(4)
-                    elif "TX" in l.lower(): c = curses.color_pair(5)
-                    elif "asic_result" in cat: c = curses.color_pair(2)
+                    # === FIX: UNPACK TUPLE SAFELY ===
+                    if isinstance(l, tuple):
+                        ts, cat, msg = l
+                        line_str = f"{ts} {cat}: {msg}"
+                    else:
+                        line_str = str(l)
                     
-                    line = f"{ts} {cat}: {msg}"
-                    try: stdscr.addstr(13+i, 2, line[:w-4], c)
+                    c = curses.color_pair(1)
+                    lower_str = line_str.lower()
+                    if "error" in lower_str or "rejected" in lower_str: c = curses.color_pair(3)
+                    elif "system" in lower_str: c = curses.color_pair(4)
+                    elif "tx" in lower_str: c = curses.color_pair(5)
+                    elif "asic_result" in lower_str: c = curses.color_pair(2)
+                    
+                    try: stdscr.addstr(13+i, 2, line_str[:w-4], c)
                     except: pass
             
             stdscr.refresh()
@@ -817,9 +850,8 @@ class MinerSuite:
                 if p.is_alive(): p.terminate()
             
             if self.restart_flag.is_set():
-                print("\n\n>>> SEAMLESS UPDATE: RESTARTING MINER <<<\n")
-                # Wait for sockets to close
-                time.sleep(2) 
+                print("\n\nRESTARTING kx2000...\n")
+                time.sleep(2)
                 os.execv(sys.executable, [sys.executable, sys.argv[0], "-r"])
 
 if __name__ == "__main__":
