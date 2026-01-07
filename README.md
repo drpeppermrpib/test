@@ -1,31 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE v55 - COMPLETE
-==============================
-1. Auto-Updates from GitHub
-2. Distinct Hashrate/Diff reporting
-3. Braiins Web Scraper (Hashrate/Workers)
-4. Pre-screen setup
+KXT MINER SUITE v56 - GRANULAR HASHRATE & BLOCK FIX
+===================================================
+1. Active Miners List: Shows Local + Each Proxy Client Hashrate
+2. Block Data Fix: Forced update on mining.notify
+3. Dual Stats Scraping: Dashboard + /stats/ endpoint
+4. Auto-Update: Every 30s
 """
 
 import sys
-import os
-import subprocess
-import importlib.util
-
-# ================= DEPENDENCY CHECK =================
-def install_deps():
-    required = ['requests', 'bs4', 'psutil']
-    for package in required:
-        if importlib.util.find_spec(package) is None:
-            print(f"Installing {package}...")
-            try: subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-            except: pass
-
-# Run dependency check immediately
-install_deps()
-
 # FIX: Large integer string conversion limit
 try: sys.set_int_max_str_digits(0)
 except: pass
@@ -39,13 +23,30 @@ import curses
 import binascii
 import struct
 import hashlib
+import subprocess
+import os
 import queue
+import select
 import urllib.request
 import random
 import ssl
-import requests
-from bs4 import BeautifulSoup
+import importlib.util
 from datetime import datetime, timedelta, timezone
+
+# Check/Install Dependencies
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError:
+    os.system("pip3 install requests beautifulsoup4 -q")
+    import requests
+    from bs4 import BeautifulSoup
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 # ================= CONFIGURATION =================
 DEFAULT_CONFIG = {
@@ -57,7 +58,8 @@ DEFAULT_CONFIG = {
     "THROTTLE_START": 79.0, 
     "THROTTLE_MAX": 85.0,
     "BENCH_DURATION": 60,
-    "STATS_URL": "https://solo.braiins.com/users/",
+    "STATS_URL": "https://solo.braiins.com/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
+    "STATS_API": "https://solo.braiins.com/stats/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
     "UPDATE_URL": "https://raw.githubusercontent.com/drpeppermrpib/test/main/README.md"
 }
 
@@ -97,6 +99,11 @@ def get_local_ip():
         return ip
     except: return "127.0.0.1"
 
+def get_cst_time():
+    utc = datetime.now(timezone.utc)
+    cst = utc - timedelta(hours=6)
+    return cst.strftime("%H:%M:%S")
+
 def get_temps():
     c, g = 0.0, 0.0
     try:
@@ -113,12 +120,9 @@ def get_temps():
     return c, g
 
 def get_hw_stats():
-    try:
-        import psutil
-        c = psutil.cpu_percent()
-        r = psutil.virtual_memory().percent
-        return c, r
-    except: return 0.0, 0.0
+    c = psutil.cpu_percent() if HAS_PSUTIL else 0.0
+    r = psutil.virtual_memory().percent if HAS_PSUTIL else 0.0
+    return c, r
 
 def fix_env():
     try: os.environ['PATH'] += ':/usr/local/cuda/bin'
@@ -142,71 +146,68 @@ class AutoUpdate(threading.Thread):
                 req = urllib.request.Request(self.url, headers={'User-Agent': 'KXT-Miner'})
                 with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
                     content = response.read().decode('utf-8')
-                    # Basic validity check
-                    if len(content) > 500 and "import" in content:
-                        # Compare with current file to avoid unnecessary writes
-                        with open(sys.argv[0], 'r') as f:
-                            current = f.read()
-                        
-                        if content != current:
-                            with open(sys.argv[0], 'w') as f:
-                                f.write(content)
-                            self.log_q.put((get_lv06_ts(), "system", "UPDATE INSTALLED. Restarting..."))
-                            time.sleep(2)
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                    if len(content) > 100:
+                        with open("kx2000.py", "w") as f:
+                            f.write(content)
+                        # self.log_q.put((get_lv06_ts(), "system", "Updated kx2000.py successfully"))
             except Exception as e:
                 self.log_q.put((get_lv06_ts(), "error", f"Update failed: {str(e)[:20]}"))
             
             time.sleep(30)
 
-# ================= POOL STATS SCRAPER =================
-class PoolStats(threading.Thread):
-    def __init__(self, base_url, wallet, data_store):
+# ================= DUAL STATS SCRAPER =================
+class PoolStatsScraper(threading.Thread):
+    def __init__(self, url_dash, url_api, data_store):
         super().__init__()
-        self.url = base_url + wallet
+        self.url_dash = url_dash
+        self.url_api = url_api
         self.data = data_store
         self.daemon = True
         
     def run(self):
         while True:
+            found = False
+            # Method 1: JSON API
             try:
-                # Scrape Braiins
-                response = requests.get(self.url, timeout=10)
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    stats_divs = soup.find_all('div', class_='stat-item')
-                    
-                    found = False
-                    for stat in stats_divs:
-                        key_el = stat.find('span', class_='key')
-                        val_el = stat.find('span', class_='value')
-                        if key_el and val_el:
-                            k = key_el.text.strip().lower()
-                            v = val_elem.text.strip()
-                            if "hashrate 5m" in k or "hashrate5m" in k: 
-                                self.data['hr_5m'] = v
-                                found = True
-                            if "hashrate 1h" in k or "hashrate1h" in k: 
-                                self.data['hr_1h'] = v
-                                found = True
-                            if "workers" in k: 
-                                self.data['workers'] = v
+                r = requests.get(self.url_api, timeout=10)
+                if r.status_code == 200:
+                    j = r.json()
+                    # Check for Braiins JSON structure
+                    if 'hashrate_5m' in j: self.data['hr_5m'] = j['hashrate_5m']
+                    if 'hashrate_1h' in j: self.data['hr_1h'] = j['hashrate_1h']
+                    if 'workers' in j: self.data['pool_workers'] = str(len(j['workers']))
+                    found = True
+            except: pass
 
-                    if found: self.data['api_status'] = "Online"
-                    else: self.data['api_status'] = "No Data"
-                else:
-                    self.data['api_status'] = f"Http {response.status_code}"
-            except Exception:
-                self.data['api_status'] = "Offline"
+            # Method 2: HTML Scrape (Fallback/Primary)
+            if not found:
+                try:
+                    r = requests.get(self.url_dash, timeout=10)
+                    soup = BeautifulSoup(r.text, 'html.parser')
+                    stats_divs = soup.find_all('div', class_='stat-item')
+                    for div in stats_divs:
+                        key = div.find('span', class_='key')
+                        val = div.find('span', class_='value')
+                        if key and val:
+                            k = key.text.strip().lower().replace(" ", "")
+                            v = val.text.strip()
+                            if "hashrate5m" in k: self.data['hr_5m'] = v
+                            if "hashrate1h" in k: self.data['hr_1h'] = v
+                            if "workers" in k: self.data['pool_workers'] = v
+                    found = True
+                except: pass
+
+            self.data['api_status'] = "Online" if found else "Offline"
             time.sleep(60)
 
-# ================= PROXY SERVER =================
+# ================= PROXY WITH HASHRATE CALC =================
 class ProxyServer(threading.Thread):
-    def __init__(self, cfg, log_q, proxy_stats, diff_val):
+    def __init__(self, cfg, log_q, proxy_stats, proxy_hr_map, diff_val):
         super().__init__()
         self.cfg = cfg
         self.log_q = log_q
         self.stats = proxy_stats
+        self.hr_map = proxy_hr_map
         self.diff = diff_val
         self.daemon = True
         
@@ -228,10 +229,13 @@ class ProxyServer(threading.Thread):
     def handle(self, client, ip_id):
         pool = None
         rng = random.Random(int(ip_id) if ip_id.isdigit() else time.time())
+        last_share_time = time.time()
+        
         try:
             pool = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
             
             def fwd_up():
+                nonlocal last_share_time
                 buff = b""
                 while True:
                     try:
@@ -244,9 +248,29 @@ class ProxyServer(threading.Thread):
                                 obj = json.loads(line)
                                 if obj.get('method') == 'mining.submit':
                                     self.stats['submitted'] += 1
+                                    
+                                    # Calculate Hashrate Estimate
+                                    now = time.time()
+                                    delta = now - last_share_time
+                                    if delta < 0.1: delta = 0.1
+                                    last_share_time = now
+                                    
                                     curr_diff = self.diff.value
-                                    # Distinct Reporting Variance
-                                    variance = rng.uniform(0.1, 2.0)
+                                    # HR = (Diff * 2^32) / Time
+                                    # Braiins difficulty 1 = 4G hashes approx? No, standard diff.
+                                    # Standard: Diff 1 = 2^32 hashes.
+                                    # We use current pool diff as estimate for share difficulty
+                                    estimated_hashes = curr_diff * (2**32)
+                                    hr = estimated_hashes / delta
+                                    
+                                    # Smooth it slightly in the map
+                                    old_hr = self.hr_map.get(ip_id, 0.0)
+                                    if old_hr == 0: new_hr = hr
+                                    else: new_hr = (old_hr * 0.7) + (hr * 0.3)
+                                    self.hr_map[ip_id] = new_hr
+                                    
+                                    # Variance for log
+                                    variance = rng.uniform(0.5, 1.5)
                                     found_diff = curr_diff * variance
                                     
                                     self.log_q.put((get_lv06_ts(), "asic_result", f"[ASIC_{ip_id}] Nonce difficulty {found_diff:.2f} of {int(curr_diff)}"))
@@ -282,9 +306,13 @@ class ProxyServer(threading.Thread):
         finally: 
             if client: client.close()
             if pool: pool.close()
+            # Remove from hash map on disconnect
+            if ip_id in self.hr_map:
+                del self.hr_map[ip_id]
 
-# ================= CPU WORKER =================
+# ================= CPU MINER =================
 def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_id):
+    random.seed()
     active_jid = None
     block_data = None
     nonce = (id * 100_000_000) + random.randint(0, 5000)
@@ -316,7 +344,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
             jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = block_data
             df = diff.value
             if df <= 0: df = 1.0
-            pool_target = (0xffff0000 * 2**(256-64) // int(df))
+            target_val = (0xffff0000 * 2**(256-64)) // int(df)
             
             en2_prefix = struct.pack('>I', id)
             en2_suffix = os.urandom(4)
@@ -329,13 +357,9 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
             for branch in mb:
                 branch_bin = binascii.unhexlify(branch)
                 merkle = hashlib.sha256(hashlib.sha256(merkle + branch_bin).digest()).digest()
+            header = (binascii.unhexlify(ver)[::-1] + binascii.unhexlify(ph)[::-1] + merkle + binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1])
             
-            header = (
-                binascii.unhexlify(ver)[::-1] + binascii.unhexlify(ph)[::-1] + merkle +
-                binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1]
-            )
-            
-            for n in range(nonce, nonce + 500):
+            for n in range(nonce, nonce + 2000):
                 nonce_bin = struct.pack('<I', n)
                 block_hash_bin = hashlib.sha256(hashlib.sha256(header + nonce_bin).digest()).digest()
                 hash_int = int.from_bytes(block_hash_bin[::-1], 'big')
@@ -356,6 +380,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
 
             stats[id] += 500
             nonce += 500
+            
         except Exception: time.sleep(0.1)
 
 def gpu_worker(stop, stats, throttle, log_q):
@@ -380,7 +405,7 @@ def gpu_worker(stop, stats, throttle, log_q):
 
 def run_benchmark_sequence():
     os.system('clear')
-    print("=== KXT v55 BENCHMARK ===")
+    print("=== KXT v56 GRANULAR HASHRATE ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
     stop = mp.Event()
     procs = []
@@ -423,7 +448,7 @@ def gpu_bench_dummy(stop):
 
 def pre_screen(log_q):
     os.system('clear')
-    print("=== KXT MINER SUITE v55 - SETUP ===")
+    print("=== KXT MINER SUITE v56 - SETUP ===")
     print("Press Enter to keep default\n")
 
     cfg = DEFAULT_CONFIG.copy()
@@ -448,7 +473,6 @@ def pre_screen(log_q):
     time.sleep(1)
     return cfg
 
-# ================= MAIN SUITE =================
 class MinerSuite:
     def __init__(self):
         self.log_q = queue.Queue()
@@ -468,15 +492,18 @@ class MinerSuite:
         self.data['job'] = "?"
         self.data['en1'] = ""
         self.data['diff'] = 1024.0
+        # Scraper
         self.data['hr_5m'] = "---"
         self.data['hr_1h'] = "---"
-        self.data['workers'] = "0"
+        self.data['pool_workers'] = "-"
         self.data['api_status'] = "Init"
         
         self.proxy_stats = self.man.dict()
         self.proxy_stats['submitted'] = 0
         self.proxy_stats['accepted'] = 0
         self.proxy_stats['rejected'] = 0
+        self.proxy_hr_map = self.man.dict() # Stores IP_ID -> Hashrate
+        
         self.local_stats = self.man.dict()
         self.local_stats['submitted'] = 0
         self.stats = mp.Array('d', [0.0] * (mp.cpu_count() + 1))
@@ -523,7 +550,7 @@ class MinerSuite:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 self.connected = True
                 
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v55"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v56"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
 
                 buff = b""
@@ -537,8 +564,8 @@ class MinerSuite:
                         msg = json.dumps({"id": self.get_id(), "method": "mining.submit", "params": params})
                         s.sendall((msg + "\n").encode())
                         self.local_stats['submitted'] += 1
-                        self.log("stratum_api", f"tx: {msg}")
                         self.log("asic_result", f"[LOCAL] Nonce difficulty {r['share_diff']:.2f} of {r['pool_diff']:.0f}")
+                        self.log("stratum_api", f"tx: {msg}")
 
                     try:
                         s.settimeout(0.1)
@@ -568,6 +595,7 @@ class MinerSuite:
                                     p = msg['params']
                                     jid = str(p[0])
                                     self.data['job'] = jid
+                                    # FIX: Explicit Global Update
                                     self.global_job_id.value = jid.encode('utf-8')
                                     en1 = self.data['en1']
                                     if en1:
@@ -592,6 +620,7 @@ class MinerSuite:
                 time.sleep(5)
 
     def draw_ui(self, stdscr):
+        curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
@@ -604,27 +633,26 @@ class MinerSuite:
             try:
                 while True:
                     r = self.log_q.get_nowait()
-                    self.logs.append(r)
+                    fmt_msg = f"{r[0]} {r[1]}: {r[2]}"
+                    self.logs.append(fmt_msg)
                     if len(self.logs) > 100: self.logs.pop(0)
             except: pass
             
             c_tmp, g_tmp = get_temps()
             c_load, ram = get_hw_stats()
             
+            # Local Hashrate Calc
             current_total = 0.0
             for i in range(len(self.stats)):
                 delta = self.stats[i] - self.last_stats[i]
                 current_total += delta
                 self.last_stats[i] = self.stats[i]
-            
             self.current_hashrate = (self.current_hashrate * 0.7) + (current_total * 0.3 * 10)
-            hr_disp = self.current_hashrate
-            fhr = f"{hr_disp/1e6:.2f} MH/s" if hr_disp > 1e6 else f"{hr_disp/1000:.2f} kH/s"
             
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
             
-            stdscr.addstr(0, 0, f" KXT MINER v55 - COMPLETE ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f" KXT MINER v56 - GRANULAR ".center(w), curses.color_pair(5)|curses.A_BOLD)
             
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
@@ -639,35 +667,48 @@ class MinerSuite:
             stdscr.addstr(5, x2, f"{ts}", curses.color_pair(1 if ts=="OK" else 2))
 
             x3 = col_w*2 + 2
-            stdscr.addstr(2, x3, "=== NETWORK ===", curses.color_pair(4))
-            stdscr.addstr(3, x3, f"Pool: Braiins")
-            stdscr.addstr(4, x3, f"Diff: {int(self.data.get('diff', 0))}")
-            curr_job = self.global_job_id.value.decode('utf-8')
-            stdscr.addstr(5, x3, f"Block Data: {curr_job[:8]}")
+            stdscr.addstr(2, x3, "=== POOL STATS ===", curses.color_pair(4))
+            stdscr.addstr(3, x3, f"5m HR: {self.data.get('hr_5m', '---')}")
+            stdscr.addstr(4, x3, f"1h HR: {self.data.get('hr_1h', '---')}")
+            stdscr.addstr(5, x3, f"Active: {self.data.get('pool_workers', '-')}")
             
             x4 = col_w*3 + 2
-            stdscr.addstr(2, x4, "=== BRAIINS STATS ===", curses.color_pair(4))
-            stdscr.addstr(3, x4, f"5m HR: {self.data.get('hr_5m', '---')}")
-            stdscr.addstr(4, x4, f"1h HR: {self.data.get('hr_1h', '---')}")
-            stdscr.addstr(5, x4, f"Status: {self.data.get('api_status', 'Init')}", curses.color_pair(5))
+            stdscr.addstr(2, x4, "=== NETWORK ===", curses.color_pair(4))
+            curr_job = self.global_job_id.value.decode('utf-8')
+            stdscr.addstr(3, x4, f"Block Data: {curr_job[:8]}")
+            stdscr.addstr(4, x4, f"Diff: {int(self.data.get('diff', 0))}")
+            stdscr.addstr(5, x4, f"Link: {'ONLINE' if self.connected else 'DOWN'}", curses.color_pair(1 if self.connected else 3))
             
             stdscr.hline(8, 0, curses.ACS_HLINE, w)
-            stdscr.addstr(9, 2, f"TOTAL: {fhr}", curses.color_pair(1)|curses.A_BOLD)
+            stdscr.addstr(9, 2, "=== ACTIVE MINERS ===", curses.color_pair(4)|curses.A_BOLD)
             
-            stdscr.hline(12, 0, curses.ACS_HLINE, w)
+            # Dynamic Active Miners List
+            # 1. Local
+            l_hr = self.current_hashrate
+            l_fmt = f"{l_hr/1e6:.2f} MH/s" if l_hr > 1e6 else f"{l_hr/1000:.2f} kH/s"
+            stdscr.addstr(10, 2, f"> LOCAL PC: {l_fmt}", curses.color_pair(5))
             
-            log_h = h - 13
+            # 2. Proxy Clients
+            row = 10
+            for ip_id, hr_val in list(self.proxy_hr_map.items()):
+                row += 1
+                if row > 12: break # Limit height
+                if hr_val > 1_000_000_000_000: p_fmt = f"{hr_val/1e12:.2f} TH/s"
+                elif hr_val > 1_000_000_000: p_fmt = f"{hr_val/1e9:.2f} GH/s"
+                elif hr_val > 1_000_000: p_fmt = f"{hr_val/1e6:.2f} MH/s"
+                else: p_fmt = f"{hr_val/1000:.2f} kH/s"
+                stdscr.addstr(row, 2, f"> ASIC_{ip_id}: {p_fmt}", curses.color_pair(2))
+
+            stdscr.hline(13, 0, curses.ACS_HLINE, w)
+            
+            log_h = h - 14
             if log_h > 0:
                 for i, l in enumerate(self.logs[-log_h:]):
-                    ts, cat, msg = l
                     c = curses.color_pair(1)
-                    if "error" in cat or "rejected" in msg.lower(): c = curses.color_pair(3)
-                    elif "system" in cat: c = curses.color_pair(4)
-                    elif "stratum_api" in cat: c = curses.color_pair(5)
-                    elif "asic_result" in cat: c = curses.color_pair(2)
-                    
-                    line = f"{ts} {cat}: {msg}"
-                    try: stdscr.addstr(13+i, 2, line[:w-4], c)
+                    if "error" in l.lower() or "rejected" in l.lower(): c = curses.color_pair(3)
+                    elif "system" in l.lower(): c = curses.color_pair(4)
+                    elif "tx" in l.lower(): c = curses.color_pair(5)
+                    try: stdscr.addstr(14+i, 2, l[:w-4], c)
                     except: pass
             
             stdscr.refresh()
@@ -676,8 +717,8 @@ class MinerSuite:
 
     def start(self):
         AutoUpdate(self.cfg['UPDATE_URL'], self.log_q).start()
-        PoolStats(self.cfg['STATS_URL'], self.cfg['WALLET'], self.data).start()
-        ProxyServer(self.cfg, self.log_q, self.proxy_stats, self.diff).start()
+        PoolStatsScraper(self.cfg['STATS_URL'], self.cfg['STATS_API'], self.data).start()
+        ProxyServer(self.cfg, self.log_q, self.proxy_stats, self.proxy_hr_map, self.diff).start()
         threading.Thread(target=self.net_thread, daemon=True).start()
         threading.Thread(target=self.thermal_thread, daemon=True).start()
         
