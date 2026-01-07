@@ -10,10 +10,8 @@ KXT MINER SUITE v53 - AUTO UPDATE + DISTINCT REPORTS
 
 import sys
 # FIX: Large integer string conversion limit
-try:
-    sys.set_int_max_str_digits(0)
-except:
-    pass
+try: sys.set_int_max_str_digits(0)
+except: pass
 
 import socket
 import json
@@ -72,7 +70,6 @@ def get_uptime_ms():
     return int(time.time() * 1000) - START_TIME_MS
 
 def get_lv06_ts():
-    # LV06 style timestamp
     return f"₿ ({get_uptime_ms()})"
 
 def get_local_ip():
@@ -82,8 +79,7 @@ def get_local_ip():
         ip = s.getsockname()[0]
         s.close()
         return ip
-    except:
-        return "127.0.0.1"
+    except: return "127.0.0.1"
 
 def get_cst_time():
     utc = datetime.now(timezone.utc)
@@ -96,17 +92,13 @@ def get_temps():
         o = subprocess.check_output("sensors", shell=True).decode()
         for l in o.splitlines():
             if any(k in l for k in ["Tdie", "Tctl", "Package id 0", "Core 0"]):
-                try:
-                    c = float(l.split('+')[1].split('°')[0].strip())
-                except:
-                    continue
-    except:
-        pass
+                try: c = float(l.split('+')[1].split('°')[0].strip())
+                except: continue
+    except: pass
     try:
         o = subprocess.check_output("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader", shell=True).decode()
         g = float(o.strip())
-    except:
-        pass
+    except: pass
     return c, g
 
 def get_hw_stats():
@@ -115,14 +107,11 @@ def get_hw_stats():
         c = psutil.cpu_percent()
         r = psutil.virtual_memory().percent
         return c, r
-    except:
-        return 0.0, 0.0
+    except: return 0.0, 0.0
 
 def fix_env():
-    try:
-        os.environ['PATH'] += ':/usr/local/cuda/bin'
-    except:
-        pass
+    try: os.environ['PATH'] += ':/usr/local/cuda/bin'
+    except: pass
 
 # ================= AUTO UPDATER =================
 class AutoUpdate(threading.Thread):
@@ -197,10 +186,8 @@ class ProxyServer(threading.Thread):
             self.log_q.put((get_lv06_ts(), "system", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
             while True:
                 c, a = sock.accept()
-                try:
-                    ip_id = a[0].split('.')[-1]
-                except:
-                    ip_id = str(random.randint(10,99))
+                try: ip_id = a[0].split('.')[-1]
+                except: ip_id = str(random.randint(10,99))
                 
                 threading.Thread(target=self.handle, args=(c, ip_id), daemon=True).start()
         except Exception as e:
@@ -406,9 +393,48 @@ def gpu_bench_dummy(stop):
             cuda.Context.synchronize()
     except: time.sleep(0.1)
 
+# ================= PRE-SCREEN =================
+def pre_screen():
+    os.system('clear')
+    print("=== KXT MINER SUITE v53 - SETUP ===")
+    print("Press Enter to keep default\n")
+
+    cfg = DEFAULT_CONFIG.copy()
+
+    print(f"Pool URL: {cfg['POOL_URL']} (solo.stratum.braiins.com)")
+    new_pool = input("New Pool URL (Enter for default): ").strip()
+    if new_pool:
+        cfg['POOL_URL'] = new_pool
+
+    print(f"Pool Port: {cfg['POOL_PORT']}")
+    new_port = input("New Port (Enter for default): ").strip()
+    if new_port:
+        cfg['POOL_PORT'] = int(new_port)
+
+    print(f"Wallet: {cfg['WALLET']}")
+    new_wallet = input("New Wallet (Enter for default): ").strip()
+    if new_wallet:
+        cfg['WALLET'] = new_wallet
+        cfg['STATS_URL'] = f"https://solo.braiins.com/users/{new_wallet}"
+
+    print(f"Worker Name: 001 (optional)")
+    new_worker = input("Worker (Enter for none): ").strip()
+    if new_worker:
+        cfg['WORKER'] = new_worker
+
+    print(f"Proxy Port: {cfg['PROXY_PORT']}")
+    new_proxy = input("New Proxy Port (Enter for default): ").strip()
+    if new_proxy:
+        cfg['PROXY_PORT'] = int(new_proxy)
+
+    print("\nConfiguration complete. Press Enter to start benchmark and miner...")
+    input()
+    return cfg
+
 # ================= APP MANAGER =================
 class MinerSuite:
     def __init__(self):
+        self.cfg = pre_screen()  # Full pre-screen with all options
         run_benchmark_sequence()
         self.run_setup()
         self.man = mp.Manager()
@@ -444,7 +470,6 @@ class MinerSuite:
 
     def run_setup(self):
         os.system('clear')
-        self.cfg = DEFAULT_CONFIG.copy()
         print("Starting Suite...")
         time.sleep(1)
 
