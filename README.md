@@ -779,7 +779,7 @@ class MinerSuite:
                     c = curses.color_pair(1)
                     if "error" in cat or "rejected" in msg.lower(): c = curses.color_pair(3)
                     elif "system" in cat: c = curses.color_pair(4)
-                    elif "tx" in l.lower(): c = curses.color_pair(5)
+                    elif "TX" in l.lower(): c = curses.color_pair(5)
                     elif "asic_result" in cat: c = curses.color_pair(2)
                     
                     line = f"{ts} {cat}: {msg}"
