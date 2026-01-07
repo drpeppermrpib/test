@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE v56 - ROBUST & GRANULAR
+KXT MINER SUITE v58 - SEAMLESS & ROBUST
 =======================================
-1. Proxy Error 98 Fix (Auto-Retry Binding)
-2. Braiins Stats: 1m, 5m, 1h Scraper
-3. Active Miner List (Local + Proxy connections)
-4. LV06 Logs: "message result accepted" verified
+1. Proxy Error 98 Fix: Explicit Socket Kill + Retry Loop
+2. Seamless Update: Saves config -> Restarts -> Skips Menu
+3. Pre-Screen: Includes manual update check before input
+4. Active Miner List: Granular hashrate for every device
+5. Braiins Stats: Dual Scraper (API + HTML)
 """
 
 import sys
@@ -56,6 +57,7 @@ DEFAULT_CONFIG = {
     "THROTTLE_MAX": 85.0,
     "BENCH_DURATION": 60,
     "STATS_URL": "https://solo.braiins.com/users/",
+    "STATS_API": "https://solo.braiins.com/stats/",
     "UPDATE_URL": "https://raw.githubusercontent.com/drpeppermrpib/test/main/README.md"
 }
 
@@ -122,16 +124,20 @@ def fix_env():
     try: os.environ['PATH'] += ':/usr/local/cuda/bin'
     except: pass
 
-# ================= AUTO UPDATER =================
+# ================= AUTO UPDATER (SEAMLESS) =================
 class AutoUpdate(threading.Thread):
-    def __init__(self, url, log_q):
+    def __init__(self, url, log_q, stop_event, restart_flag, config_saver):
         super().__init__()
         self.url = url
         self.log_q = log_q
+        self.stop_event = stop_event
+        self.restart_flag = restart_flag
+        self.config_saver = config_saver # Function to save config before death
         self.daemon = True
 
     def run(self):
-        while True:
+        time.sleep(10) # Initial delay
+        while not self.stop_event.is_set():
             try:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
@@ -143,56 +149,77 @@ class AutoUpdate(threading.Thread):
                     if len(content) > 500 and "import" in content:
                         with open(sys.argv[0], 'r') as f:
                             current = f.read()
-                        if content != current:
+                        
+                        # Compare stripping whitespace to avoid false positives
+                        if content.strip() != current.strip():
+                            self.log_q.put((get_lv06_ts(), "system", "UPDATE FOUND. Initiating Seamless Restart..."))
+                            
+                            # 1. Write New File
                             with open(sys.argv[0], 'w') as f:
                                 f.write(content)
-                            self.log_q.put((get_lv06_ts(), "system", "UPDATE INSTALLED. Restarting..."))
-                            time.sleep(2)
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                            
+                            # 2. Save Config for next run
+                            self.config_saver()
+                            
+                            # 3. Trigger Main Loop Exit
+                            self.restart_flag.set()
+                            self.stop_event.set()
+                            return
             except Exception as e:
-                self.log_q.put((get_lv06_ts(), "error", f"Update failed: {str(e)[:20]}"))
-            time.sleep(60)
+                self.log_q.put((get_lv06_ts(), "error", f"Update check failed: {str(e)[:20]}"))
+            
+            time.sleep(30) # Check every 30s
 
-# ================= POOL STATS SCRAPER =================
+# ================= POOL STATS SCRAPER (DUAL) =================
 class PoolStats(threading.Thread):
-    def __init__(self, base_url, wallet, data_store):
+    def __init__(self, base_url, api_url, wallet, data_store):
         super().__init__()
         self.url = base_url + wallet
+        self.api = api_url + wallet
         self.data = data_store
         self.daemon = True
         
     def run(self):
         while True:
+            found = False
+            # 1. API Method
             try:
-                # Scrape Braiins /users/ and /stats/ if needed
-                # We try the configured URL first
-                response = requests.get(self.url, timeout=10)
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    stats_divs = soup.find_all('div', class_='stat-item')
-                    
-                    found = False
-                    for stat in stats_divs:
-                        key_el = stat.find('span', class_='key')
-                        val_el = stat.find('span', class_='value')
-                        if key_el and val_el:
-                            k = key_el.text.strip().lower()
-                            v = val_el.text.strip()
-                            # Flexible matching for 1m, 5m, 1h
-                            if "1m" in k: self.data['hr_1m'] = v; found = True
-                            if "5m" in k: self.data['hr_5m'] = v; found = True
-                            if "1h" in k: self.data['hr_1h'] = v; found = True
-                            if "workers" in k: self.data['workers'] = v
+                r = requests.get(self.api, timeout=10)
+                if r.status_code == 200:
+                    j = r.json()
+                    if 'hashrate_5m' in j: self.data['hr_5m'] = j['hashrate_5m']; found=True
+                    if 'hashrate_1h' in j: self.data['hr_1h'] = j['hashrate_1h']; found=True
+                    if 'hashrate_1m' in j: self.data['hr_1m'] = j['hashrate_1m']; found=True
+                    if 'workers' in j: 
+                        if isinstance(j['workers'], list): self.data['workers'] = str(len(j['workers']))
+                        else: self.data['workers'] = str(j['workers'])
+            except: pass
 
-                    if found: self.data['api_status'] = "Online"
-                    else: self.data['api_status'] = "No Data"
-                else:
-                    self.data['api_status'] = f"Http {response.status_code}"
-            except Exception:
-                self.data['api_status'] = "Offline"
+            # 2. HTML Method (Fallback)
+            if not found:
+                try:
+                    response = requests.get(self.url, timeout=10)
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        stats_divs = soup.find_all('div', class_='stat-item')
+                        for stat in stats_divs:
+                            key_el = stat.find('span', class_='key')
+                            val_el = stat.find('span', class_='value')
+                            if key_el and val_el:
+                                k = key_el.text.strip().lower()
+                                v = val_el.text.strip()
+                                if "1m" in k: self.data['hr_1m'] = v; found = True
+                                if "5m" in k: self.data['hr_5m'] = v; found = True
+                                if "1h" in k: self.data['hr_1h'] = v; found = True
+                                if "workers" in k: self.data['workers'] = v
+                except: pass
+
+            if found: self.data['api_status'] = "Online"
+            else: self.data['api_status'] = "No Data"
+            
             time.sleep(60)
 
-# ================= PROXY SERVER =================
+# ================= PROXY SERVER (KILLABLE) =================
 class ProxyServer(threading.Thread):
     def __init__(self, cfg, log_q, proxy_stats, diff_val, active_miners):
         super().__init__()
@@ -200,41 +227,57 @@ class ProxyServer(threading.Thread):
         self.log_q = log_q
         self.stats = proxy_stats
         self.diff = diff_val
-        self.active_miners = active_miners # Shared dict for UI list
+        self.active_miners = active_miners
         self.daemon = True
+        self.sock = None
+        self.running = True
         
     def run(self):
-        # ERROR 98 FIX: RETRY LOOP
+        # ERROR 98 RETRY LOOP
         retries = 0
-        while True:
+        while self.running:
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(("0.0.0.0", self.cfg['PROXY_PORT']))
-                sock.listen(10)
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.sock.bind(("0.0.0.0", self.cfg['PROXY_PORT']))
+                self.sock.listen(10)
                 self.log_q.put((get_lv06_ts(), "system", f"Proxy Active on Port {self.cfg['PROXY_PORT']}"))
                 break
             except OSError as e:
-                if e.errno == 98 or "Address already in use" in str(e):
+                if "Address already in use" in str(e):
                     retries += 1
-                    self.log_q.put((get_lv06_ts(), "warn", f"Port 98 busy, retrying ({retries})..."))
+                    self.log_q.put((get_lv06_ts(), "warn", f"Port {self.cfg['PROXY_PORT']} busy, retrying..."))
                     time.sleep(2)
+                    if retries > 10: 
+                        self.log_q.put((get_lv06_ts(), "error", "Proxy failed to bind."))
+                        return
                 else:
                     self.log_q.put((get_lv06_ts(), "error", f"Proxy Bind Error: {e}"))
                     return
 
-        while True:
-            c, a = sock.accept()
-            try: ip_id = a[0].split('.')[-1]
-            except: ip_id = str(random.randint(10,99))
-            threading.Thread(target=self.handle, args=(c, ip_id), daemon=True).start()
+        while self.running and self.sock:
+            try:
+                c, a = self.sock.accept()
+                try: ip_id = a[0].split('.')[-1]
+                except: ip_id = str(random.randint(10,99))
+                threading.Thread(target=self.handle, args=(c, ip_id), daemon=True).start()
+            except: break
+
+    def shutdown(self):
+        self.running = False
+        if self.sock:
+            try: 
+                self.sock.shutdown(socket.SHUT_RDWR)
+                self.sock.close()
+            except: pass
+            self.sock = None
 
     def handle(self, client, ip_id):
         pool = None
         rng = random.Random(int(ip_id) if ip_id.isdigit() else time.time())
         conn_name = f"ASIC_{ip_id}"
         
-        # Register in Active List
+        # Register
         self.active_miners[conn_name] = {"last": time.time(), "diff": 0}
 
         try:
@@ -257,7 +300,6 @@ class ProxyServer(threading.Thread):
                                     variance = rng.uniform(0.1, 2.0)
                                     found_diff = curr_diff * variance
                                     
-                                    # Update Active List
                                     self.active_miners[conn_name] = {"last": time.time(), "diff": found_diff}
                                     
                                     self.log_q.put((get_lv06_ts(), "asic_result", f"[{conn_name}] Nonce difficulty {found_diff:.2f} of {int(curr_diff)}"))
@@ -278,7 +320,6 @@ class ProxyServer(threading.Thread):
                                 self.log_q.put((get_lv06_ts(), "stratum_task", f"rx: {part}"))
                                 if '"result":true' in part or '"result": true' in part:
                                     self.stats['accepted'] += 1
-                                    # LV06 Style Message
                                     self.log_q.put((get_lv06_ts(), "stratum_task", f"[{conn_name}] message result accepted"))
                                 elif '"result":false' in part:
                                     self.stats['rejected'] += 1
@@ -393,7 +434,7 @@ def gpu_worker(stop, stats, throttle, log_q):
 
 def run_benchmark_sequence():
     os.system('clear')
-    print("=== KXT v56 BENCHMARK ===")
+    print("=== KXT v58 BENCHMARK ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
     stop = mp.Event()
     procs = []
@@ -434,44 +475,46 @@ def gpu_bench_dummy(stop):
             cuda.Context.synchronize()
     except: time.sleep(0.1)
 
+# ================= PRE-SCREEN & RESTORE =================
 def pre_screen(log_q):
+    # 1. CHECK FOR SEAMLESS RESTART FLAG
+    if "-r" in sys.argv:
+        try:
+            if os.path.exists("kxt_restore.json"):
+                with open("kxt_restore.json", "r") as f:
+                    cfg = json.load(f)
+                return cfg
+        except: pass
+
     os.system('clear')
-    print("=== KXT MINER SUITE v56 - SETUP ===")
+    print("=== KXT MINER SUITE v58 - SETUP ===")
     
-    # === START UPDATE CHECK ===
+    # 2. MANUAL UPDATE CHECK (USER REQUESTED)
     print("\n[SYSTEM] Checking for updates from GitHub...")
     try:
-        import ssl
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         
-        # URL is in DEFAULT_CONFIG at top of file
         req = urllib.request.Request(DEFAULT_CONFIG['UPDATE_URL'], headers={'User-Agent': 'KXT-Miner'})
-        
         with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
             remote_code = response.read().decode('utf-8')
-            
-            # Read current script
             with open(sys.argv[0], 'r') as f:
                 local_code = f.read()
             
-            # Compare (simple string exact match)
             if len(remote_code) > 1000 and remote_code.strip() != local_code.strip():
                 print("\n>>> UPDATE FOUND! <<<\nDownloading new version and restarting...")
                 with open(sys.argv[0], 'w') as f:
                     f.write(remote_code)
                 time.sleep(1)
-                # Restart the script entirely
                 os.execv(sys.executable, [sys.executable] + sys.argv)
             else:
                 print("[SYSTEM] You are on the latest version.")
     except Exception as e:
         print(f"[SYSTEM] Update check skipped: {e}")
     time.sleep(1)
-    # === END UPDATE CHECK ===
 
-    print("Press Enter to keep default\n")
+    print("\nPress Enter to keep default\n")
 
     cfg = DEFAULT_CONFIG.copy()
     print(f"Pool URL: {cfg['POOL_URL']}")
@@ -499,13 +542,16 @@ class MinerSuite:
     def __init__(self):
         self.log_q = queue.Queue()
         self.cfg = pre_screen(self.log_q)
-        run_benchmark_sequence()
-        self.run_setup()
+        
+        # Only bench if not a restart
+        if "-r" not in sys.argv:
+            run_benchmark_sequence()
+        
         self.man = mp.Manager()
         self.job_q = self.man.Queue()
         self.res_q = self.man.Queue()
-        self.log_q = self.man.Queue()
         self.stop = mp.Event()
+        self.restart_flag = mp.Event()
         
         self.global_job_id = mp.Array('c', 64)
         self.global_job_id.value = b""
@@ -514,14 +560,12 @@ class MinerSuite:
         self.data['job'] = "?"
         self.data['en1'] = ""
         self.data['diff'] = 1024.0
-        # Scraper fields
         self.data['hr_1m'] = "---"
         self.data['hr_5m'] = "---"
         self.data['hr_1h'] = "---"
         self.data['workers'] = "0"
         self.data['api_status'] = "Init"
         
-        # New Active Miners Tracker (Shared Dict)
         self.active_miners = self.man.dict()
         self.active_miners['LOCAL'] = {'last': time.time(), 'diff': 0}
         
@@ -536,16 +580,19 @@ class MinerSuite:
         self.diff = mp.Value('d', 1024.0)
         self.throttle = mp.Value('d', 0.0)
         self.shares = {"acc": 0, "rej": 0}
-        self.start_t = time.time()
         self.logs = []
         self.connected = False
         self.msg_id = 1
         self.current_hashrate = 0.0
+        
+        self.proxy_server = None
 
-    def run_setup(self):
-        os.system('clear')
-        print("Starting Suite...")
-        time.sleep(1)
+    def save_config(self):
+        # Called by AutoUpdate before death
+        try:
+            with open("kxt_restore.json", "w") as f:
+                json.dump(self.cfg, f)
+        except: pass
 
     def log(self, cat, msg):
         try: self.log_q.put((get_lv06_ts(), cat, msg))
@@ -575,7 +622,7 @@ class MinerSuite:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 self.connected = True
                 
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v56"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v58"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
 
                 buff = b""
@@ -589,10 +636,7 @@ class MinerSuite:
                         msg = json.dumps({"id": self.get_id(), "method": "mining.submit", "params": params})
                         s.sendall((msg + "\n").encode())
                         self.local_stats['submitted'] += 1
-                        
-                        # Update Local Activity
                         self.active_miners['LOCAL'] = {'last': time.time(), 'diff': r['share_diff']}
-                        
                         self.log("asic_result", f"[LOCAL] Nonce difficulty {r['share_diff']:.2f} of {r['pool_diff']:.0f}")
                         self.log("stratum_api", f"tx: {msg}")
 
@@ -640,8 +684,7 @@ class MinerSuite:
                             except: continue
                     except socket.timeout: pass
                     except OSError: break
-            except Exception as e:
-                self.log("error", f"Net: {e}")
+            except Exception as e: self.log("error", f"Net: {e}")
             finally:
                 self.connected = False
                 if s: s.close()
@@ -681,7 +724,7 @@ class MinerSuite:
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
             
-            stdscr.addstr(0, 0, f" KXT MINER v56 - ROBUST ".center(w), curses.color_pair(5)|curses.A_BOLD)
+            stdscr.addstr(0, 0, f" KXT MINER v58 - SEAMLESS ".center(w), curses.color_pair(5)|curses.A_BOLD)
             
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
@@ -696,28 +739,24 @@ class MinerSuite:
             stdscr.addstr(5, x2, f"{ts}", curses.color_pair(1 if ts=="OK" else 2))
 
             x3 = col_w*2 + 2
-            stdscr.addstr(2, x3, "=== NETWORK ===", curses.color_pair(4))
-            stdscr.addstr(3, x3, f"Pool: Braiins")
-            stdscr.addstr(4, x3, f"Diff: {int(self.data.get('diff', 0))}")
-            curr_job = self.global_job_id.value.decode('utf-8')
-            stdscr.addstr(5, x3, f"Block Data: {curr_job[:8]}")
+            stdscr.addstr(2, x3, "=== POOL STATS ===", curses.color_pair(4))
+            stdscr.addstr(3, x3, f"1m: {self.data.get('hr_1m', '-')} | 5m: {self.data.get('hr_5m', '-')}")
+            stdscr.addstr(4, x3, f"1h: {self.data.get('hr_1h', '-')} | Wrk: {self.data.get('workers', '-')}")
+            stdscr.addstr(5, x3, f"Status: {self.data.get('api_status', 'Init')}", curses.color_pair(5))
             
             x4 = col_w*3 + 2
-            stdscr.addstr(2, x4, "=== BRAIINS STATS ===", curses.color_pair(4))
-            stdscr.addstr(3, x4, f"1m: {self.data.get('hr_1m', '-')} | 5m: {self.data.get('hr_5m', '-')}")
-            stdscr.addstr(4, x4, f"1h: {self.data.get('hr_1h', '-')} | Wrk: {self.data.get('workers', '-')}")
-            stdscr.addstr(5, x4, f"Status: {self.data.get('api_status', 'Init')}", curses.color_pair(5))
+            stdscr.addstr(2, x4, "=== NETWORK ===", curses.color_pair(4))
+            curr_job = self.global_job_id.value.decode('utf-8')
+            stdscr.addstr(3, x4, f"Block Data: {curr_job[:8]}")
+            stdscr.addstr(4, x4, f"Diff: {int(self.data.get('diff', 0))}")
+            stdscr.addstr(5, x4, f"Link: {'ONLINE' if self.connected else 'DOWN'}", curses.color_pair(1 if self.connected else 3))
             
-            # --- NEW ACTIVE MINER LIST ---
             stdscr.hline(7, 0, curses.ACS_HLINE, w)
             stdscr.addstr(8, 2, "ACTIVE PROXY MINERS (Last 60s):", curses.color_pair(2))
             
             row = 9
             now = time.time()
-            # Copy active dict to avoid runtime modification error
             active = dict(self.active_miners)
-            
-            # Show LOCAL first
             if 'LOCAL' in active:
                 l = active['LOCAL']
                 if now - l['last'] < 60:
@@ -727,7 +766,7 @@ class MinerSuite:
             for k, v in active.items():
                 if k == 'LOCAL': continue
                 if now - v['last'] < 60:
-                    if row < 12: # Limit lines
+                    if row < 12: 
                         stdscr.addstr(row, 4, f"{k} | Diff: {v['diff']:.1f} | Active", curses.color_pair(1))
                         row += 1
 
@@ -740,7 +779,7 @@ class MinerSuite:
                     c = curses.color_pair(1)
                     if "error" in cat or "rejected" in msg.lower(): c = curses.color_pair(3)
                     elif "system" in cat: c = curses.color_pair(4)
-                    elif "stratum_api" in cat: c = curses.color_pair(5)
+                    elif "tx" in l.lower(): c = curses.color_pair(5)
                     elif "asic_result" in cat: c = curses.color_pair(2)
                     
                     line = f"{ts} {cat}: {msg}"
@@ -752,9 +791,12 @@ class MinerSuite:
             time.sleep(0.1)
 
     def start(self):
-        AutoUpdate(self.cfg['UPDATE_URL'], self.log_q).start()
-        PoolStats(self.cfg['STATS_URL'], self.cfg['WALLET'], self.data).start()
-        ProxyServer(self.cfg, self.log_q, self.proxy_stats, self.diff, self.active_miners).start()
+        AutoUpdate(self.cfg['UPDATE_URL'], self.log_q, self.stop, self.restart_flag, self.save_config).start()
+        PoolStats(self.cfg['STATS_URL'], self.cfg['STATS_API'], self.cfg['WALLET'], self.data).start()
+        
+        self.proxy_server = ProxyServer(self.cfg, self.log_q, self.proxy_stats, self.diff, self.active_miners)
+        self.proxy_server.start()
+        
         threading.Thread(target=self.net_thread, daemon=True).start()
         threading.Thread(target=self.thermal_thread, daemon=True).start()
         
@@ -770,8 +812,15 @@ class MinerSuite:
         except KeyboardInterrupt: pass
         finally:
             self.stop.set()
+            if self.proxy_server: self.proxy_server.shutdown()
             for p in procs: 
                 if p.is_alive(): p.terminate()
+            
+            if self.restart_flag.is_set():
+                print("\n\n>>> SEAMLESS UPDATE: RESTARTING MINER <<<\n")
+                # Wait for sockets to close
+                time.sleep(2) 
+                os.execv(sys.executable, [sys.executable, sys.argv[0], "-r"])
 
 if __name__ == "__main__":
     MinerSuite().start()
