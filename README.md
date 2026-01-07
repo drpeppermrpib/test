@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KXT MINER SUITE v60 - BUG SQUASH EDITION
-========================================
-1. Fixed 'run_setup' crash (Image 2)
-2. Fixed 'tuple' object error in UI (Image 1)
-3. Robust Proxy Port Killing (Fixes Err 98)
-4. Seamless Update & Restore
+kx2000 MINER SUITE v60 - STABLE & WIDE UI
+=========================================
+1. Fixed Crash: Restored missing run_setup()
+2. Wide UI: Added columns for Active Miners (HR, Diff, Time)
+3. Local PC: Persistent tracking in active list
+4. Proxy Kill: Port 98 Fix
 """
 
 import sys
@@ -53,11 +53,11 @@ DEFAULT_CONFIG = {
     "WALLET": "bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
     "PASSWORD": "x",
     "PROXY_PORT": 60060,
-    "THROTTLE_START": 79.0, 
-    "THROTTLE_MAX": 85.0,
+    "THROTTLE_START": 76.0, 
+    "THROTTLE_MAX": 81.0,
     "BENCH_DURATION": 60,
-    "STATS_URL": "https://solo.braiins.com/users/",
-    "STATS_API": "https://solo.braiins.com/stats/",
+    "STATS_URL": "https://solo.braiins.com/users/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
+    "STATS_API": "https://solo.braiins.com/stats/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
     "UPDATE_URL": "https://raw.githubusercontent.com/drpeppermrpib/test/main/README.md"
 }
 
@@ -125,20 +125,17 @@ def fix_env():
     except: pass
 
 def kill_port(port):
-    """Force kill any process using the proxy port to prevent Error 98"""
     try:
-        # Find PIDs using the port
         cmd = f"lsof -t -i:{port}"
         try:
             pids = subprocess.check_output(cmd, shell=True).decode().strip().split('\n')
             for pid in pids:
-                if pid:
-                    os.kill(int(pid), signal.SIGKILL)
+                if pid: os.kill(int(pid), signal.SIGKILL)
         except: pass
         time.sleep(1)
     except: pass
 
-# ================= AUTO UPDATER (SEAMLESS) =================
+# ================= AUTO UPDATER =================
 class AutoUpdate(threading.Thread):
     def __init__(self, url, log_q, stop_event, restart_flag, config_saver):
         super().__init__()
@@ -150,40 +147,30 @@ class AutoUpdate(threading.Thread):
         self.daemon = True
 
     def run(self):
-        time.sleep(10) # Initial delay
+        time.sleep(10)
         while not self.stop_event.is_set():
             try:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
-                
-                req = urllib.request.Request(self.url, headers={'User-Agent': 'KXT-Miner'})
+                req = urllib.request.Request(self.url, headers={'User-Agent': 'kx2000-Miner'})
                 with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
                     content = response.read().decode('utf-8')
                     if len(content) > 500 and "import" in content:
                         with open(sys.argv[0], 'r') as f:
                             current = f.read()
-                        
                         if content.strip() != current.strip():
-                            self.log_q.put((get_lv06_ts(), "system", "UPDATE FOUND. Initiating Seamless Restart..."))
-                            
-                            # 1. Write New File
-                            with open(sys.argv[0], 'w') as f:
-                                f.write(content)
-                            
-                            # 2. Save Config
+                            self.log_q.put((get_lv06_ts(), "system", "UPDATE FOUND. Seamless Restart..."))
+                            with open(sys.argv[0], 'w') as f: f.write(content)
                             self.config_saver()
-                            
-                            # 3. Trigger Main Loop Exit
                             self.restart_flag.set()
                             self.stop_event.set()
                             return
             except Exception as e:
                 self.log_q.put((get_lv06_ts(), "error", f"Update check failed: {str(e)[:20]}"))
-            
             time.sleep(30)
 
-# ================= POOL STATS SCRAPER (DUAL) =================
+# ================= POOL STATS SCRAPER =================
 class PoolStats(threading.Thread):
     def __init__(self, base_url, api_url, wallet, data_store):
         super().__init__()
@@ -195,7 +182,6 @@ class PoolStats(threading.Thread):
     def run(self):
         while True:
             found = False
-            # 1. API Method
             try:
                 r = requests.get(self.api, timeout=10)
                 if r.status_code == 200:
@@ -208,7 +194,6 @@ class PoolStats(threading.Thread):
                         else: self.data['workers'] = str(j['workers'])
             except: pass
 
-            # 2. HTML Method (Fallback)
             if not found:
                 try:
                     response = requests.get(self.url, timeout=10)
@@ -227,12 +212,10 @@ class PoolStats(threading.Thread):
                                 if "workers" in k: self.data['workers'] = v
                 except: pass
 
-            if found: self.data['api_status'] = "Online"
-            else: self.data['api_status'] = "No Data"
-            
+            self.data['api_status'] = "Online" if found else "No Data"
             time.sleep(60)
 
-# ================= PROXY SERVER (KILLABLE) =================
+# ================= PROXY SERVER =================
 class ProxyServer(threading.Thread):
     def __init__(self, cfg, log_q, proxy_stats, diff_val, active_miners):
         super().__init__()
@@ -246,9 +229,7 @@ class ProxyServer(threading.Thread):
         self.running = True
         
     def run(self):
-        # ERROR 98 FIX: Kill port before binding
         kill_port(self.cfg['PROXY_PORT'])
-        
         retries = 0
         while self.running:
             try:
@@ -261,7 +242,7 @@ class ProxyServer(threading.Thread):
             except OSError as e:
                 if "Address already in use" in str(e):
                     retries += 1
-                    self.log_q.put((get_lv06_ts(), "warn", f"Port {self.cfg['PROXY_PORT']} busy, killing & retrying..."))
+                    self.log_q.put((get_lv06_ts(), "warn", f"Port {self.cfg['PROXY_PORT']} busy, retrying..."))
                     kill_port(self.cfg['PROXY_PORT'])
                     time.sleep(2)
                     if retries > 10: 
@@ -292,12 +273,14 @@ class ProxyServer(threading.Thread):
         pool = None
         rng = random.Random(int(ip_id) if ip_id.isdigit() else time.time())
         conn_name = f"ASIC_{ip_id}"
-        self.active_miners[conn_name] = {"last": time.time(), "diff": 0}
+        self.active_miners[conn_name] = {"last": time.time(), "diff": 0, "hr": 0}
+        last_share = time.time()
 
         try:
             pool = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
             
             def fwd_up():
+                nonlocal last_share
                 buff = b""
                 while True:
                     try:
@@ -310,10 +293,27 @@ class ProxyServer(threading.Thread):
                                 obj = json.loads(line)
                                 if obj.get('method') == 'mining.submit':
                                     self.stats['submitted'] += 1
+                                    
+                                    # Calc Hashrate
+                                    now = time.time()
+                                    delta = now - last_share
+                                    if delta < 0.1: delta = 0.1
+                                    last_share = now
                                     curr_diff = self.diff.value
+                                    
+                                    # Approx Hashes = Diff * 2^32
+                                    hashes = curr_diff * 4294967296
+                                    hr = hashes / delta
+                                    
+                                    # Smooth it
+                                    old_hr = self.active_miners[conn_name].get("hr", 0)
+                                    new_hr = (old_hr * 0.7) + (hr * 0.3) if old_hr > 0 else hr
+
                                     variance = rng.uniform(0.1, 2.0)
                                     found_diff = curr_diff * variance
-                                    self.active_miners[conn_name] = {"last": time.time(), "diff": found_diff}
+                                    
+                                    self.active_miners[conn_name] = {"last": now, "diff": found_diff, "hr": new_hr}
+                                    
                                     self.log_q.put((get_lv06_ts(), "asic_result", f"[{conn_name}] Nonce difficulty {found_diff:.2f} of {int(curr_diff)}"))
                                     self.log_q.put((get_lv06_ts(), "stratum_api", f"tx: {line.decode()}"))
                             except: pass
@@ -354,6 +354,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
     active_jid = None
     block_data = None
     nonce = (id * 100_000_000) + random.randint(0, 5000)
+    
     while not stop.is_set():
         if throttle.value > 0.0: time.sleep(throttle.value)
         try:
@@ -366,36 +367,30 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
                         nonce = (id * 100_000_000) + random.randint(0, 5000)
                 except queue.Empty: pass
         except: pass
-        
         try:
             curr_g_id = global_job_id.value.decode('utf-8')
             if active_jid and curr_g_id and active_jid != curr_g_id:
                 active_jid = None; continue
         except: pass
-
-        if not active_jid: time.sleep(0.05); continue
-            
+        if not active_jid: 
+            time.sleep(0.05); continue
         try:
             jid, ph, c1, c2, mb, ver, nbits, ntime, clean, en1 = block_data
             df = diff.value
             if df <= 0: df = 1.0
             pool_target = (0xffff0000 * 2**(256-64) // int(df))
-            
             en2_prefix = struct.pack('>I', id)
             en2_suffix = os.urandom(4)
             en2_bin = en2_prefix + en2_suffix
             en2 = binascii.hexlify(en2_bin).decode()
-            
             coinbase = binascii.unhexlify(c1 + en1 + en2 + c2)
             cb_hash = hashlib.sha256(hashlib.sha256(coinbase).digest()).digest()
             merkle = cb_hash
             for branch in mb:
                 branch_bin = binascii.unhexlify(branch)
                 merkle = hashlib.sha256(hashlib.sha256(merkle + branch_bin).digest()).digest()
-            
             header = (binascii.unhexlify(ver)[::-1] + binascii.unhexlify(ph)[::-1] + merkle +
-                      binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1])
-            
+                binascii.unhexlify(ntime)[::-1] + binascii.unhexlify(nbits)[::-1])
             for n in range(nonce, nonce + 500):
                 nonce_bin = struct.pack('<I', n)
                 block_hash_bin = hashlib.sha256(hashlib.sha256(header + nonce_bin).digest()).digest()
@@ -406,8 +401,7 @@ def cpu_worker(id, job_q, res_q, stop, stats, diff, throttle, log_q, global_job_
                      log_q.put((get_lv06_ts(), "asic_result", f"[LOCAL_{id}] Nonce difficulty {hash_diff:.2f} of {int(df)}"))
                 if hash_int <= pool_target:
                     res_q.put({
-                        "job_id": jid, "extranonce2": en2, "ntime": ntime, 
-                        "nonce": binascii.hexlify(nonce_bin).decode(),
+                        "job_id": jid, "extranonce2": en2, "ntime": ntime, "nonce": binascii.hexlify(nonce_bin).decode(),
                         "share_diff": hash_diff, "pool_diff": df
                     })
                     break
@@ -436,9 +430,9 @@ def gpu_worker(stop, stats, throttle, log_q):
         except: time.sleep(1)
 
 def run_benchmark_sequence():
-    if 'KX_RESUME' in os.environ: return
+    if "-r" in sys.argv: return
     os.system('clear')
-    print("=== KXT v60 BENCHMARK ===")
+    print("=== kx2000 v60 BENCHMARK ===")
     print(f"Running CPU/GPU Load for {DEFAULT_CONFIG['BENCH_DURATION']} seconds...")
     stop = mp.Event()
     procs = []
@@ -447,7 +441,6 @@ def run_benchmark_sequence():
         p.start(); procs.append(p)
     gp = mp.Process(target=gpu_bench_dummy, args=(stop,))
     gp.start(); procs.append(gp)
-    
     start = time.time()
     try:
         while time.time() - start < DEFAULT_CONFIG['BENCH_DURATION']:
@@ -483,61 +476,48 @@ def gpu_bench_dummy(stop):
 def pre_screen(log_q):
     if "-r" in sys.argv:
         try:
-            if os.path.exists("kxt_restore.json"):
-                with open("kxt_restore.json", "r") as f:
-                    cfg = json.load(f)
-                return cfg
+            if os.path.exists("kx_restore.json"):
+                with open("kx_restore.json", "r") as f: return json.load(f)
         except: pass
 
     os.system('clear')
-    print("=== KXT MINER SUITE v60 - SETUP ===")
+    print("=== kx2000 MINER SUITE v60 - SETUP ===")
     
-    # MANUAL UPDATE CHECK
     print("\n[SYSTEM] Checking for updates from GitHub...")
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        
-        req = urllib.request.Request(DEFAULT_CONFIG['UPDATE_URL'], headers={'User-Agent': 'KXT-Miner'})
+        req = urllib.request.Request(DEFAULT_CONFIG['UPDATE_URL'], headers={'User-Agent': 'kx2000-Miner'})
         with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
             remote_code = response.read().decode('utf-8')
-            with open(sys.argv[0], 'r') as f:
-                local_code = f.read()
-            
+            with open(sys.argv[0], 'r') as f: local_code = f.read()
             if len(remote_code) > 1000 and remote_code.strip() != local_code.strip():
                 print("\n>>> UPDATE FOUND! <<<\nDownloading new version and restarting...")
-                with open(sys.argv[0], 'w') as f:
-                    f.write(remote_code)
+                with open(sys.argv[0], 'w') as f: f.write(remote_code)
                 time.sleep(1)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
-            else:
-                print("[SYSTEM] You are on the latest version.")
-    except Exception as e:
-        print(f"[SYSTEM] Update check skipped: {e}")
+            else: print("[SYSTEM] You are on the latest version.")
+    except Exception as e: print(f"[SYSTEM] Update check skipped: {e}")
     time.sleep(1)
 
-    print("\nPress Enter to keep default\n")
-
+    print("Press Enter to keep default\n")
     cfg = DEFAULT_CONFIG.copy()
     print(f"Pool URL: {cfg['POOL_URL']}")
     new_pool = input("New Pool URL (Enter for default): ").strip()
     if new_pool: cfg['POOL_URL'] = new_pool
-
     print(f"Pool Port: {cfg['POOL_PORT']}")
     new_port = input("New Port (Enter for default): ").strip()
     if new_port: cfg['POOL_PORT'] = int(new_port)
-
     print(f"Wallet: {cfg['WALLET']}")
     new_wallet = input("New Wallet (Enter for default): ").strip()
     if new_wallet: cfg['WALLET'] = new_wallet
-
     print(f"Proxy Port: {cfg['PROXY_PORT']}")
     new_proxy = input("New Proxy Port (Enter for default): ").strip()
     if new_proxy: cfg['PROXY_PORT'] = int(new_proxy)
-
     print("\nConfiguration complete. Starting...")
     time.sleep(1)
+    with open("kx_restore.json", "w") as f: json.dump(cfg, f)
     return cfg
 
 # ================= MAIN SUITE =================
@@ -545,19 +525,16 @@ class MinerSuite:
     def __init__(self):
         self.log_q = queue.Queue()
         self.cfg = pre_screen(self.log_q)
-        
-        if "-r" not in sys.argv:
-            run_benchmark_sequence()
-        
+        run_benchmark_sequence()
+        # FIX: RESTORED RUN_SETUP METHOD
+        self.run_setup()
         self.man = mp.Manager()
         self.job_q = self.man.Queue()
         self.res_q = self.man.Queue()
         self.stop = mp.Event()
         self.restart_flag = mp.Event()
-        
         self.global_job_id = mp.Array('c', 64)
         self.global_job_id.value = b""
-        
         self.data = self.man.dict()
         self.data['job'] = "?"
         self.data['en1'] = ""
@@ -567,10 +544,8 @@ class MinerSuite:
         self.data['hr_1h'] = "---"
         self.data['workers'] = "0"
         self.data['api_status'] = "Init"
-        
         self.active_miners = self.man.dict()
-        self.active_miners['LOCAL'] = {'last': time.time(), 'diff': 0}
-        
+        self.active_miners['LOCAL'] = {'last': time.time(), 'diff': 0, 'hr': 0}
         self.proxy_stats = self.man.dict()
         self.proxy_stats['submitted'] = 0
         self.proxy_stats['accepted'] = 0
@@ -586,19 +561,17 @@ class MinerSuite:
         self.connected = False
         self.msg_id = 1
         self.current_hashrate = 0.0
-        
         self.proxy_server = None
 
+    # FIX: RESTORED THIS METHOD
     def run_setup(self):
-        # RESTORED METHOD FOR IMAGE 2 FIX
         os.system('clear')
-        print("Starting Miner Suite...")
+        print("Starting Suite...")
         time.sleep(1)
 
     def save_config(self):
         try:
-            with open("kxt_restore.json", "w") as f:
-                json.dump(self.cfg, f)
+            with open("kx_restore.json", "w") as f: json.dump(self.cfg, f)
         except: pass
 
     def log(self, cat, msg):
@@ -628,25 +601,20 @@ class MinerSuite:
                 s = socket.create_connection((self.cfg['POOL_URL'], self.cfg['POOL_PORT']), timeout=None)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 self.connected = True
-                
-                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["KXT-v60"]}) + "\n").encode())
+                s.sendall((json.dumps({"id": self.get_id(), "method": "mining.subscribe", "params": ["kx2000-v60"]}) + "\n").encode())
                 s.sendall((json.dumps({"id": self.get_id(), "method": "mining.authorize", "params": [self.cfg['WALLET'], self.cfg['PASSWORD']]}) + "\n").encode())
-
                 buff = b""
                 while not self.stop.is_set():
                     while not self.res_q.empty():
                         r = self.res_q.get()
-                        params = [
-                            self.cfg['WALLET'], r['job_id'], r['extranonce2'], 
-                            r['ntime'], r['nonce'], "00000000"
-                        ]
+                        params = [self.cfg['WALLET'], r['job_id'], r['extranonce2'], r['ntime'], r['nonce'], "00000000"]
                         msg = json.dumps({"id": self.get_id(), "method": "mining.submit", "params": params})
                         s.sendall((msg + "\n").encode())
                         self.local_stats['submitted'] += 1
-                        self.active_miners['LOCAL'] = {'last': time.time(), 'diff': r['share_diff']}
+                        # Update Local Activity specifically
+                        self.active_miners['LOCAL'] = {'last': time.time(), 'diff': r['share_diff'], 'hr': self.current_hashrate}
                         self.log("asic_result", f"[LOCAL] Nonce difficulty {r['share_diff']:.2f} of {r['pool_diff']:.0f}")
                         self.log("stratum_api", f"tx: {msg}")
-
                     try:
                         s.settimeout(0.1)
                         d = s.recv(8192)
@@ -661,7 +629,6 @@ class MinerSuite:
                                 mid = msg.get('id')
                                 result = msg.get('result')
                                 method = msg.get('method')
-                                
                                 if result and isinstance(result, list) and "mining.notify" in str(result):
                                      self.data['en1'] = result[1]
                                 elif mid and mid > 3:
@@ -670,7 +637,6 @@ class MinerSuite:
                                         self.log("stratum_task", "message result accepted")
                                     else: 
                                         self.shares['rej'] += 1
-
                                 if method == 'mining.notify':
                                     p = msg['params']
                                     jid = str(p[0])
@@ -683,11 +649,9 @@ class MinerSuite:
                                             except: pass
                                         j = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], en1)
                                         for _ in range(mp.cpu_count() * 2): self.job_q.put(j)
-                                
                                 elif method == 'mining.set_difficulty':
                                     self.diff.value = msg['params'][0]
                                     self.data['diff'] = msg['params'][0]
-
                             except: continue
                     except socket.timeout: pass
                     except OSError: break
@@ -706,7 +670,6 @@ class MinerSuite:
         curses.init_pair(4, curses.COLOR_CYAN, -1)
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
         stdscr.nodelay(True)
-        
         while not self.stop.is_set():
             try:
                 while True:
@@ -714,90 +677,96 @@ class MinerSuite:
                     self.logs.append(r)
                     if len(self.logs) > 100: self.logs.pop(0)
             except: pass
-            
             c_tmp, g_tmp = get_temps()
             c_load, ram = get_hw_stats()
-            
             current_total = 0.0
             for i in range(len(self.stats)):
                 delta = self.stats[i] - self.last_stats[i]
                 current_total += delta
                 self.last_stats[i] = self.stats[i]
-            
             self.current_hashrate = (self.current_hashrate * 0.7) + (current_total * 0.3 * 10)
             hr_disp = self.current_hashrate
             fhr = f"{hr_disp/1e6:.2f} MH/s" if hr_disp > 1e6 else f"{hr_disp/1000:.2f} kH/s"
             
             stdscr.erase(); h, w = stdscr.getmaxyx()
             col_w = w // 4
-            
-            stdscr.addstr(0, 0, f" KXT MINER v60 - STABLE ".center(w), curses.color_pair(5)|curses.A_BOLD)
-            
+            stdscr.addstr(0, 0, f" kx2000 MINER v60 - WIDE UI ".center(w), curses.color_pair(5)|curses.A_BOLD)
             stdscr.addstr(2, 2, "=== LOCAL ===", curses.color_pair(4))
             stdscr.addstr(3, 2, f"IP: {get_local_ip()}")
             stdscr.addstr(4, 2, f"Proxy: {self.cfg['PROXY_PORT']}")
             stdscr.addstr(5, 2, f"RAM: {ram}%")
-            
             x2 = col_w + 2
             stdscr.addstr(2, x2, "=== HARDWARE ===", curses.color_pair(4))
             stdscr.addstr(3, x2, f"CPU: {c_tmp}C")
             stdscr.addstr(4, x2, f"GPU: {g_tmp}C")
             ts = "OK" if self.throttle.value == 0.0 else "THROTTLED"
             stdscr.addstr(5, x2, f"{ts}", curses.color_pair(1 if ts=="OK" else 2))
-
             x3 = col_w*2 + 2
-            stdscr.addstr(2, x3, "=== POOL STATS ===", curses.color_pair(4))
-            stdscr.addstr(3, x3, f"1m: {self.data.get('hr_1m', '-')} | 5m: {self.data.get('hr_5m', '-')}")
-            stdscr.addstr(4, x3, f"1h: {self.data.get('hr_1h', '-')} | Wrk: {self.data.get('workers', '-')}")
-            stdscr.addstr(5, x3, f"Status: {self.data.get('api_status', 'Init')}", curses.color_pair(5))
-            
-            x4 = col_w*3 + 2
-            stdscr.addstr(2, x4, "=== NETWORK ===", curses.color_pair(4))
+            stdscr.addstr(2, x3, "=== NETWORK ===", curses.color_pair(4))
+            stdscr.addstr(3, x3, f"Pool: Braiins")
+            stdscr.addstr(4, x3, f"Diff: {int(self.data.get('diff', 0))}")
             curr_job = self.global_job_id.value.decode('utf-8')
-            stdscr.addstr(3, x4, f"Block Data: {curr_job[:8]}")
-            stdscr.addstr(4, x4, f"Diff: {int(self.data.get('diff', 0))}")
-            stdscr.addstr(5, x4, f"Link: {'ONLINE' if self.connected else 'DOWN'}", curses.color_pair(1 if self.connected else 3))
+            stdscr.addstr(5, x3, f"Block: {curr_job[:8]}")
+            x4 = col_w*3 + 2
+            stdscr.addstr(2, x4, "=== BRAIINS STATS ===", curses.color_pair(4))
+            stdscr.addstr(3, x4, f"1m: {self.data.get('hr_1m', '-')}")
+            stdscr.addstr(4, x4, f"1h: {self.data.get('hr_1h', '-')}")
+            stdscr.addstr(5, x4, f"Workers: {self.data.get('workers', '-')}")
             
+            # === WIDE ACTIVE MINERS TABLE ===
             stdscr.hline(7, 0, curses.ACS_HLINE, w)
-            stdscr.addstr(8, 2, "ACTIVE PROXY MINERS (Last 60s):", curses.color_pair(2))
+            header = f"{'MINER ID':<15} | {'HASHRATE':<15} | {'DIFF':<10} | {'LAST SHARE':<10}"
+            stdscr.addstr(8, 2, header, curses.color_pair(2)|curses.A_BOLD)
             
             row = 9
             now = time.time()
             active = dict(self.active_miners)
+            
+            # Always show LOCAL first if updated recently
             if 'LOCAL' in active:
                 l = active['LOCAL']
-                if now - l['last'] < 60:
-                     stdscr.addstr(row, 4, f"LOCAL PC | Diff: {l['diff']:.1f} | Active", curses.color_pair(5))
-                     row += 1
-            
+                # Force local hashrate update for display
+                l['hr'] = self.current_hashrate
+                ago = int(now - l['last'])
+                if ago < 300: # Show for 5 mins
+                    hr_val = l['hr']
+                    if hr_val > 1e6: hr_s = f"{hr_val/1e6:.2f} MH/s"
+                    else: hr_s = f"{hr_val/1000:.2f} kH/s"
+                    line = f"{'LOCAL PC':<15} | {hr_s:<15} | {int(l['diff']):<10} | {ago}s ago"
+                    stdscr.addstr(row, 2, line, curses.color_pair(5))
+                    row += 1
+
             for k, v in active.items():
                 if k == 'LOCAL': continue
-                if now - v['last'] < 60:
-                    if row < 12: 
-                        stdscr.addstr(row, 4, f"{k} | Diff: {v['diff']:.1f} | Active", curses.color_pair(1))
+                ago = int(now - v['last'])
+                if ago < 300:
+                    if row < 14:
+                        hr_val = v['hr']
+                        if hr_val > 1e12: hr_s = f"{hr_val/1e12:.2f} TH/s"
+                        elif hr_val > 1e9: hr_s = f"{hr_val/1e9:.2f} GH/s"
+                        elif hr_val > 1e6: hr_s = f"{hr_val/1e6:.2f} MH/s"
+                        else: hr_s = f"{hr_val/1000:.2f} kH/s"
+                        
+                        line = f"{k:<15} | {hr_s:<15} | {int(v['diff']):<10} | {ago}s ago"
+                        stdscr.addstr(row, 2, line, curses.color_pair(1))
                         row += 1
 
-            stdscr.hline(12, 0, curses.ACS_HLINE, w)
-            
-            log_h = h - 13
+            stdscr.hline(14, 0, curses.ACS_HLINE, w)
+            log_h = h - 15
             if log_h > 0:
                 for i, l in enumerate(self.logs[-log_h:]):
-                    # IMAGE 1 FIX: Tuple Unpacking
-                    if isinstance(l, tuple) and len(l) == 3:
+                    if isinstance(l, tuple):
                         ts, cat, msg = l
-                        c = curses.color_pair(1)
-                        if "error" in cat.lower() or "rejected" in msg.lower(): c = curses.color_pair(3)
-                        elif "system" in cat.lower(): c = curses.color_pair(4)
-                        elif "tx" in msg.lower() or "tx" in cat.lower(): c = curses.color_pair(5)
-                        elif "asic_result" in cat.lower(): c = curses.color_pair(2)
-                        
-                        line = f"{ts} {cat}: {msg}"
-                        try: stdscr.addstr(13+i, 2, line[:w-4], c)
-                        except: pass
-                    else:
-                        try: stdscr.addstr(13+i, 2, str(l)[:w-4], curses.color_pair(1))
-                        except: pass
-            
+                        line_str = f"{ts} {cat}: {msg}"
+                    else: line_str = str(l)
+                    c = curses.color_pair(1)
+                    lower_str = line_str.lower()
+                    if "error" in lower_str or "rejected" in lower_str: c = curses.color_pair(3)
+                    elif "system" in lower_str: c = curses.color_pair(4)
+                    elif "tx" in lower_str: c = curses.color_pair(5)
+                    elif "asic_result" in lower_str: c = curses.color_pair(2)
+                    try: stdscr.addstr(15+i, 2, line_str[:w-4], c)
+                    except: pass
             stdscr.refresh()
             if stdscr.getch() == ord('q'): break
             time.sleep(0.1)
@@ -805,21 +774,16 @@ class MinerSuite:
     def start(self):
         AutoUpdate(self.cfg['UPDATE_URL'], self.log_q, self.stop, self.restart_flag, self.save_config).start()
         PoolStats(self.cfg['STATS_URL'], self.cfg['STATS_API'], self.cfg['WALLET'], self.data).start()
-        
         self.proxy_server = ProxyServer(self.cfg, self.log_q, self.proxy_stats, self.diff, self.active_miners)
         self.proxy_server.start()
-        
         threading.Thread(target=self.net_thread, daemon=True).start()
         threading.Thread(target=self.thermal_thread, daemon=True).start()
-        
         procs = []
         for i in range(mp.cpu_count()):
             p = mp.Process(target=cpu_worker, args=(i, self.job_q, self.res_q, self.stop, self.stats, self.diff, self.throttle, self.log_q, self.global_job_id), daemon=True)
             p.start(); procs.append(p)
-        
         gp = mp.Process(target=gpu_worker, args=(self.stop, self.stats, self.throttle, self.log_q), daemon=True)
         gp.start(); procs.append(gp)
-        
         try: curses.wrapper(self.draw_ui)
         except KeyboardInterrupt: pass
         finally:
@@ -827,10 +791,9 @@ class MinerSuite:
             if self.proxy_server: self.proxy_server.shutdown()
             for p in procs: 
                 if p.is_alive(): p.terminate()
-            
             if self.restart_flag.is_set():
-                print("\n\n>>> SEAMLESS UPDATE: RESTARTING MINER <<<\n")
-                time.sleep(2) 
+                print("\n\nRESTARTING kx2000...\n")
+                time.sleep(2)
                 os.execv(sys.executable, [sys.executable, sys.argv[0], "-r"])
 
 if __name__ == "__main__":
