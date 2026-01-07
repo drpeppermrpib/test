@@ -3,15 +3,19 @@
 """
 KXT MINER SUITE v53 - AUTO UPDATE + DISTINCT REPORTS
 ====================================================
-1. Auto-Updates 'kx2000.py' from GitHub README every 5min (faster poll)
+1. Auto-Updates 'kx2000.py' from GitHub README every 5min (fast poll)
 2. Distinct Hashrate/Diff reporting per ASIC ID
 3. Braiins API JSON Parsing
-4. Pre-screen setup with all options
+4. Pre-screen setup with all options before benchmark
 5. Local TX/OK counting fixed
 6. Stable connection (120s timeout + keep-alive)
+7. Real hashrate (no fake numbers)
+8. Long log (40 lines)
+9. Pretty print UI
 """
 
 import sys
+# FIX: Large integer string conversion limit
 try: sys.set_int_max_str_digits(0)
 except: pass
 
@@ -27,6 +31,7 @@ import hashlib
 import subprocess
 import os
 import queue
+import select
 import urllib.request
 import random
 import ssl
