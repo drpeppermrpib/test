@@ -437,6 +437,40 @@ def gpu_bench_dummy(stop):
 def pre_screen(log_q):
     os.system('clear')
     print("=== KXT MINER SUITE v56 - SETUP ===")
+    
+    # === START UPDATE CHECK ===
+    print("\n[SYSTEM] Checking for updates from GitHub...")
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        # URL is in DEFAULT_CONFIG at top of file
+        req = urllib.request.Request(DEFAULT_CONFIG['UPDATE_URL'], headers={'User-Agent': 'KXT-Miner'})
+        
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
+            remote_code = response.read().decode('utf-8')
+            
+            # Read current script
+            with open(sys.argv[0], 'r') as f:
+                local_code = f.read()
+            
+            # Compare (simple string exact match)
+            if len(remote_code) > 1000 and remote_code.strip() != local_code.strip():
+                print("\n>>> UPDATE FOUND! <<<\nDownloading new version and restarting...")
+                with open(sys.argv[0], 'w') as f:
+                    f.write(remote_code)
+                time.sleep(1)
+                # Restart the script entirely
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            else:
+                print("[SYSTEM] You are on the latest version.")
+    except Exception as e:
+        print(f"[SYSTEM] Update check skipped: {e}")
+    time.sleep(1)
+    # === END UPDATE CHECK ===
+
     print("Press Enter to keep default\n")
 
     cfg = DEFAULT_CONFIG.copy()
