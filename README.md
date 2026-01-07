@@ -393,48 +393,9 @@ def gpu_bench_dummy(stop):
             cuda.Context.synchronize()
     except: time.sleep(0.1)
 
-# ================= PRE-SCREEN SETUP =================
-def pre_screen():
-    os.system('clear')
-    print("=== KXT MINER SUITE v53 - CONFIGURATION ===")
-    print("Press Enter to keep default values\n")
-
-    cfg = DEFAULT_CONFIG.copy()
-
-    print(f"Pool URL: {cfg['POOL_URL']} (solo.stratum.braiins.com)")
-    new_pool = input("New Pool URL (Enter for default): ").strip()
-    if new_pool:
-        cfg['POOL_URL'] = new_pool
-
-    print(f"Pool Port: {cfg['POOL_PORT']}")
-    new_port = input("New Port (Enter for default): ").strip()
-    if new_port:
-        cfg['POOL_PORT'] = int(new_port)
-
-    print(f"Wallet: {cfg['WALLET']}")
-    new_wallet = input("New Wallet (Enter for default): ").strip()
-    if new_wallet:
-        cfg['WALLET'] = new_wallet
-        cfg['STATS_URL'] = f"https://solo.braiins.com/users/{new_wallet}"
-
-    print(f"Worker Name: 001 (optional)")
-    new_worker = input("Worker (Enter for none): ").strip()
-    if new_worker:
-        cfg['WORKER'] = new_worker
-
-    print(f"Proxy Port: {cfg['PROXY_PORT']}")
-    new_proxy = input("New Proxy Port (Enter for default): ").strip()
-    if new_proxy:
-        cfg['PROXY_PORT'] = int(new_proxy)
-
-    print("\nConfiguration complete. Press Enter to start benchmark and miner...")
-    input()
-    return cfg
-
 # ================= APP MANAGER =================
 class MinerSuite:
     def __init__(self):
-        self.cfg = pre_screen()  # Full pre-screen with all options
         run_benchmark_sequence()
         self.run_setup()
         self.man = mp.Manager()
@@ -470,6 +431,7 @@ class MinerSuite:
 
     def run_setup(self):
         os.system('clear')
+        self.cfg = DEFAULT_CONFIG.copy()
         print("Starting Suite...")
         time.sleep(1)
 
