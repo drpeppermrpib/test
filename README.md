@@ -3,20 +3,19 @@
 """
 KXT MINER SUITE v53 - AUTO UPDATE + DISTINCT REPORTS
 ====================================================
-1. Auto-Updates 'kx2000.py' from GitHub README every 30 seconds (fast poll for real-time update)
+1. Auto-Updates 'kx2000.py' from GitHub README every 30s (real-time)
 2. Distinct Hashrate/Diff reporting per ASIC ID
 3. Braiins API JSON Parsing
-4. Full pre-screen setup with all options before benchmark
+4. Pre-screen with all options before benchmark
 5. Local TX/OK counting fixed
 6. Stable connection (120s timeout + keep-alive)
-7. Real hashrate (accurate KH/s)
+7. Real hashrate
 8. Long log (40 lines)
 9. Pretty print UI
-10. All original features preserved
+10. All original features + fixes
 """
 
 import sys
-# FIX: Large integer string conversion limit
 try:
     sys.set_int_max_str_digits(0)
 except:
@@ -129,16 +128,16 @@ def fix_env():
     except:
         pass
 
-# ================= AUTO UPDATER (checks every 30 seconds for real-time update) =================
+# ================= AUTO UPDATER (every 30s + hash check for real-time) =================
 class AutoUpdate(threading.Thread):
     def __init__(self, url, log_q):
         super().__init__()
         self.url = url
         self.log_q = log_q
         self.daemon = True
+        self.last_hash = None
 
     def run(self):
-        last_content_hash = None
         while True:
             try:
                 ctx = ssl.create_default_context()
@@ -149,17 +148,17 @@ class AutoUpdate(threading.Thread):
                 with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
                     content = response.read().decode('utf-8')
                     current_hash = hashlib.md5(content.encode()).hexdigest()
-                    if current_hash != last_content_hash and len(content) > 100:
+                    if current_hash != self.last_hash and len(content) > 100:
                         with open("kx2000.py", "w") as f:
                             f.write(content)
-                        self.log_q.put((get_lv06_ts(), "system", "Updated kx2000.py successfully - restarting..."))
-                        last_content_hash = current_hash
+                        self.log_q.put((get_lv06_ts(), "system", "Updated kx2000.py - restarting..."))
+                        self.last_hash = current_hash
                         os.execv(sys.executable, [sys.executable] + sys.argv)
-                    last_content_hash = current_hash
+                    self.last_hash = current_hash
             except Exception as e:
-                self.log_q.put((get_lv06_ts(), "error", f"Update check failed: {str(e)[:20]}"))
+                self.log_q.put((get_lv06_ts(), "error", f"Update failed: {str(e)[:20]}"))
             
-            time.sleep(30)  # Check every 30 seconds for near real-time update
+            time.sleep(30)  # Every 30 seconds for near real-time
 
 # ================= PRE-SCREEN =================
 def pre_screen(log_q):
@@ -248,7 +247,7 @@ def gpu_bench_dummy(stop):
 # ================= APP MANAGER =================
 class MinerSuite:
     def __init__(self):
-        self.log_q = queue.Queue()  # For pre-screen logs
+        self.log_q = queue.Queue()
         self.cfg = pre_screen(self.log_q)
         run_benchmark_sequence()
         self.run_setup()
