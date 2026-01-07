@@ -393,11 +393,11 @@ def gpu_bench_dummy(stop):
             cuda.Context.synchronize()
     except: time.sleep(0.1)
 
-# ================= PRE-SCREEN =================
+# ================= PRE-SCREEN SETUP =================
 def pre_screen():
     os.system('clear')
-    print("=== KXT MINER SUITE v53 - SETUP ===")
-    print("Press Enter to keep default\n")
+    print("=== KXT MINER SUITE v53 - CONFIGURATION ===")
+    print("Press Enter to keep default values\n")
 
     cfg = DEFAULT_CONFIG.copy()
 
