@@ -112,6 +112,46 @@ def get_temps():
     except: pass
     return c, g
 
+class ThermalRampController:
+    def __init__(self, target_temp=76.0, max_throttle=0.5):
+        self.target_temp = target_temp
+        self.max_throttle = max_throttle
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.last_temp = None
+        self.kp = 0.012
+        self.ki = 0.0015
+        self.kd = 0.006
+
+    def update(self, current_temp, current_throttle):
+        if current_temp <= 0:
+            return max(0.0, current_throttle - 0.02)
+
+        if current_temp <= (self.target_temp - 3.0):
+            self.integral = 0.0
+            self.prev_error = 0.0
+            self.last_temp = current_temp
+            return 0.0
+
+        error = current_temp - self.target_temp
+        self.integral = max(-50.0, min(50.0, self.integral + error))
+        derivative = error - self.prev_error
+        self.prev_error = error
+
+        pid = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        desired = current_throttle + pid
+
+        if error < 0:
+            desired -= 0.02
+        elif error > 0.5:
+            desired += 0.015
+
+        if self.last_temp is not None and current_temp < self.last_temp - 0.3:
+            desired -= 0.01
+        self.last_temp = current_temp
+
+        return max(0.0, min(self.max_throttle, desired))
+
 def get_hw_stats():
     try:
         import psutil
@@ -556,6 +596,10 @@ class MinerSuite:
         self.last_stats = [0.0] * (mp.cpu_count() + 1)
         self.diff = mp.Value('d', 1024.0)
         self.throttle = mp.Value('d', 0.0)
+        self.thermal_controller = ThermalRampController(
+            target_temp=min(76.0, float(self.cfg.get('THROTTLE_START', 76.0))),
+            max_throttle=0.5
+        )
         self.shares = {"acc": 0, "rej": 0}
         self.logs = []
         self.connected = False
@@ -586,11 +630,7 @@ class MinerSuite:
         while not self.stop.is_set():
             c, g = get_temps()
             mx = max(c, g)
-            start = self.cfg['THROTTLE_START']
-            stop = self.cfg['THROTTLE_MAX']
-            if mx < start: self.throttle.value = 0.0
-            elif mx < stop: self.throttle.value = (mx - start) / (stop - start) * 0.1
-            else: self.throttle.value = 0.5
+            self.throttle.value = self.thermal_controller.update(mx, self.throttle.value)
             time.sleep(2)
 
     def net_thread(self):
