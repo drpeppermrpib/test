@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     "STATS_API": "https://solo.braiins.com/stats/bc1q0xqv0m834uvgd8fljtaa67he87lzu8mpa37j7e",
     "UPDATE_URL": "https://raw.githubusercontent.com/drpeppermrpib/test/main/README.md"
 }
+SAFE_TEMP_LIMIT = 76.0
 
 # ================= PTX KERNEL =================
 PTX_CODE = """
@@ -111,6 +112,55 @@ def get_temps():
         g = float(o.strip())
     except: pass
     return c, g
+
+class ThermalRampController:
+    """PID-style thermal controller with target temp set to min(THROTTLE_START, 76°C)."""
+    def __init__(
+        self,
+        target_temp=SAFE_TEMP_LIMIT,
+        max_throttle=0.5,
+        kp=0.012,
+        ki=0.0015,
+        kd=0.006,
+        invalid_temp_throttle_decay_rate=0.02,
+        cool_temp_margin=3.0,
+        integral_min=-50.0,
+        integral_max=50.0
+    ):
+        self.target_temp = target_temp
+        self.max_throttle = max_throttle
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.invalid_temp_throttle_decay_rate = invalid_temp_throttle_decay_rate
+        self.cool_temp_margin = cool_temp_margin
+        self.integral_min = integral_min
+        self.integral_max = integral_max
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+    def update(self, current_temp, current_throttle):
+        """Return next throttle value for the latest max(CPU,GPU) temperature reading."""
+        if current_temp < 0:
+            self.reset()
+            return max(0.0, current_throttle - self.invalid_temp_throttle_decay_rate)
+
+        if current_temp <= (self.target_temp - self.cool_temp_margin):
+            self.reset()
+            return 0.0
+
+        error = current_temp - self.target_temp
+        self.integral = max(self.integral_min, min(self.integral_max, self.integral + error))
+        derivative = error - self.prev_error
+        self.prev_error = error
+
+        pid = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        desired = current_throttle + pid
+        return max(0.0, min(self.max_throttle, desired))
 
 def get_hw_stats():
     try:
@@ -556,12 +606,16 @@ class MinerSuite:
         self.last_stats = [0.0] * (mp.cpu_count() + 1)
         self.diff = mp.Value('d', 1024.0)
         self.throttle = mp.Value('d', 0.0)
+        self.thermal_controller = ThermalRampController(
+            target_temp=min(SAFE_TEMP_LIMIT, float(self.cfg.get('THROTTLE_START', SAFE_TEMP_LIMIT)))
+        )
         self.shares = {"acc": 0, "rej": 0}
         self.logs = []
         self.connected = False
         self.msg_id = 1
         self.current_hashrate = 0.0
         self.proxy_server = None
+        self.over_max_temp = False
 
     # FIX: RESTORED THIS METHOD
     def run_setup(self):
@@ -586,11 +640,15 @@ class MinerSuite:
         while not self.stop.is_set():
             c, g = get_temps()
             mx = max(c, g)
-            start = self.cfg['THROTTLE_START']
-            stop = self.cfg['THROTTLE_MAX']
-            if mx < start: self.throttle.value = 0.0
-            elif mx < stop: self.throttle.value = (mx - start) / (stop - start) * 0.1
-            else: self.throttle.value = 0.5
+            next_throttle = self.thermal_controller.update(mx, self.throttle.value)
+            if mx >= float(self.cfg.get('THROTTLE_MAX', 81.0)):
+                next_throttle = max(next_throttle, self.thermal_controller.max_throttle)
+                if not self.over_max_temp:
+                    self.thermal_controller.reset()
+                self.over_max_temp = True
+            else:
+                self.over_max_temp = False
+            self.throttle.value = next_throttle
             time.sleep(2)
 
     def net_thread(self):
